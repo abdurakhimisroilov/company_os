@@ -1,0 +1,4 @@
+keyAlias=company-os
+keyPassword=your_keystore_password
+storeFile=../app/release-key.jks
+storePassword=your_keystore_password
