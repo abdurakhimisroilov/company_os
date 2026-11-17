@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-ios:
-    runs-on: macos-latest
+    runs-on: macos-13
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,14 +27,13 @@ jobs:
         run: |
           cd mobile
           flutter build ios --release --no-codesign
+          mkdir -p build/ios/iphoneos/Payload
+          cp -r build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
           cd build/ios/iphoneos
-          mkdir -p Payload
-          cp -r Runner.app Payload/
-          zip -r CompanyOS-release.ipa Payload
-          mv CompanyOS-release.ipa ../../../CompanyOS-release.ipa
+          zip -r -q CompanyOS-release.ipa Payload
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
           name: CompanyOS-iOS
-          path: mobile/CompanyOS-release.ipa
+          path: mobile/build/ios/iphoneos/CompanyOS-release.ipa
