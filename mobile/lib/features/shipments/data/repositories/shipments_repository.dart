@@ -8,54 +8,35 @@ class ShipmentsRepository {
 
   ShipmentsRepository({required this.apiClient});
 
-  Future<List<ShipmentModel>> getShipments({String? status, int page = 1, int limit = 50}) async {
-    final query = <String, dynamic>{'page': page, 'limit': limit};
-    if (status != null && status.isNotEmpty && status != 'all') {
-      query['status'] = status;
-    }
-
-    final response = await apiClient.get(
-      ApiEndpoints.shipments,
-      queryParameters: query,
-    );
-
-    if (response.statusCode == 200) {
-      final list = JsonHelpers.toList(response.data);
-      return list.map((e) => ShipmentModel.fromJson(JsonHelpers.toMap(e))).toList();
-    }
-    throw Exception('Не удалось загрузить поставки');
+  ShipmentModel _shipment(dynamic body) {
+    return ShipmentModel.fromJson(JsonHelpers.toMap(body is Map && body.containsKey('data') ? body['data'] : body));
   }
 
+  /// [status] is 'pending', 'received' or 'all'.
+  Future<List<ShipmentModel>> getShipments({String? status}) async {
+    final query = <String, dynamic>{};
+    if (status != null && status.isNotEmpty && status != 'all') query['status'] = status;
+
+    final response = await apiClient.get(ApiEndpoints.shipments, queryParameters: query);
+    return JsonHelpers.toList(response.data).map((e) => ShipmentModel.fromJson(JsonHelpers.toMap(e))).toList();
+  }
+
+  /// Shipment with its items.
   Future<ShipmentModel> getShipmentById(String id) async {
     final response = await apiClient.get(ApiEndpoints.shipment(id));
-    if (response.statusCode == 200) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return ShipmentModel.fromJson(map);
-    }
-    throw Exception('Не удалось загрузить данные поставки');
+    return _shipment(response.data);
   }
 
+  /// [data]: `{supplierId | supplierName, invoiceNumber?, expectedDate?, items: [{productId, quantity, unitPrice}],
+  /// additionalCosts?, status?: 'pending'}`. Without `status: 'pending'` the goods go to stock at once.
   Future<ShipmentModel> createShipment(Map<String, dynamic> data) async {
     final response = await apiClient.post(ApiEndpoints.shipments, data: data);
-    if (response.statusCode == 200 || response.statusCode == 201) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return ShipmentModel.fromJson(map);
-    }
-    throw Exception('Не удалось создать поставку');
+    return _shipment(response.data);
   }
 
-  Future<void> confirmShipment(String id) async {
+  /// Receives a pending shipment into stock and returns it updated.
+  Future<ShipmentModel> confirmShipment(String id) async {
     final response = await apiClient.post(ApiEndpoints.confirmShipment(id));
-    if (response.statusCode != 200 && response.statusCode != 201) {
-      throw Exception('Не удалось подтвердить приёмку');
-    }
+    return _shipment(response.data);
   }
 }

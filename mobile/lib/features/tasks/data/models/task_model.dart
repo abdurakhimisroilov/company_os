@@ -1,4 +1,23 @@
+import 'dart:convert';
 import '../../../../core/utils/json_helpers.dart';
+
+/// Attachments uploaded before the server decoded multipart names as UTF-8 were
+/// stored as mojibake. Restores those when (and only when) the text is valid
+/// UTF-8 read as Latin-1; correct names pass through untouched.
+String _restoreFileName(String name) {
+  if (name.runes.every((r) => r < 0x80)) return name;
+  try {
+    return utf8.decode(latin1.encode(name));
+  } catch (_) {
+    return name;
+  }
+}
+
+String formatFileSize(int bytes) {
+  if (bytes >= 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} МБ';
+  if (bytes >= 1024) return '${(bytes / 1024).toStringAsFixed(0)} КБ';
+  return '$bytes Б';
+}
 
 class TaskCommentModel {
   final String id;
@@ -16,13 +35,48 @@ class TaskCommentModel {
   factory TaskCommentModel.fromJson(Map<String, dynamic> json) {
     return TaskCommentModel(
       id: JsonHelpers.toStr(json['id']),
-      authorName: JsonHelpers.extractString(
-        json['author'] ?? json['user'],
-        preferredKeys: ['fullName', 'name'],
-        fallback: JsonHelpers.toStr(json['authorName'], 'Сотрудник'),
-      ),
+      authorName: JsonHelpers.toStr(json['authorName'] ?? json['author_name']),
       content: JsonHelpers.toStr(json['content'] ?? json['text'] ?? json['comment']),
-      createdAt: JsonHelpers.toDateTime(json['createdAt'] ?? json['created_at']),
+      createdAt: JsonHelpers.toDateTime(json['created_at'] ?? json['createdAt']).toLocal(),
+    );
+  }
+}
+
+class TaskAttachmentModel {
+  final String id;
+  final String name;
+  final String url;
+  final int sizeBytes;
+
+  const TaskAttachmentModel({required this.id, required this.name, required this.url, this.sizeBytes = 0});
+
+  String get extension => name.contains('.') ? name.split('.').last.toLowerCase() : '';
+
+  factory TaskAttachmentModel.fromJson(Map<String, dynamic> json) {
+    final url = JsonHelpers.toStr(json['url']);
+    final rawName = JsonHelpers.toStr(json['name'] ?? json['fileName']);
+    return TaskAttachmentModel(
+      id: JsonHelpers.toStr(json['id']),
+      name: rawName.isNotEmpty ? _restoreFileName(rawName) : url.split('/').last,
+      url: url,
+      sizeBytes: JsonHelpers.toInt(json['size']),
+    );
+  }
+}
+
+/// A company member that a task can be assigned to (`GET /employees`).
+class TaskAssignee {
+  final String id;
+  final String fullName;
+  final String position;
+
+  const TaskAssignee({required this.id, required this.fullName, this.position = ''});
+
+  factory TaskAssignee.fromJson(Map<String, dynamic> json) {
+    return TaskAssignee(
+      id: JsonHelpers.toStr(json['id']),
+      fullName: JsonHelpers.toStr(json['fullName'] ?? json['full_name']),
+      position: JsonHelpers.toStr(json['position']),
     );
   }
 }
@@ -31,39 +85,43 @@ class TaskModel {
   final String id;
   final String title;
   final String description;
+  final String assignedToId;
   final String assignedToName;
-  final String? assignedToAvatar;
+  final String createdById;
   final String createdByName;
-  final String priority; // 'high' (Высокий), 'medium' (Средний), 'low' (Низкий)
-  final String status; // 'todo' (К выполнению), 'in_progress' (В работе), 'review' (На проверке), 'done' (Завершено)
-  final DateTime deadline;
+  final String priority; // 'low', 'medium', 'high', 'urgent'
+  final String status; // 'todo', 'in_progress', 'review', 'done'
+  final DateTime? deadline;
   final double progress; // 0.0 - 1.0
-  final List<String> attachments;
+  final List<TaskAttachmentModel> attachments;
   final List<TaskCommentModel> comments;
 
   const TaskModel({
     required this.id,
     required this.title,
     required this.description,
-    required this.assignedToName,
-    this.assignedToAvatar,
-    required this.createdByName,
+    this.assignedToId = '',
+    this.assignedToName = '',
+    this.createdById = '',
+    this.createdByName = '',
     required this.priority,
     required this.status,
-    required this.deadline,
+    this.deadline,
     this.progress = 0.0,
     this.attachments = const [],
     this.comments = const [],
   });
 
-  bool get isOverdue => DateTime.now().isAfter(deadline) && status != 'done';
+  bool get isOverdue => deadline != null && DateTime.now().isAfter(deadline!) && status != 'done';
 
-  String get priorityDisplay {
-    switch (priority.toLowerCase()) {
+  int get progressPercent => (progress * 100).round();
+
+  static String priorityLabel(String priority) {
+    switch (priority) {
+      case 'urgent':
+        return 'Срочный';
       case 'high':
         return 'Высокий';
-      case 'medium':
-        return 'Средний';
       case 'low':
         return 'Низкий';
       default:
@@ -71,10 +129,8 @@ class TaskModel {
     }
   }
 
-  String get statusDisplay {
-    switch (status.toLowerCase()) {
-      case 'todo':
-        return 'К выполнению';
+  static String statusLabel(String status) {
+    switch (status) {
       case 'in_progress':
         return 'В работе';
       case 'review':
@@ -82,62 +138,42 @@ class TaskModel {
       case 'done':
         return 'Завершено';
       default:
-        return 'В работе';
+        return 'К выполнению';
     }
   }
 
+  String get priorityDisplay => priorityLabel(priority);
+
+  String get statusDisplay => statusLabel(status);
+
   factory TaskModel.fromJson(Map<String, dynamic> json) {
-    final commentsList = JsonHelpers.toList(json['comments'])
+    final comments = JsonHelpers.toList(json['comments'])
         .map((e) => TaskCommentModel.fromJson(JsonHelpers.toMap(e)))
         .toList();
-
-    final attachList = JsonHelpers.toList(json['attachments'])
-        .map((e) => JsonHelpers.extractString(e, preferredKeys: ['url', 'name'], fallback: e.toString()))
+    final attachments = JsonHelpers.toList(json['attachmentFiles'])
+        .map((e) => TaskAttachmentModel.fromJson(JsonHelpers.toMap(e)))
+        .where((a) => a.url.isNotEmpty)
         .toList();
 
-    double prog = JsonHelpers.toDouble(json['progress']);
-    if (prog > 1.0) prog = prog / 100.0;
+    // The server stores progress as an integer percentage (0–100).
+    final progress = (JsonHelpers.toDouble(json['progress']) / 100).clamp(0.0, 1.0).toDouble();
+    final assignedTo = json['assignedTo'] ?? json['assigned_to'];
+    final createdBy = json['createdBy'] ?? json['created_by'];
 
     return TaskModel(
       id: JsonHelpers.toStr(json['id']),
-      title: JsonHelpers.toStr(json['title'], 'Задача'),
+      title: JsonHelpers.toStr(json['title']),
       description: JsonHelpers.toStr(json['description']),
-      assignedToName: JsonHelpers.extractString(
-        json['assignedTo'] ?? json['assignee'] ?? json['employee'],
-        preferredKeys: ['fullName', 'name'],
-        fallback: JsonHelpers.toStr(json['assignedToName'], 'Сотрудник'),
-      ),
-      assignedToAvatar: JsonHelpers.extractOptionalString(
-            json['assignedTo'] ?? json['assignee'],
-            preferredKeys: ['photoUrl', 'avatarUrl', 'avatar'],
-          ) ??
-          JsonHelpers.extractOptionalString(json['assignedToAvatar']),
-      createdByName: JsonHelpers.extractString(
-        json['createdBy'] ?? json['creator'] ?? json['author'],
-        preferredKeys: ['fullName', 'name'],
-        fallback: JsonHelpers.toStr(json['createdByName'], 'Руководитель'),
-      ),
+      assignedToId: assignedTo is String ? assignedTo : '',
+      assignedToName: JsonHelpers.toStr(json['assignedToName'] ?? json['assigned_to_name']),
+      createdById: createdBy is String ? createdBy : '',
+      createdByName: JsonHelpers.toStr(json['createdByName'] ?? json['created_by_name']),
       priority: JsonHelpers.toStr(json['priority'], 'medium').toLowerCase(),
       status: JsonHelpers.toStr(json['status'], 'todo').toLowerCase(),
-      deadline: JsonHelpers.toDateTime(
-        json['deadline'] ?? json['due_date'],
-        DateTime.now().add(const Duration(days: 3)),
-      ),
-      progress: prog,
-      attachments: attachList,
-      comments: commentsList,
+      deadline: JsonHelpers.toOptionalDateTime(json['deadline'] ?? json['due_date'])?.toLocal(),
+      progress: progress,
+      attachments: attachments,
+      comments: comments,
     );
-  }
-
-  Map<String, dynamic> toJson() {
-    return {
-      'title': title,
-      'description': description,
-      'assignedToName': assignedToName,
-      'priority': priority,
-      'status': status,
-      'deadline': deadline.toIso8601String(),
-      'progress': progress,
-    };
   }
 }

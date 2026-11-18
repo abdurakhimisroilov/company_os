@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/network/api_error.dart';
 import '../../data/models/shipment_model.dart';
 import '../../data/repositories/shipments_repository.dart';
 
@@ -10,32 +13,20 @@ abstract class ShipmentsEvent extends Equatable {
   List<Object?> get props => [];
 }
 
+/// Loads the list for a status: 'all', 'pending', 'received'.
 class LoadShipmentsEvent extends ShipmentsEvent {
-  final String? status;
-  const LoadShipmentsEvent({this.status});
+  final String status;
+  const LoadShipmentsEvent({this.status = 'all'});
   @override
   List<Object?> get props => [status];
 }
 
-class LoadShipmentDetailEvent extends ShipmentsEvent {
-  final String id;
-  const LoadShipmentDetailEvent(this.id);
+/// Reloads the list with the current filter without hiding what is on screen.
+class RefreshShipmentsEvent extends ShipmentsEvent {
+  final Completer<String?>? completer;
+  const RefreshShipmentsEvent({this.completer});
   @override
-  List<Object?> get props => [id];
-}
-
-class CreateShipmentEvent extends ShipmentsEvent {
-  final Map<String, dynamic> data;
-  const CreateShipmentEvent(this.data);
-  @override
-  List<Object?> get props => [data];
-}
-
-class ConfirmShipmentEvent extends ShipmentsEvent {
-  final String id;
-  const ConfirmShipmentEvent(this.id);
-  @override
-  List<Object?> get props => [id];
+  List<Object?> get props => [completer];
 }
 
 // ─── States ─────────────────────────────────────────────────────────────────
@@ -52,23 +43,13 @@ class ShipmentsLoading extends ShipmentsState {}
 class ShipmentsLoaded extends ShipmentsState {
   final List<ShipmentModel> shipments;
   final String currentFilter;
-  const ShipmentsLoaded({required this.shipments, this.currentFilter = 'all'});
-  @override
-  List<Object?> get props => [shipments, currentFilter];
-}
 
-class ShipmentDetailLoaded extends ShipmentsState {
-  final ShipmentModel shipment;
-  const ShipmentDetailLoaded(this.shipment);
-  @override
-  List<Object?> get props => [shipment];
-}
+  /// A request for another filter is in flight; [shipments] are still the previous result.
+  final bool isLoading;
 
-class ShipmentsActionSuccess extends ShipmentsState {
-  final String message;
-  const ShipmentsActionSuccess(this.message);
+  const ShipmentsLoaded({required this.shipments, this.currentFilter = 'all', this.isLoading = false});
   @override
-  List<Object?> get props => [message];
+  List<Object?> get props => [shipments, currentFilter, isLoading];
 }
 
 class ShipmentsError extends ShipmentsState {
@@ -79,55 +60,61 @@ class ShipmentsError extends ShipmentsState {
 }
 
 // ─── BLoC ───────────────────────────────────────────────────────────────────
+/// Holds the shipments LIST only. Shipment detail and the new-shipment form talk to the
+/// repository themselves and ask this bloc to refresh afterwards.
 class ShipmentsBloc extends Bloc<ShipmentsEvent, ShipmentsState> {
   final ShipmentsRepository shipmentsRepository;
 
+  String _status = 'all';
+  int _requestSeq = 0;
+
   ShipmentsBloc({required this.shipmentsRepository}) : super(ShipmentsInitial()) {
     on<LoadShipmentsEvent>(_onLoadShipments);
-    on<LoadShipmentDetailEvent>(_onLoadDetail);
-    on<CreateShipmentEvent>(_onCreateShipment);
-    on<ConfirmShipmentEvent>(_onConfirmShipment);
+    on<RefreshShipmentsEvent>(_onRefreshShipments);
+  }
+
+  /// Reloads with the current filter; completes with an error text or null.
+  Future<String?> refresh() {
+    final completer = Completer<String?>();
+    add(RefreshShipmentsEvent(completer: completer));
+    return completer.future;
   }
 
   Future<void> _onLoadShipments(LoadShipmentsEvent event, Emitter<ShipmentsState> emit) async {
-    emit(ShipmentsLoading());
-    try {
-      final shipments = await shipmentsRepository.getShipments(status: event.status);
-      emit(ShipmentsLoaded(shipments: shipments, currentFilter: event.status ?? 'all'));
-    } catch (e) {
-      emit(ShipmentsError(e.toString().replaceAll('Exception: ', '')));
+    _status = event.status;
+    final current = state;
+    if (current is ShipmentsLoaded) {
+      emit(ShipmentsLoaded(shipments: current.shipments, currentFilter: _status, isLoading: true));
+    } else {
+      emit(ShipmentsLoading());
     }
+    await _fetch(emit, silent: false);
   }
 
-  Future<void> _onLoadDetail(LoadShipmentDetailEvent event, Emitter<ShipmentsState> emit) async {
-    emit(ShipmentsLoading());
-    try {
-      final shipment = await shipmentsRepository.getShipmentById(event.id);
-      emit(ShipmentDetailLoaded(shipment));
-    } catch (e) {
-      emit(ShipmentsError(e.toString().replaceAll('Exception: ', '')));
-    }
+  Future<void> _onRefreshShipments(RefreshShipmentsEvent event, Emitter<ShipmentsState> emit) async {
+    if (state is! ShipmentsLoaded) emit(ShipmentsLoading());
+    final error = await _fetch(emit, silent: state is ShipmentsLoaded);
+    event.completer?.complete(error);
   }
 
-  Future<void> _onCreateShipment(CreateShipmentEvent event, Emitter<ShipmentsState> emit) async {
-    emit(ShipmentsLoading());
+  Future<String?> _fetch(Emitter<ShipmentsState> emit, {required bool silent}) async {
+    final seq = ++_requestSeq;
     try {
-      await shipmentsRepository.createShipment(event.data);
-      emit(const ShipmentsActionSuccess('Поставка успешно создана'));
-      add(const LoadShipmentsEvent());
+      final shipments = await shipmentsRepository.getShipments(status: _status);
+      if (seq != _requestSeq) return null;
+      emit(ShipmentsLoaded(shipments: shipments, currentFilter: _status));
+      return null;
     } catch (e) {
-      emit(ShipmentsError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onConfirmShipment(ConfirmShipmentEvent event, Emitter<ShipmentsState> emit) async {
-    emit(ShipmentsLoading());
-    try {
-      await shipmentsRepository.confirmShipment(event.id);
-      emit(const ShipmentsActionSuccess('Приёмка товара подтверждена'));
-      add(LoadShipmentDetailEvent(event.id));
-    } catch (e) {
-      emit(ShipmentsError(e.toString().replaceAll('Exception: ', '')));
+      final message = apiErrorMessage(e, fallback: 'Не удалось загрузить поставки');
+      if (seq != _requestSeq) return message;
+      final current = state;
+      if (silent && current is ShipmentsLoaded) {
+        // Keep the list the user is looking at; the caller reports the failure.
+        if (current.isLoading) emit(ShipmentsLoaded(shipments: current.shipments, currentFilter: current.currentFilter));
+        return message;
+      }
+      emit(ShipmentsError(message));
+      return message;
     }
   }
 }

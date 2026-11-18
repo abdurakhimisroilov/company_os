@@ -259,8 +259,11 @@ CREATE TABLE IF NOT EXISTS transactions (
     account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     to_account_id UUID REFERENCES accounts(id) ON DELETE SET NULL, -- for transfers
     category_id UUID REFERENCES expense_categories(id) ON DELETE SET NULL,
+    category VARCHAR(255),
     amount DECIMAL(20, 2) NOT NULL,
     description TEXT,
+    document_url TEXT,
+    document_name TEXT,
     reference_type VARCHAR(50), -- SALE, SHIPMENT, SALARY, MANUAL
     reference_id UUID,
     created_by UUID REFERENCES users(id) ON DELETE SET NULL,

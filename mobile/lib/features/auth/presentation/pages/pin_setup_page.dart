@@ -26,7 +26,39 @@ class _PinSetupPageState extends State<PinSetupPage> {
   bool _isConfirming = false;
   String? _errorMessage;
 
+  // Changing the PIN starts by proving the current one.
+  late bool _isVerifyingCurrent = widget.isChangeMode;
+  String _currentPin = '';
+  bool _isBusy = false;
+
+  Future<void> _checkCurrentPin() async {
+    _isBusy = true;
+    final result = await _securityService.verifyPin(_currentPin);
+    _isBusy = false;
+    if (!mounted) return;
+    setState(() {
+      _currentPin = '';
+      if (result.isSuccess) {
+        _isVerifyingCurrent = false;
+        _errorMessage = null;
+      } else {
+        _errorMessage = result.message ?? 'Неверный PIN-код';
+      }
+    });
+  }
+
   void _onDigitPress(String digit) {
+    if (_isBusy) return;
+    if (_isVerifyingCurrent) {
+      if (_currentPin.length < 4) {
+        setState(() {
+          _currentPin += digit;
+          _errorMessage = null;
+        });
+        if (_currentPin.length == 4) _checkCurrentPin();
+      }
+      return;
+    }
     if (_isConfirming) {
       if (_confirmPin.length < 4) {
         setState(() {
@@ -44,12 +76,9 @@ class _PinSetupPageState extends State<PinSetupPage> {
           _errorMessage = null;
         });
         if (_firstPin.length == 4) {
+          // Short pause so the fourth dot is seen before the step changes.
           Future.delayed(const Duration(milliseconds: 200), () {
-            if (mounted) {
-              setState(() {
-                _isConfirming = true;
-              });
-            }
+            if (mounted) setState(() => _isConfirming = true);
           });
         }
       }
@@ -57,9 +86,14 @@ class _PinSetupPageState extends State<PinSetupPage> {
   }
 
   void _onBackspace() {
+    if (_isBusy) return;
     setState(() {
       _errorMessage = null;
-      if (_isConfirming) {
+      if (_isVerifyingCurrent) {
+        if (_currentPin.isNotEmpty) {
+          _currentPin = _currentPin.substring(0, _currentPin.length - 1);
+        }
+      } else if (_isConfirming) {
         if (_confirmPin.isNotEmpty) {
           _confirmPin = _confirmPin.substring(0, _confirmPin.length - 1);
         } else {
@@ -76,7 +110,9 @@ class _PinSetupPageState extends State<PinSetupPage> {
 
   Future<void> _onPinsComplete() async {
     if (_firstPin == _confirmPin) {
+      _isBusy = true;
       await _securityService.savePin(_firstPin);
+      _isBusy = false;
 
       if (!mounted) return;
 
@@ -100,7 +136,7 @@ class _PinSetupPageState extends State<PinSetupPage> {
           builder: (ctx) => AlertDialog(
             title: const Text('Вход по биометрии'),
             content: const Text(
-              'Хотите включить быстрый вход с помощью отпечатка пальца (биометрии)?',
+              'Хотите включить быстрый вход с помощью биометрии (Face ID или отпечаток пальца)?',
             ),
             actions: [
               TextButton(
@@ -139,7 +175,7 @@ class _PinSetupPageState extends State<PinSetupPage> {
 
   @override
   Widget build(BuildContext context) {
-    final currentPin = _isConfirming ? _confirmPin : _firstPin;
+    final currentPin = _isVerifyingCurrent ? _currentPin : (_isConfirming ? _confirmPin : _firstPin);
 
     return Scaffold(
       backgroundColor: AppColors.background,
@@ -148,14 +184,14 @@ class _PinSetupPageState extends State<PinSetupPage> {
         elevation: 0,
         leading: widget.isChangeMode
             ? IconButton(
-                icon: const Icon(Icons.arrow_back_ios_new,
+                icon: Icon(Icons.arrow_back_ios_new,
                     color: AppColors.textPrimary, size: 20),
                 onPressed: () => context.pop(),
               )
             : null,
       ),
       body: Container(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           gradient: AppColors.backgroundGradient,
         ),
         child: SafeArea(
@@ -187,9 +223,11 @@ class _PinSetupPageState extends State<PinSetupPage> {
               ),
               const SizedBox(height: 20),
               Text(
-                widget.isChangeMode
-                    ? (_isConfirming ? 'Повторите новый PIN-код' : 'Введите новый PIN-код')
-                    : (_isConfirming ? 'Повторите PIN-код' : 'Создайте 4-значный PIN-код'),
+                _isVerifyingCurrent
+                    ? 'Введите текущий PIN-код'
+                    : widget.isChangeMode
+                        ? (_isConfirming ? 'Повторите новый PIN-код' : 'Введите новый PIN-код')
+                        : (_isConfirming ? 'Повторите PIN-код' : 'Создайте 4-значный PIN-код'),
                 style: AppTextStyles.titleLarge.copyWith(
                   fontWeight: FontWeight.bold,
                 ),
@@ -197,9 +235,11 @@ class _PinSetupPageState extends State<PinSetupPage> {
               ),
               const SizedBox(height: 8),
               Text(
-                _isConfirming
-                    ? 'Введите PIN ещё раз для подтверждения'
-                    : 'PIN-код используется для быстрого входа в систему',
+                _isVerifyingCurrent
+                    ? 'Подтвердите, что это вы, прежде чем задать новый PIN'
+                    : _isConfirming
+                        ? 'Введите PIN ещё раз для подтверждения'
+                        : 'PIN-код используется для быстрого входа в систему',
                 style: AppTextStyles.bodyMedium.copyWith(
                   color: AppColors.textSecondary,
                 ),
@@ -326,7 +366,7 @@ class _PinSetupPageState extends State<PinSetupPage> {
         width: 72,
         height: 72,
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.85),
+          color: AppColors.cardBackground.withOpacity(0.85),
           shape: BoxShape.circle,
           border: Border.all(color: AppColors.cardBorder),
           boxShadow: [
@@ -340,7 +380,7 @@ class _PinSetupPageState extends State<PinSetupPage> {
         child: Center(
           child: Text(
             digit,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 26,
               fontWeight: FontWeight.w600,
               color: AppColors.textPrimary,
@@ -362,7 +402,7 @@ class _PinSetupPageState extends State<PinSetupPage> {
         width: 72,
         height: 72,
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.5),
+          color: AppColors.cardBackground.withOpacity(0.5),
           shape: BoxShape.circle,
         ),
         child: Center(

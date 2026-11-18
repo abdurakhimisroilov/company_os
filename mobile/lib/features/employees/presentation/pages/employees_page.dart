@@ -1,10 +1,15 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
+import '../../../../core/di/injection.dart';
+import '../../../../core/network/api_client.dart';
+import '../../../../core/router/app_router.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/widgets/glass_card.dart';
 import '../../../../core/widgets/loading_shimmer.dart';
+import '../../../auth/presentation/bloc/auth_bloc.dart';
 import '../bloc/employees_bloc.dart';
 import '../../data/models/employee_model.dart';
 
@@ -17,7 +22,7 @@ class EmployeesPage extends StatefulWidget {
 
 class _EmployeesPageState extends State<EmployeesPage> {
   final _searchController = TextEditingController();
-  String _selectedDepartment = 'Все';
+  String? _selectedDepartmentId;
 
   @override
   void initState() {
@@ -31,25 +36,47 @@ class _EmployeesPageState extends State<EmployeesPage> {
     super.dispose();
   }
 
-  void _onDepartmentSelect(String dept) {
-    setState(() => _selectedDepartment = dept);
-    context.read<EmployeesBloc>().add(
-          LoadEmployeesEvent(department: dept, search: _searchController.text.trim()),
-        );
+  /// Adding, editing roles and removing employees is for administrators.
+  bool _isAdmin = false;
+
+  Future<void> _reload() {
+    final done = Completer<void>();
+    context.read<EmployeesBloc>().add(LoadEmployeesEvent(
+          departmentId: _selectedDepartmentId,
+          search: _searchController.text.trim(),
+          done: done,
+        ));
+    return done.future;
   }
 
-  void _onSearch(String query) {
-    context.read<EmployeesBloc>().add(
-          LoadEmployeesEvent(department: _selectedDepartment, search: query),
-        );
+  void _onDepartmentSelect(String? departmentId) {
+    setState(() => _selectedDepartmentId = departmentId);
+    _reload();
+  }
+
+  void _onSearch(String query) => _reload();
+
+  Future<void> _openAdd() async {
+    final added = await context.push<bool>(AppRoutes.employeeAdd);
+    if (added == true && mounted) _reload();
+  }
+
+  Future<void> _openDetail(EmployeeModel emp) async {
+    await context.push('/employees/${emp.id}');
+    // The profile may have been edited or the employee removed.
+    if (mounted) _reload();
   }
 
   @override
   Widget build(BuildContext context) {
+    _isAdmin = context.select<AuthBloc, bool>((bloc) {
+      final auth = bloc.state;
+      return auth is AuthAuthenticated && auth.user.isAdmin;
+    });
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SafeArea(
           bottom: false,
           child: Column(
@@ -58,15 +85,18 @@ class _EmployeesPageState extends State<EmployeesPage> {
               _buildSearchBar(),
               Expanded(
                 child: BlocConsumer<EmployeesBloc, EmployeesState>(
+                  listenWhen: (previous, current) => current is EmployeesLoaded && current.refreshError != null,
                   listener: (context, state) {
-                    if (state is EmployeesActionSuccess) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(state.message), backgroundColor: AppColors.success),
-                      );
+                    if (state is EmployeesLoaded && state.refreshError != null) {
+                      // The list on screen belongs to the previous filter again.
+                      setState(() => _selectedDepartmentId = state.selectedDepartmentId);
+                      ScaffoldMessenger.of(context)
+                        ..hideCurrentSnackBar()
+                        ..showSnackBar(SnackBar(content: Text(state.refreshError!), backgroundColor: AppColors.error));
                     }
                   },
                   builder: (context, state) {
-                    if (state is EmployeesLoading) {
+                    if (state is EmployeesLoading || state is EmployeesInitial) {
                       return const LoadingShimmer();
                     }
                     if (state is EmployeesError) {
@@ -83,12 +113,14 @@ class _EmployeesPageState extends State<EmployeesPage> {
           ),
         ),
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => context.push('/employees/add'),
-        backgroundColor: AppColors.primaryBlue,
-        icon: const Icon(Icons.person_add, color: Colors.white),
-        label: const Text('Сотрудник', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-      ),
+      floatingActionButton: _isAdmin
+          ? FloatingActionButton.extended(
+              onPressed: _openAdd,
+              backgroundColor: AppColors.primaryBlue,
+              icon: const Icon(Icons.person_add, color: Colors.white),
+              label: const Text('Сотрудник', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            )
+          : null,
     );
   }
 
@@ -98,10 +130,10 @@ class _EmployeesPageState extends State<EmployeesPage> {
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+            icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
             onPressed: () => context.pop(),
           ),
-          const Expanded(
+          Expanded(
             child: Text(
               'Сотрудники компании',
               style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
@@ -117,15 +149,16 @@ class _EmployeesPageState extends State<EmployeesPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
       child: Container(
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.9),
+          color: AppColors.cardBackground.withOpacity(0.9),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: AppColors.cardBorder),
         ),
         child: TextField(
           controller: _searchController,
           onSubmitted: _onSearch,
+          textInputAction: TextInputAction.search,
           decoration: InputDecoration(
-            hintText: 'Поиск по имени, должности...',
+            hintText: 'Поиск по имени, email, телефону...',
             hintStyle: TextStyle(color: AppColors.textTertiary, fontSize: 14),
             prefixIcon: const Icon(Icons.search, color: AppColors.primaryBlue),
             border: InputBorder.none,
@@ -136,38 +169,55 @@ class _EmployeesPageState extends State<EmployeesPage> {
     );
   }
 
+  Widget _buildDepartmentChip({required String label, required bool isSelected, required VoidCallback onSelected}) {
+    return ChoiceChip(
+      label: Text(label),
+      selected: isSelected,
+      selectedColor: AppColors.primaryBlue,
+      backgroundColor: AppColors.cardBackground.withOpacity(0.7),
+      labelStyle: TextStyle(
+        color: isSelected ? Colors.white : AppColors.textPrimary,
+        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+        fontSize: 12,
+      ),
+      onSelected: (_) => onSelected(),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+    );
+  }
+
   Widget _buildContent(EmployeesLoaded state) {
+    final isFiltered = state.selectedDepartmentId != null || state.searchQuery.isNotEmpty;
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<EmployeesBloc>().add(
-              LoadEmployeesEvent(department: _selectedDepartment, search: _searchController.text.trim()),
-            );
-      },
+      onRefresh: _reload,
       child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(16),
         children: [
+          if (state.isRefreshing)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 10),
+              child: LinearProgressIndicator(minHeight: 2, color: AppColors.primaryBlue),
+            ),
           // Department chips
           SizedBox(
             height: 40,
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
-              itemCount: state.departments.length,
+              itemCount: state.departments.length + 1,
               separatorBuilder: (_, __) => const SizedBox(width: 8),
               itemBuilder: (context, index) {
-                final d = state.departments[index];
-                final isSelected = d == state.selectedDepartment;
-                return ChoiceChip(
-                  label: Text(d),
-                  selected: isSelected,
-                  selectedColor: AppColors.primaryBlue,
-                  backgroundColor: Colors.white.withOpacity(0.7),
-                  labelStyle: TextStyle(
-                    color: isSelected ? Colors.white : AppColors.textPrimary,
-                    fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                    fontSize: 12,
-                  ),
-                  onSelected: (_) => _onDepartmentSelect(d),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                if (index == 0) {
+                  return _buildDepartmentChip(
+                    label: 'Все',
+                    isSelected: state.selectedDepartmentId == null,
+                    onSelected: () => _onDepartmentSelect(null),
+                  );
+                }
+                final d = state.departments[index - 1];
+                return _buildDepartmentChip(
+                  label: d.name,
+                  isSelected: d.id == state.selectedDepartmentId,
+                  onSelected: () => _onDepartmentSelect(d.id),
                 );
               },
             ),
@@ -182,21 +232,30 @@ class _EmployeesPageState extends State<EmployeesPage> {
                   children: [
                     Icon(Icons.badge_outlined, size: 56, color: AppColors.textTertiary),
                     const SizedBox(height: 12),
-                    Text('Данных пока нет', style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary)),
-                    const SizedBox(height: 6),
-                    Text('Добавьте сотрудников в штат компании', style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary)),
-                    const SizedBox(height: 16),
-                    ElevatedButton.icon(
-                      onPressed: () => context.push('/employees/add'),
-                      icon: const Icon(Icons.person_add, size: 18),
-                      label: const Text('Добавить сотрудника'),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: AppColors.primaryBlue,
-                        foregroundColor: Colors.white,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                      ),
+                    Text(
+                      isFiltered ? 'Никого не найдено' : 'Данных пока нет',
+                      style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary),
                     ),
+                    const SizedBox(height: 6),
+                    Text(
+                      isFiltered ? 'Измените запрос или выберите другой отдел' : 'В организации пока нет сотрудников',
+                      style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary),
+                      textAlign: TextAlign.center,
+                    ),
+                    if (_isAdmin && !isFiltered) ...[
+                      const SizedBox(height: 16),
+                      ElevatedButton.icon(
+                        onPressed: _openAdd,
+                        icon: const Icon(Icons.person_add, size: 18),
+                        label: const Text('Добавить сотрудника'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primaryBlue,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -226,7 +285,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
 
   Widget _buildEmployeeCard(EmployeeModel emp) {
     return GlassCard(
-      onTap: () => context.push('/employees/${emp.id}'),
+      onTap: () => _openDetail(emp),
       padding: const EdgeInsets.all(12),
       borderRadius: 18,
       child: Column(
@@ -235,7 +294,8 @@ class _EmployeesPageState extends State<EmployeesPage> {
           CircleAvatar(
             radius: 28,
             backgroundColor: emp.roleBgColor,
-            backgroundImage: emp.photoUrl != null ? NetworkImage(emp.photoUrl!) : null,
+            backgroundImage:
+                emp.photoUrl != null ? NetworkImage(getIt<ApiClient>().resolveFileUrl(emp.photoUrl!)) : null,
             child: emp.photoUrl == null
                 ? Text(
                     emp.fullName.isNotEmpty ? emp.fullName[0].toUpperCase() : '?',
@@ -246,14 +306,14 @@ class _EmployeesPageState extends State<EmployeesPage> {
           const SizedBox(height: 8),
           Text(
             emp.fullName,
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: AppColors.textPrimary),
+            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: AppColors.textPrimary),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
           ),
           const SizedBox(height: 2),
           Text(
-            emp.position,
+            emp.position.isNotEmpty ? emp.position : emp.email,
             style: AppTextStyles.caption.copyWith(fontSize: 11),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
@@ -285,7 +345,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
           ),
           const SizedBox(height: 4),
           Text(
-            emp.departmentName ?? 'Общий',
+            emp.departmentName ?? 'Без отдела',
             style: TextStyle(fontSize: 10, color: AppColors.textSecondary),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
@@ -302,10 +362,13 @@ class _EmployeesPageState extends State<EmployeesPage> {
         children: [
           const Icon(Icons.error_outline, size: 48, color: AppColors.error),
           const SizedBox(height: 12),
-          Text(message, style: AppTextStyles.bodyMedium),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Text(message, style: AppTextStyles.bodyMedium, textAlign: TextAlign.center),
+          ),
           const SizedBox(height: 16),
           ElevatedButton(
-            onPressed: () => context.read<EmployeesBloc>().add(const LoadEmployeesEvent()),
+            onPressed: _reload,
             child: const Text('Повторить'),
           ),
         ],

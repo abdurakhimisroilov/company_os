@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
@@ -8,6 +10,7 @@ import '../../../../core/widgets/glass_card.dart';
 import '../../../../core/widgets/loading_shimmer.dart';
 import '../bloc/customers_bloc.dart';
 import '../../data/models/customer_model.dart';
+import '../widgets/customer_form_sheet.dart';
 
 class CustomersPage extends StatefulWidget {
   const CustomersPage({super.key});
@@ -18,108 +21,56 @@ class CustomersPage extends StatefulWidget {
 
 class _CustomersPageState extends State<CustomersPage> {
   final _searchController = TextEditingController();
+  Timer? _debounce;
 
   @override
   void initState() {
     super.initState();
-    context.read<CustomersBloc>().add(const LoadCustomersEvent());
+    context.read<CustomersBloc>().add(const LoadCustomersEvent(search: ''));
   }
 
   @override
   void dispose() {
+    _debounce?.cancel();
     _searchController.dispose();
     super.dispose();
   }
 
-  void _onSearch(String query) {
-    context.read<CustomersBloc>().add(LoadCustomersEvent(search: query));
+  void _onSearchChanged(String query) {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 400), () {
+      if (mounted) _reload(search: query);
+    });
+    setState(() {});
   }
 
-  void _showAddCustomerDialog() {
-    final nameController = TextEditingController();
-    final phoneController = TextEditingController();
-    final emailController = TextEditingController();
-    final addressController = TextEditingController();
+  /// Reloads the list and finishes when the server has answered.
+  Future<void> _reload({String? search}) async {
+    final completer = Completer<String?>();
+    context.read<CustomersBloc>().add(
+          LoadCustomersEvent(search: search ?? _searchController.text, completer: completer),
+        );
+    final error = await completer.future;
+    if (!mounted || error == null) return;
+    if (context.read<CustomersBloc>().state is CustomersLoaded) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error), backgroundColor: AppColors.error),
+      );
+    }
+  }
 
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) => Container(
-        padding: EdgeInsets.only(
-          bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
-          top: 20,
-          left: 20,
-          right: 20,
-        ),
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text('Новый клиент', style: AppTextStyles.titleMedium),
-            const SizedBox(height: 14),
-            TextField(
-              controller: nameController,
-              decoration: InputDecoration(
-                labelText: 'Имя / Название компании *',
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: phoneController,
-              keyboardType: TextInputType.phone,
-              decoration: InputDecoration(
-                labelText: 'Телефон *',
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: emailController,
-              keyboardType: TextInputType.emailAddress,
-              decoration: InputDecoration(
-                labelText: 'Email',
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: addressController,
-              decoration: InputDecoration(
-                labelText: 'Адрес',
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-            ),
-            const SizedBox(height: 20),
-            ElevatedButton(
-              onPressed: () {
-                if (nameController.text.trim().isNotEmpty && phoneController.text.trim().isNotEmpty) {
-                  Navigator.pop(ctx);
-                  context.read<CustomersBloc>().add(CreateCustomerEvent({
-                        'name': nameController.text.trim(),
-                        'phone': phoneController.text.trim(),
-                        'email': emailController.text.trim(),
-                        'address': addressController.text.trim(),
-                      }));
-                }
-              },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.primaryBlue,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 14),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-              ),
-              child: const Text('Сохранить клиента'),
-            ),
-          ],
-        ),
-      ),
+  Future<void> _showAddCustomerDialog() async {
+    final created = await showCustomerFormSheet(context);
+    if (created == null || !mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Клиент успешно добавлен'), backgroundColor: AppColors.success),
     );
+    await _reload();
+  }
+
+  Future<void> _openCustomer(CustomerModel c) async {
+    await context.push('/customers/${c.id}');
+    if (mounted) await _reload();
   }
 
   @override
@@ -127,7 +78,7 @@ class _CustomersPageState extends State<CustomersPage> {
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SafeArea(
           bottom: false,
           child: Column(
@@ -135,25 +86,15 @@ class _CustomersPageState extends State<CustomersPage> {
               _buildHeader(),
               _buildSearchBar(),
               Expanded(
-                child: BlocConsumer<CustomersBloc, CustomersState>(
-                  listener: (context, state) {
-                    if (state is CustomersActionSuccess) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(state.message), backgroundColor: AppColors.success),
-                      );
-                    }
-                  },
+                child: BlocBuilder<CustomersBloc, CustomersState>(
                   builder: (context, state) {
-                    if (state is CustomersLoading) {
-                      return const LoadingShimmer();
+                    if (state is CustomersLoaded) {
+                      return _buildList(state.customers, state.search);
                     }
                     if (state is CustomersError) {
                       return _buildErrorState(state.message);
                     }
-                    if (state is CustomersLoaded) {
-                      return _buildList(state.customers);
-                    }
-                    return const SizedBox.shrink();
+                    return const LoadingShimmer();
                   },
                 ),
               ),
@@ -176,10 +117,10 @@ class _CustomersPageState extends State<CustomersPage> {
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+            icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
             onPressed: () => context.pop(),
           ),
-          const Expanded(
+          Expanded(
             child: Text(
               'Клиенты',
               style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
@@ -195,17 +136,33 @@ class _CustomersPageState extends State<CustomersPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
       child: Container(
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.9),
+          color: AppColors.cardBackground.withOpacity(0.9),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: AppColors.cardBorder),
         ),
         child: TextField(
           controller: _searchController,
-          onSubmitted: _onSearch,
+          onChanged: _onSearchChanged,
+          onSubmitted: (q) {
+            _debounce?.cancel();
+            _reload(search: q);
+          },
+          textInputAction: TextInputAction.search,
           decoration: InputDecoration(
             hintText: 'Поиск по имени, номеру телефона...',
             hintStyle: TextStyle(color: AppColors.textTertiary, fontSize: 14),
             prefixIcon: const Icon(Icons.search, color: AppColors.primaryBlue),
+            suffixIcon: _searchController.text.isEmpty
+                ? null
+                : IconButton(
+                    icon: Icon(Icons.close, size: 18, color: AppColors.textSecondary),
+                    onPressed: () {
+                      _debounce?.cancel();
+                      _searchController.clear();
+                      setState(() {});
+                      _reload(search: '');
+                    },
+                  ),
             border: InputBorder.none,
             contentPadding: const EdgeInsets.symmetric(vertical: 14),
           ),
@@ -214,13 +171,13 @@ class _CustomersPageState extends State<CustomersPage> {
     );
   }
 
-  Widget _buildList(List<CustomerModel> customers) {
+  Widget _buildList(List<CustomerModel> customers, String search) {
+    final searching = search.isNotEmpty;
     if (customers.isEmpty) {
       return RefreshIndicator(
-        onRefresh: () async {
-          context.read<CustomersBloc>().add(LoadCustomersEvent(search: _searchController.text.trim()));
-        },
+        onRefresh: _reload,
         child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.symmetric(vertical: 60),
           children: [
             Center(
@@ -228,10 +185,14 @@ class _CustomersPageState extends State<CustomersPage> {
                 children: [
                   Icon(Icons.people_outline, size: 56, color: AppColors.textTertiary),
                   const SizedBox(height: 12),
-                  Text('Данных пока нет', style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary)),
+                  Text(searching ? 'Ничего не найдено' : 'Данных пока нет', style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary)),
                   const SizedBox(height: 6),
-                  Text('Добавьте первого клиента компании', style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary)),
+                  Text(
+                    searching ? 'Измените запрос и попробуйте снова' : 'Добавьте первого клиента компании',
+                    style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary),
+                  ),
                   const SizedBox(height: 16),
+                  if (!searching)
                   ElevatedButton.icon(
                     onPressed: _showAddCustomerDialog,
                     icon: const Icon(Icons.person_add, size: 18),
@@ -252,11 +213,10 @@ class _CustomersPageState extends State<CustomersPage> {
     }
 
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<CustomersBloc>().add(LoadCustomersEvent(search: _searchController.text.trim()));
-      },
+      onRefresh: _reload,
       child: ListView.builder(
-        padding: const EdgeInsets.all(16),
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
         itemCount: customers.length,
         itemBuilder: (context, index) {
           final c = customers[index];
@@ -265,7 +225,7 @@ class _CustomersPageState extends State<CustomersPage> {
           return Container(
             margin: const EdgeInsets.only(bottom: 12),
             child: GlassCard(
-              onTap: () => context.push('/customers/${c.id}'),
+              onTap: () => _openCustomer(c),
               padding: const EdgeInsets.all(16),
               borderRadius: 16,
               borderColor: hasDebt ? AppColors.error.withOpacity(0.3) : null,
@@ -275,7 +235,7 @@ class _CustomersPageState extends State<CustomersPage> {
                     radius: 24,
                     backgroundColor: hasDebt ? AppColors.iconBgRed : AppColors.iconBgBlue,
                     child: Text(
-                      c.name.isNotEmpty ? c.name[0] : '?',
+                      c.name.isNotEmpty ? c.name.characters.first.toUpperCase() : '?',
                       style: TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
@@ -290,10 +250,12 @@ class _CustomersPageState extends State<CustomersPage> {
                       children: [
                         Text(
                           c.name,
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
                         ),
-                        const SizedBox(height: 4),
-                        Text(c.phone, style: AppTextStyles.caption),
+                        if (c.phone.isNotEmpty) ...[
+                          const SizedBox(height: 4),
+                          Text(c.phone, style: AppTextStyles.caption),
+                        ],
                       ],
                     ),
                   ),
@@ -326,18 +288,21 @@ class _CustomersPageState extends State<CustomersPage> {
 
   Widget _buildErrorState(String message) {
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.error_outline, size: 48, color: AppColors.error),
-          const SizedBox(height: 12),
-          Text(message, style: AppTextStyles.bodyMedium),
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: () => context.read<CustomersBloc>().add(const LoadCustomersEvent()),
-            child: const Text('Повторить'),
-          ),
-        ],
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.error_outline, size: 48, color: AppColors.error),
+            const SizedBox(height: 12),
+            Text(message, style: AppTextStyles.bodyMedium, textAlign: TextAlign.center),
+            const SizedBox(height: 16),
+            ElevatedButton(
+              onPressed: _reload,
+              child: const Text('Повторить'),
+            ),
+          ],
+        ),
       ),
     );
   }

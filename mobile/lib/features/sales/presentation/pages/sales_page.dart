@@ -26,11 +26,29 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
     super.initState();
     _tabController = TabController(length: _filters.length, vsync: this);
     _tabController.addListener(() {
-      if (!_tabController.indexIsChanging) {
-        context.read<SalesBloc>().add(LoadSalesEvent(status: _filters[_tabController.index]));
-      }
+      if (!_tabController.indexIsChanging) _load();
     });
     context.read<SalesBloc>().add(const LoadSalesEvent());
+  }
+
+  void _load() {
+    context.read<SalesBloc>().add(LoadSalesEvent(status: _filters[_tabController.index]));
+  }
+
+  Future<void> _refresh() async {
+    final error = await context.read<SalesBloc>().refresh();
+    if (error != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error), backgroundColor: AppColors.error),
+      );
+    }
+  }
+
+  /// Opens a page that may change sales and brings the list up to date afterwards.
+  Future<void> _openAndRefresh(String location) async {
+    await context.push(location);
+    if (!mounted) return;
+    context.read<SalesBloc>().add(const RefreshSalesEvent());
   }
 
   @override
@@ -44,7 +62,7 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SafeArea(
           bottom: false,
           child: Column(
@@ -52,25 +70,23 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
               _buildHeader(),
               _buildTabBar(),
               Expanded(
-                child: BlocConsumer<SalesBloc, SalesState>(
-                  listener: (context, state) {
-                    if (state is SalesActionSuccess) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(state.message), backgroundColor: AppColors.success),
-                      );
-                    }
-                  },
+                child: BlocBuilder<SalesBloc, SalesState>(
                   builder: (context, state) {
-                    if (state is SalesLoading) {
-                      return const LoadingShimmer();
-                    }
                     if (state is SalesError) {
                       return _buildErrorState(state.message);
                     }
                     if (state is SalesLoaded) {
-                      return _buildContent(state.sales);
+                      return Column(
+                        children: [
+                          SizedBox(
+                            height: 2,
+                            child: state.isLoading ? const LinearProgressIndicator(minHeight: 2) : null,
+                          ),
+                          Expanded(child: _buildContent(state)),
+                        ],
+                      );
                     }
-                    return const SizedBox.shrink();
+                    return const LoadingShimmer();
                   },
                 ),
               ),
@@ -79,7 +95,7 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
         ),
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => context.push('/sales/add'),
+        onPressed: () => _openAndRefresh('/sales/add'),
         backgroundColor: AppColors.primaryBlue,
         icon: const Icon(Icons.add, color: Colors.white),
         label: const Text('Продажа', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
@@ -93,10 +109,10 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+            icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
             onPressed: () => context.pop(),
           ),
-          const Expanded(
+          Expanded(
             child: Text(
               'Продажи',
               style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
@@ -112,7 +128,7 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
       height: 40,
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.6),
+        color: AppColors.cardBackground.withOpacity(0.6),
         borderRadius: BorderRadius.circular(12),
       ),
       child: TabBar(
@@ -129,13 +145,17 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
     );
   }
 
-  Widget _buildContent(List<SaleModel> sales) {
+  Widget _buildContent(SalesLoaded state) {
+    final sales = state.sales;
+    if (sales.isEmpty && state.isLoading) {
+      return const SizedBox.expand();
+    }
     if (sales.isEmpty) {
+      final isFiltered = state.currentFilter != 'all';
       return RefreshIndicator(
-        onRefresh: () async {
-          context.read<SalesBloc>().add(LoadSalesEvent(status: _filters[_tabController.index]));
-        },
+        onRefresh: _refresh,
         child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.symmetric(vertical: 60),
           children: [
             Center(
@@ -143,21 +163,26 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
                 children: [
                   Icon(Icons.point_of_sale_outlined, size: 56, color: AppColors.textTertiary),
                   const SizedBox(height: 12),
-                  Text('Данных пока нет', style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary)),
-                  const SizedBox(height: 6),
-                  Text('Зарегистрируйте первую продажу компании', style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary)),
-                  const SizedBox(height: 16),
-                  ElevatedButton.icon(
-                    onPressed: () => context.push('/sales/add'),
-                    icon: const Icon(Icons.add, size: 18),
-                    label: const Text('Оформить продажу'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppColors.primaryBlue,
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                    ),
+                  Text(
+                    isFiltered ? 'Продаж с таким статусом нет' : 'Данных пока нет',
+                    style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary),
                   ),
+                  if (!isFiltered) ...[
+                    const SizedBox(height: 6),
+                    Text('Зарегистрируйте первую продажу компании', style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary)),
+                    const SizedBox(height: 16),
+                    ElevatedButton.icon(
+                      onPressed: () => _openAndRefresh('/sales/add'),
+                      icon: const Icon(Icons.add, size: 18),
+                      label: const Text('Оформить продажу'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppColors.primaryBlue,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -167,11 +192,10 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
     }
 
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<SalesBloc>().add(LoadSalesEvent(status: _filters[_tabController.index]));
-      },
+      onRefresh: _refresh,
       child: ListView.builder(
-        padding: const EdgeInsets.all(16),
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
         itemCount: sales.length,
         itemBuilder: (context, index) {
           final sale = sales[index];
@@ -203,7 +227,7 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       child: GlassCard(
-        onTap: () => context.push('/sales/${sale.id}'),
+        onTap: () => _openAndRefresh('/sales/${sale.id}'),
         padding: const EdgeInsets.all(16),
         borderRadius: 16,
         child: Column(
@@ -222,11 +246,19 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        sale.customerName,
-                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
+                        sale.customerLabel,
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                       ),
                       const SizedBox(height: 2),
-                      Text(Formatters.formatDate(sale.date), style: AppTextStyles.caption),
+                      Text(
+                        [
+                          if (sale.saleNumber.isNotEmpty) '№ ${sale.saleNumber}',
+                          if (sale.date != null) Formatters.formatDate(sale.date!.toLocal()),
+                        ].join('  •  '),
+                        style: AppTextStyles.caption,
+                      ),
                     ],
                   ),
                 ),
@@ -251,7 +283,7 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
                     const SizedBox(height: 2),
                     Text(
                       Formatters.formatUzs(sale.totalAmount),
-                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
                     ),
                   ],
                 ),
@@ -282,10 +314,13 @@ class _SalesPageState extends State<SalesPage> with SingleTickerProviderStateMix
         children: [
           const Icon(Icons.error_outline, size: 48, color: AppColors.error),
           const SizedBox(height: 12),
-          Text(message, style: AppTextStyles.bodyMedium),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Text(message, style: AppTextStyles.bodyMedium, textAlign: TextAlign.center),
+          ),
           const SizedBox(height: 16),
           ElevatedButton(
-            onPressed: () => context.read<SalesBloc>().add(const LoadSalesEvent()),
+            onPressed: _load,
             child: const Text('Повторить'),
           ),
         ],

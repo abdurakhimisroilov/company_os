@@ -1,5 +1,10 @@
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:dio/dio.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/di/injection.dart';
+import '../../../../core/network/api_error.dart';
+import '../../../../core/services/app_session.dart';
+import '../../../../core/services/security_service.dart';
 import '../../data/models/user_model.dart';
 import '../../data/repositories/auth_repository.dart';
 
@@ -25,27 +30,31 @@ class RegisterRequested extends AuthEvent {
   final String password;
   final String fullName;
   final String? phone;
+  final String? companyName;
 
   const RegisterRequested({
     required this.email,
     required this.password,
     required this.fullName,
     this.phone,
+    this.companyName,
   });
 
   @override
-  List<Object?> get props => [email, password, fullName, phone];
+  List<Object?> get props => [email, password, fullName, phone, companyName];
 }
 
 class LogoutRequested extends AuthEvent {}
 
-class RefreshTokenRequested extends AuthEvent {}
+/// The server no longer accepts this session (expired, revoked, account removed).
+class SessionExpired extends AuthEvent {}
 
-class DemoLoginRequested extends AuthEvent {
-  final String email;
-  const DemoLoginRequested({this.email = 'isroilov540@gmail.com'});
+/// The profile changed on this device (edit profile, role change) or should be re-read.
+class UserUpdated extends AuthEvent {
+  final UserModel user;
+  const UserUpdated(this.user);
   @override
-  List<Object?> get props => [email];
+  List<Object?> get props => [user];
 }
 
 // ─── States ─────────────────────────────────────────────────────────────────
@@ -83,26 +92,9 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
     on<CheckAuthStatus>(_onCheckAuthStatus);
     on<LoginRequested>(_onLoginRequested);
     on<RegisterRequested>(_onRegisterRequested);
-    on<DemoLoginRequested>(_onDemoLoginRequested);
     on<LogoutRequested>(_onLogoutRequested);
-  }
-
-  Future<void> _onDemoLoginRequested(
-    DemoLoginRequested event,
-    Emitter<AuthState> emit,
-  ) async {
-    emit(AuthLoading());
-    final email = event.email.trim();
-    final demoUser = UserModel(
-      id: 'demo-001',
-      email: email.isNotEmpty ? email : 'isroilov540@gmail.com',
-      fullName: email.contains('isroilov') ? 'Исроил Исмоилов' : 'Администратор Системы',
-      role: 'SUPER_ADMIN',
-      departmentName: 'Руководство',
-      phone: '+998 90 062-27-25',
-      isActive: true,
-    );
-    emit(AuthAuthenticated(demoUser));
+    on<SessionExpired>(_onSessionExpired);
+    on<UserUpdated>((event, emit) => emit(AuthAuthenticated(event.user)));
   }
 
   Future<void> _onCheckAuthStatus(
@@ -110,18 +102,25 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
     Emitter<AuthState> emit,
   ) async {
     emit(AuthLoading());
+    if (!await authRepository.isAuthenticated()) {
+      emit(AuthUnauthenticated());
+      return;
+    }
     try {
-      final isAuth = await authRepository.isAuthenticated();
-      if (isAuth) {
-        final user = await authRepository.getCurrentUser();
-        if (user != null) {
-          emit(AuthAuthenticated(user));
-          return;
-        }
+      emit(AuthAuthenticated(await authRepository.fetchCurrentUser()));
+    } on DioException catch (e) {
+      final status = e.response?.statusCode;
+      if (status == 401 || status == 403 || status == 404) {
+        await _endSession();
+        emit(AuthUnauthenticated());
+        return;
       }
-      emit(AuthUnauthenticated());
+      // Offline or server down: keep the saved session and the last known profile.
+      final cached = await authRepository.getCachedUser();
+      emit(cached != null ? AuthAuthenticated(cached) : AuthUnauthenticated());
     } catch (_) {
-      emit(AuthUnauthenticated());
+      final cached = await authRepository.getCachedUser();
+      emit(cached != null ? AuthAuthenticated(cached) : AuthUnauthenticated());
     }
   }
 
@@ -131,13 +130,11 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
   ) async {
     emit(AuthLoading());
     try {
-      final user = await authRepository.login(
-        email: event.email,
-        password: event.password,
-      );
+      final user = await authRepository.login(email: event.email, password: event.password);
+      AppSession.instance.restart();
       emit(AuthAuthenticated(user));
     } catch (e) {
-      emit(AuthError(e.toString().replaceAll('Exception: ', '')));
+      emit(AuthError(apiErrorMessage(e, fallback: 'Не удалось войти. Попробуйте ещё раз')));
     }
   }
 
@@ -152,20 +149,37 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
         password: event.password,
         fullName: event.fullName,
         phone: event.phone,
+        companyName: event.companyName,
       );
+      AppSession.instance.restart();
       emit(AuthAuthenticated(user));
     } catch (e) {
-      final msg = e.toString().replaceAll('Exception: ', '').replaceAll('DioException: ', '');
-      emit(AuthError(msg));
+      emit(AuthError(apiErrorMessage(e, fallback: 'Не удалось зарегистрироваться. Попробуйте ещё раз')));
     }
+  }
+
+  // PIN and biometric unlock belong to the account that set them up.
+  Future<void> _endSession() async {
+    await authRepository.logout();
+    try {
+      await getIt<SecurityService>().clearAllSecurity();
+    } catch (_) {}
   }
 
   Future<void> _onLogoutRequested(
     LogoutRequested event,
     Emitter<AuthState> emit,
   ) async {
-    emit(AuthLoading());
-    await authRepository.logout();
+    await _endSession();
+    emit(AuthUnauthenticated());
+  }
+
+  Future<void> _onSessionExpired(
+    SessionExpired event,
+    Emitter<AuthState> emit,
+  ) async {
+    if (state is AuthUnauthenticated) return;
+    await _endSession();
     emit(AuthUnauthenticated());
   }
 }

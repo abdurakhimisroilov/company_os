@@ -8,51 +8,48 @@ class CompanyRepository {
 
   CompanyRepository({required this.apiClient});
 
+  Map<String, dynamic> _data(dynamic body) {
+    final map = JsonHelpers.toMap(body);
+    return map['data'] is Map ? JsonHelpers.toMap(map['data']) : map;
+  }
+
+  /// Organizations the signed-in user belongs to; the active one comes first.
   Future<List<CompanyModel>> getCompanies() async {
     final response = await apiClient.get(ApiEndpoints.companies);
-    if (response.statusCode == 200) {
-      final list = JsonHelpers.toList(response.data);
-      return list.map((e) => CompanyModel.fromJson(JsonHelpers.toMap(e))).toList();
-    }
-    throw Exception('Не удалось загрузить список организаций');
+    return JsonHelpers.toList(response.data).map((e) => CompanyModel.fromJson(JsonHelpers.toMap(e))).toList();
   }
 
   Future<CompanyModel> getCurrentCompany() async {
     final response = await apiClient.get(ApiEndpoints.currentCompany);
-    if (response.statusCode == 200) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return CompanyModel.fromJson(map);
+    final map = _data(response.data);
+    if (JsonHelpers.toStr(map['id']).isEmpty) {
+      throw Exception('Активная организация не выбрана');
     }
-    throw Exception('Не удалось загрузить текущую организацию');
+    return CompanyModel.fromJson(map);
   }
 
+  /// Creates an organization; the server makes it the active one.
   Future<CompanyModel> createCompany(Map<String, dynamic> data) async {
     final response = await apiClient.post(ApiEndpoints.companies, data: data);
-    if (response.statusCode == 200 || response.statusCode == 201) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return CompanyModel.fromJson(map);
-    }
-    throw Exception('Не удалось создать организацию');
+    return CompanyModel.fromJson(_data(response.data));
   }
 
+  /// The choice is stored on the server, so it survives restarts and other devices.
   Future<CompanyModel> switchCompany(String companyId) async {
     final response = await apiClient.post(ApiEndpoints.switchCompany, data: {'companyId': companyId});
-    if (response.statusCode == 200) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return CompanyModel.fromJson(map);
-    }
-    throw Exception('Не удалось переключить организацию');
+    return CompanyModel.fromJson(_data(response.data));
+  }
+
+  Future<CompanyModel> updateCompany(String companyId, Map<String, dynamic> data) async {
+    final response = await apiClient.patch('${ApiEndpoints.companies}/$companyId', data: data);
+    return CompanyModel.fromJson(_data(response.data));
+  }
+
+  /// Deletes the organization with all its data. Returns the id of the
+  /// organization that is active afterwards.
+  Future<String?> deleteCompany(String companyId) async {
+    final response = await apiClient.delete('${ApiEndpoints.companies}/$companyId');
+    final id = JsonHelpers.toStr(JsonHelpers.toMap(response.data)['currentCompanyId']);
+    return id.isEmpty ? null : id;
   }
 }

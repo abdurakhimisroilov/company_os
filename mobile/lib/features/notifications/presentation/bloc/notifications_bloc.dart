@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/network/api_error.dart';
 import '../../data/models/notification_model.dart';
 import '../../data/repositories/notifications_repository.dart';
 
@@ -10,7 +12,12 @@ abstract class NotificationsEvent extends Equatable {
   List<Object?> get props => [];
 }
 
-class LoadNotificationsEvent extends NotificationsEvent {}
+class LoadNotificationsEvent extends NotificationsEvent {
+  /// Completed when the request has finished, successfully or not
+  /// (pull-to-refresh waits on it).
+  final Completer<void>? done;
+  const LoadNotificationsEvent({this.done});
+}
 
 class MarkAllNotificationsReadEvent extends NotificationsEvent {}
 
@@ -41,9 +48,17 @@ class NotificationsLoading extends NotificationsState {}
 
 class NotificationsLoaded extends NotificationsState {
   final List<AppNotificationModel> notifications;
-  const NotificationsLoaded(this.notifications);
+
+  /// A change that the server refused; the list is already back as it was.
+  final String? actionError;
+  final int _errorSeq;
+
+  const NotificationsLoaded(this.notifications, {this.actionError, int errorSeq = 0}) : _errorSeq = errorSeq;
+
+  int get unreadCount => notifications.where((n) => !n.isRead).length;
+
   @override
-  List<Object?> get props => [notifications];
+  List<Object?> get props => [notifications, actionError, _errorSeq];
 }
 
 class NotificationsError extends NotificationsState {
@@ -56,6 +71,7 @@ class NotificationsError extends NotificationsState {
 // ─── BLoC ───────────────────────────────────────────────────────────────────
 class NotificationsBloc extends Bloc<NotificationsEvent, NotificationsState> {
   final NotificationsRepository notificationsRepository;
+  int _errorSeq = 0;
 
   NotificationsBloc({required this.notificationsRepository}) : super(NotificationsInitial()) {
     on<LoadNotificationsEvent>(_onLoad);
@@ -64,40 +80,78 @@ class NotificationsBloc extends Bloc<NotificationsEvent, NotificationsState> {
     on<DeleteNotificationEvent>(_onDelete);
   }
 
+  List<AppNotificationModel>? get _current {
+    final s = state;
+    return s is NotificationsLoaded ? s.notifications : null;
+  }
+
+  NotificationsLoaded _failed(List<AppNotificationModel> list, Object error, String fallback) {
+    return NotificationsLoaded(list, actionError: apiErrorMessage(error, fallback: fallback), errorSeq: ++_errorSeq);
+  }
+
   Future<void> _onLoad(LoadNotificationsEvent event, Emitter<NotificationsState> emit) async {
-    emit(NotificationsLoading());
+    // A list that is already on screen stays there while it is refreshed.
+    final shown = _current;
+    if (shown == null) emit(NotificationsLoading());
     try {
       final list = await notificationsRepository.getNotifications();
       emit(NotificationsLoaded(list));
     } catch (e) {
-      emit(NotificationsError(e.toString().replaceAll('Exception: ', '')));
+      if (shown != null) {
+        emit(_failed(_current ?? shown, e, 'Не удалось обновить уведомления'));
+      } else {
+        emit(NotificationsError(apiErrorMessage(e, fallback: 'Не удалось загрузить уведомления')));
+      }
+    } finally {
+      final done = event.done;
+      if (done != null && !done.isCompleted) done.complete();
     }
   }
 
   Future<void> _onMarkAllRead(MarkAllNotificationsReadEvent event, Emitter<NotificationsState> emit) async {
+    final before = _current;
+    if (before == null || before.every((n) => n.isRead)) return;
+    emit(NotificationsLoaded(before.map((n) => n.copyWith(isRead: true)).toList()));
     try {
       await notificationsRepository.markAllAsRead();
-      add(LoadNotificationsEvent());
     } catch (e) {
-      emit(NotificationsError(e.toString().replaceAll('Exception: ', '')));
+      emit(_failed(before, e, 'Не удалось отметить уведомления прочитанными'));
     }
   }
 
   Future<void> _onMarkRead(MarkNotificationReadEvent event, Emitter<NotificationsState> emit) async {
+    final before = _current;
+    if (before == null) return;
+    if (!before.any((n) => n.id == event.id && !n.isRead)) return;
+    emit(NotificationsLoaded(before.map((n) => n.id == event.id ? n.copyWith(isRead: true) : n).toList()));
     try {
       await notificationsRepository.markAsRead(event.id);
-      add(LoadNotificationsEvent());
     } catch (e) {
-      emit(NotificationsError(e.toString().replaceAll('Exception: ', '')));
+      final now = _current ?? before;
+      emit(_failed(
+        now.map((n) => n.id == event.id ? n.copyWith(isRead: false) : n).toList(),
+        e,
+        'Не удалось отметить уведомление прочитанным',
+      ));
     }
   }
 
   Future<void> _onDelete(DeleteNotificationEvent event, Emitter<NotificationsState> emit) async {
+    final before = _current;
+    if (before == null) return;
+    final index = before.indexWhere((n) => n.id == event.id);
+    if (index < 0) return;
+    final removed = before[index];
+    emit(NotificationsLoaded(before.where((n) => n.id != event.id).toList()));
     try {
       await notificationsRepository.deleteNotification(event.id);
-      add(LoadNotificationsEvent());
     } catch (e) {
-      emit(NotificationsError(e.toString().replaceAll('Exception: ', '')));
+      // Put the notification back where it was.
+      final now = List<AppNotificationModel>.of(_current ?? const []);
+      if (!now.any((n) => n.id == removed.id)) {
+        now.insert(index.clamp(0, now.length), removed);
+      }
+      emit(_failed(now, e, 'Не удалось удалить уведомление'));
     }
   }
 }

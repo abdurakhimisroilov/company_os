@@ -59,14 +59,16 @@ void main() {
     });
 
     test('TaskModel parses flat or populated relations without crashing', () {
-      final jsonWithStringRelation = {
+      // Shape returned by GET /tasks: ids in assigned_to/created_by, names alongside.
+      final json = {
         'id': 'task-1',
         'title': 'Подготовить отчёт',
-        'assignedTo': 'Сардор Рахимов', // String instead of object!
-        'createdBy': 'Тимур Алиев',
+        'assigned_to': '7d878ac2-9033-48da-a102-97d8ea4c0c1f',
+        'assignedToName': 'Сардор Рахимов',
+        'created_by_name': 'Тимур Алиев',
         'progress': '75',
       };
-      final task = TaskModel.fromJson(jsonWithStringRelation);
+      final task = TaskModel.fromJson(json);
       expect(task.assignedToName, equals('Сардор Рахимов'));
       expect(task.createdByName, equals('Тимур Алиев'));
       expect(task.progress, equals(0.75));

@@ -1,8 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// DATE columns are calendar days; keep them as 'YYYY-MM-DD' instead of letting
+// node-postgres turn them into a server-local midnight timestamp.
+types.setTypeParser(1082, (value) => value);
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
@@ -13,24 +18,33 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'company_os_jwt_secret_key_2026_super_secure';
 
-// Upload directory
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+const DEV_JWT_SECRET = 'company_os_jwt_secret_key_2026_super_secure';
+const JWT_SECRET = process.env.JWT_SECRET || DEV_JWT_SECRET;
+if (JWT_SECRET === DEV_JWT_SECRET) {
+  console.warn('⚠️  JWT_SECRET is not set. The built-in secret is public; set JWT_SECRET before serving real users.');
 }
+const ACCESS_TTL = process.env.JWT_EXPIRES_IN || '7d';
+const REFRESH_TTL = process.env.JWT_REFRESH_EXPIRES_IN || '30d';
+const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}-${Math.random().toString(36).substring(2, 9)}${ext}`);
-  },
+// ============================================================================
+// INFRASTRUCTURE
+// ============================================================================
+const uploadDir = path.join(__dirname, 'uploads');
+fs.mkdirSync(uploadDir, { recursive: true });
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadDir),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase().replace(/[^.a-z0-9]/g, '').slice(0, 10);
+      cb(null, `${Date.now()}-${crypto.randomBytes(12).toString('hex')}${ext}`);
+    },
+  }),
+  limits: { fileSize: 25 * 1024 * 1024 },
 });
-const upload = multer({ storage });
 
-// Database Pool
 const pool = new Pool({
   host: process.env.DB_HOST || '172.17.0.5',
   port: parseInt(process.env.DB_PORT || '5432', 10),
@@ -39,2052 +53,2395 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD || 'company_os_password_2026',
   max: 20,
   idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
-// Test DB
 pool.query('SELECT NOW()', (err, res) => {
-  if (err) {
-    console.error('❌ Database connection error:', err.message);
-  } else {
-    console.log('✅ PostgreSQL connected successfully at:', res.rows[0].now);
-  }
+  if (err) console.error('❌ Database connection error:', err.message);
+  else console.log('✅ PostgreSQL connected successfully at:', res.rows[0].now);
 });
 
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (v) => typeof v === 'string' && UUID_RE.test(v);
+const uuidOrNull = (v) => (isUuid(v) ? v : null);
+const str = (v) => (v == null ? '' : String(v).trim());
+const strOrNull = (v) => (str(v) === '' ? null : str(v));
+
+function num(v, fallback = 0) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : fallback;
+  if (v == null) return fallback;
+  const n = parseFloat(String(v).replace(/\s/g, '').replace(',', '.'));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function requirePositive(v, label) {
+  const n = num(v, NaN);
+  if (!Number.isFinite(n) || n <= 0) throw new HttpError(400, `${label} должна быть больше 0`);
+  return Math.round(n * 100) / 100;
+}
+
+function dateOrToday(v) {
+  if (!v) return new Date().toISOString().slice(0, 10);
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return new Date().toISOString().slice(0, 10);
+  // The app sends local midnight as an ISO string; keep the calendar day the user picked.
+  const s = String(v);
+  return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : d.toISOString().slice(0, 10);
+}
+
+const NUMERIC_KEY = /(^|_)(amount|balance|price|cost|total|subtotal|quantity|discount|tax|salary|costs|paid|debt|value|level|count|progress|size)($|_)/;
+
+// Rows go out with their snake_case columns plus camelCase aliases, and DECIMAL
+// columns as numbers, because the app models read either spelling.
+function out(row) {
+  if (row == null || typeof row !== 'object') return row;
+  if (Array.isArray(row)) return row.map(out);
+  if (row instanceof Date) return row;
+  const res = {};
+  for (const [k, raw] of Object.entries(row)) {
+    if (k === 'password_hash' || k === 'token_version' || k === 'fcm_token') continue;
+    let v = raw;
+    if (typeof v === 'string' && NUMERIC_KEY.test(k) && /^-?\d+(\.\d+)?$/.test(v)) v = parseFloat(v);
+    else if (v && typeof v === 'object' && !(v instanceof Date)) v = out(v);
+    res[k] = v;
+    const camel = k.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+    if (camel !== k && !(camel in row)) res[camel] = v;
+  }
+  return res;
+}
+
+const h = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+async function tx(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+function fileUrl(relative) {
+  if (!relative) return relative;
+  return PUBLIC_URL && relative.startsWith('/') ? `${PUBLIC_URL}${relative}` : relative;
+}
+
+// multer decodes multipart file names as latin1; browsers and Dio send UTF-8.
+function originalName(file) {
+  const raw = file.originalname || 'file';
+  const decoded = Buffer.from(raw, 'latin1').toString('utf8');
+  return decoded.includes('\uFFFD') ? raw : decoded;
+}
+
+function removeUploadedFile(url) {
+  if (!url) return;
+  const name = path.basename(String(url).split('?')[0]);
+  const full = path.join(uploadDir, name);
+  if (full.startsWith(uploadDir + path.sep)) fs.unlink(full, () => {});
+}
+
+app.set('trust proxy', true);
 app.use(cors({ origin: '*', credentials: true }));
-app.use(express.json());
-app.use('/uploads', express.static(uploadDir));
+app.use(express.json({ limit: '2mb' }));
+app.use('/uploads', express.static(uploadDir, { fallthrough: false, index: false }));
 
 const webDir = path.join(__dirname, 'web');
-if (fs.existsSync(webDir)) {
-  app.use(express.static(webDir));
-}
+if (fs.existsSync(webDir)) app.use(express.static(webDir));
 
-// Request logger
 app.use((req, res, next) => {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  console.log(`[${new Date().toLocaleTimeString()}] 📱 ${ip} -> ${req.method} ${req.originalUrl}`);
+  console.log(`[${new Date().toISOString()}] ${req.ip} -> ${req.method} ${req.originalUrl.split('?')[0]}`);
   next();
 });
 
-// Helper: JWT Auth Middleware
-function authMiddleware(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader) return next();
-  const token = authHeader.replace('Bearer ', '');
+// ============================================================================
+// AUTHENTICATION MIDDLEWARE
+// ============================================================================
+const ADMIN_ROLES = new Set(['OWNER', 'SUPER_ADMIN', 'ADMIN']);
+const ROLE_IDS = ['SUPER_ADMIN', 'ADMIN', 'MANAGER', 'ACCOUNTANT', 'WAREHOUSE_KEEPER', 'EMPLOYEE'];
+
+function signTokens(user) {
+  const base = { sub: user.id, email: user.email, tv: user.token_version || 0 };
+  return {
+    accessToken: jwt.sign({ ...base, typ: 'access' }, JWT_SECRET, { expiresIn: ACCESS_TTL }),
+    refreshToken: jwt.sign({ ...base, typ: 'refresh' }, JWT_SECRET, { expiresIn: REFRESH_TTL }),
+  };
+}
+
+async function resolveMembership(userId, preferredCompanyId) {
+  const res = await pool.query(
+    `SELECT uc.company_id, uc.role
+     FROM user_companies uc JOIN companies c ON c.id = uc.company_id AND c.is_active
+     WHERE uc.user_id = $1
+     ORDER BY (uc.company_id = $2) DESC, uc.is_default DESC, uc.created_at ASC
+     LIMIT 1`,
+    [userId, preferredCompanyId]
+  );
+  return res.rows[0] || null;
+}
+
+async function authenticate(req, res, next) {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-  } catch (e) {
-    // Ignore invalid token or let route handle
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) throw new HttpError(401, 'Требуется авторизация');
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (e) {
+      throw new HttpError(401, 'Сессия истекла. Войдите снова');
+    }
+    if (decoded.typ === 'refresh') throw new HttpError(401, 'Недействительный токен');
+
+    const userRes = await pool.query(
+      `SELECT id, email, full_name, role, is_active, token_version, current_company_id FROM users WHERE id = $1`,
+      [decoded.sub]
+    );
+    const user = userRes.rows[0];
+    if (!user || !user.is_active) throw new HttpError(401, 'Учётная запись недоступна');
+    if (decoded.tv != null && decoded.tv !== user.token_version) throw new HttpError(401, 'Сессия истекла. Войдите снова');
+
+    const membership = await resolveMembership(user.id, user.current_company_id);
+    req.user = { id: user.id, sub: user.id, email: user.email, fullName: user.full_name };
+    req.companyId = membership ? membership.company_id : null;
+    req.companyRole = membership ? membership.role : null;
+    if (membership && membership.company_id !== user.current_company_id) {
+      await pool.query(`UPDATE users SET current_company_id = $1 WHERE id = $2`, [membership.company_id, user.id]);
+    }
+    next();
+  } catch (err) {
+    next(err);
   }
+}
+
+function requireCompany(req, res, next) {
+  if (!req.companyId) return next(new HttpError(409, 'У вас нет организации. Создайте организацию в разделе «Мои организации»'));
   next();
 }
-app.use(authMiddleware);
 
-// ============================================================================
-// HEALTH CHECK
-// ============================================================================
-app.get('/api/v1/health', async (req, res) => {
-  try {
-    const dbRes = await pool.query('SELECT count(*) FROM users');
-    res.json({
-      status: 'ok',
-      server: 'COMPANY OS Enterprise PostgreSQL Server',
-      database: 'connected',
-      usersCount: parseInt(dbRes.rows[0].count, 10),
-      timestamp: new Date().toISOString(),
-    });
-  } catch (e) {
-    res.json({
-      status: 'degraded',
-      server: 'COMPANY OS Enterprise Server',
-      database: 'error',
-      error: e.message,
-      timestamp: new Date().toISOString(),
-    });
+function requireAdmin(req, res, next) {
+  if (!ADMIN_ROLES.has(req.companyRole)) return next(new HttpError(403, 'Недостаточно прав для этого действия'));
+  next();
+}
+
+const appRole = (companyRole) => (companyRole === 'OWNER' ? 'SUPER_ADMIN' : companyRole || 'EMPLOYEE');
+
+// Attempts per (ip, email) in a sliding window; keeps password guessing slow.
+const loginAttempts = new Map();
+function checkLoginRate(key) {
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000;
+  const list = (loginAttempts.get(key) || []).filter((t) => now - t < windowMs);
+  if (list.length >= 10) throw new HttpError(429, 'Слишком много попыток входа. Повторите через 15 минут');
+  list.push(now);
+  loginAttempts.set(key, list);
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, list] of loginAttempts) {
+    if (list.every((t) => now - t > 15 * 60 * 1000)) loginAttempts.delete(k);
   }
-});
+}, 5 * 60 * 1000).unref();
 
 // ============================================================================
-// APP VERSION & AUTO-UPDATE
+// PUBLIC ROUTES
 // ============================================================================
+const api = express.Router();
+app.use('/api/v1', api);
+
+api.get('/health', h(async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', server: 'COMPANY OS Server', database: 'connected', timestamp: new Date().toISOString() });
+  } catch (e) {
+    res.status(503).json({ status: 'degraded', database: 'error', timestamp: new Date().toISOString() });
+  }
+}));
+
 const updatesDir = path.join(__dirname, 'updates');
-if (!fs.existsSync(updatesDir)) {
-  try { fs.mkdirSync(updatesDir, { recursive: true }); } catch (e) {}
-}
+try { fs.mkdirSync(updatesDir, { recursive: true }); } catch (e) { /* read-only deploys */ }
 
 const currentAppVersion = {
-  versionCode: 4,
-  versionName: '1.0.3',
+  versionCode: 5,
+  versionName: '1.1.0',
   minSupportedVersion: 1,
-  downloadUrl: 'http://45.158.199.215:3000/api/v1/app/download',
-  fileSize: 48696791,
-  title: 'Обновление Company OS v1.0.3',
+  fileSize: 0,
+  title: 'Обновление Company OS v1.1.0',
   changelog: [
-    'Мультикомпания: добавление новых организаций и филиалов прямо в приложении',
-    'Мгновенное переключение между компаниями в шапке дашборда и настройках',
-    'Раздельный баланс, счета и аналитика для каждой компании',
-    'Прикрепление документов (DOCX, PDF, Excel, чеки) к доходам, расходам и долгам',
-    'Оплата и погашение задолженностей с прикреплением актов',
-    'Повышена стабильность работы уведомлений и базы данных'
+    'Раздельные данные для каждой организации',
+    'Тёмная тема',
+    'Исправлено сохранение доходов и расходов',
+    'Просмотр и удаление прикреплённых документов',
   ],
   forceUpdate: false,
-  releaseDate: '2026-11-15T16:00:00Z'
+  releaseDate: '2026-11-19T00:00:00Z',
 };
 
-app.get('/api/v1/app/version', (req, res) => {
+api.get('/app/version', (req, res) => {
   const apkPath = path.join(updatesDir, 'CompanyOS-latest.apk');
-  let size = currentAppVersion.fileSize;
-  if (fs.existsSync(apkPath)) {
-    try {
-      const stats = fs.statSync(apkPath);
-      size = stats.size;
-    } catch (_) {}
-  }
-  res.json({ ...currentAppVersion, fileSize: size });
+  const hasApk = fs.existsSync(apkPath);
+  const base = PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+  res.json({
+    ...currentAppVersion,
+    fileSize: hasApk ? fs.statSync(apkPath).size : 0,
+    downloadUrl: hasApk ? `${base}/api/v1/app/download` : null,
+  });
 });
 
-app.get('/api/v1/app/download', (req, res) => {
+api.get('/app/download', (req, res) => {
   const apkPath = path.join(updatesDir, 'CompanyOS-latest.apk');
-  if (fs.existsSync(apkPath)) {
-    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-    res.download(apkPath, 'CompanyOS-latest.apk');
-  } else {
-    res.status(404).json({ error: 'APK file not found on server' });
-  }
+  if (!fs.existsSync(apkPath)) return res.status(404).json({ message: 'Файл обновления не найден на сервере' });
+  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+  res.download(apkPath, 'CompanyOS-latest.apk');
 });
 
-// ============================================================================
-// COMPANIES & ORGANIZATIONS (MULTI-TENANT)
-// ============================================================================
-
-// Get all companies
-app.get('/api/v1/companies', async (req, res) => {
-  const userId = req.user ? (req.user.sub || req.user.id) : null;
-  try {
-    let result;
-    if (userId) {
-      result = await pool.query(
-        `SELECT c.*, uc.role as user_role,
-                CASE WHEN u.current_company_id = c.id THEN TRUE ELSE FALSE END as is_current
-         FROM companies c
-         LEFT JOIN user_companies uc ON c.id = uc.company_id AND uc.user_id = $1
-         LEFT JOIN users u ON u.id = $1
-         WHERE c.is_active = TRUE
-         ORDER BY is_current DESC, c.created_at ASC`,
-        [userId]
-      );
-    } else {
-      result = await pool.query(`SELECT *, FALSE as is_current FROM companies WHERE is_active = TRUE ORDER BY created_at ASC`);
-    }
-
-    if (result.rows.length === 0) {
-      const defRes = await pool.query(`SELECT *, TRUE as is_current FROM companies LIMIT 1`);
-      return res.json({ data: defRes.rows });
-    }
-
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Get current company
-app.get('/api/v1/companies/current', async (req, res) => {
-  const userId = req.user ? (req.user.sub || req.user.id) : null;
-  try {
-    let company;
-    if (userId) {
-      const resUser = await pool.query(`SELECT current_company_id FROM users WHERE id = $1`, [userId]);
-      const currentId = resUser.rows[0]?.current_company_id;
-      if (currentId) {
-        const cRes = await pool.query(`SELECT * FROM companies WHERE id = $1`, [currentId]);
-        if (cRes.rows.length > 0) company = cRes.rows[0];
-      }
-    }
-    if (!company) {
-      const cRes = await pool.query(`SELECT * FROM companies WHERE is_active = TRUE ORDER BY created_at ASC LIMIT 1`);
-      company = cRes.rows[0];
-    }
-    res.json({ data: company });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Create new company
-app.post('/api/v1/companies', async (req, res) => {
-  const { name, taxId, currency, description, address, phone, email, logoUrl } = req.body;
-  if (!name || !name.trim()) {
-    return res.status(400).json({ message: 'Название компании обязательно' });
-  }
-
-  const userId = req.user ? (req.user.sub || req.user.id) : null;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // 1. Create company
-    const compRes = await client.query(
-      `INSERT INTO companies (name, tax_id, currency, description, address, phone, email, logo_url, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [name.trim(), taxId || null, currency || 'UZS', description || '', address || '', phone || '', email || '', logoUrl || null, userId || null]
-    );
-    const newCompany = compRes.rows[0];
-
-    // 2. Link creator as OWNER
-    if (userId) {
-      await client.query(
-        `INSERT INTO user_companies (user_id, company_id, role, is_default)
-         VALUES ($1, $2, 'OWNER', FALSE)
-         ON CONFLICT (user_id, company_id) DO NOTHING`,
-        [userId, newCompany.id]
-      );
-
-      // 3. Switch user active company
-      await client.query(`UPDATE users SET current_company_id = $1 WHERE id = $2`, [newCompany.id, userId]);
-    }
-
-    // 4. Create default accounts for new company
-    await client.query(
-      `INSERT INTO accounts (name, type, balance, currency, company_id)
-       VALUES 
-       ($1, 'CASH', 0.00, $2, $3),
-       ($4, 'BANK', 0.00, $2, $3)`,
-      [`Касса (${name.trim()})`, currency || 'UZS', newCompany.id, `Основной р/с (${name.trim()})`]
-    );
-
-    await client.query('COMMIT');
-    await createNotification(userId, 'Организация создана', `Компания "${newCompany.name}" успешно зарегистрирована`, 'SYSTEM', newCompany.id);
-
-    res.status(201).json({ data: { ...newCompany, is_current: true } });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ message: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-// Switch company
-app.post('/api/v1/companies/switch', async (req, res) => {
-  const { companyId } = req.body;
-  if (!companyId) return res.status(400).json({ message: 'companyId обязателен' });
-
-  const userId = req.user ? (req.user.sub || req.user.id) : null;
-  try {
-    const compRes = await pool.query(`SELECT * FROM companies WHERE id = $1 AND is_active = TRUE`, [companyId]);
-    if (compRes.rows.length === 0) {
-      return res.status(404).json({ message: 'Компания не найдена' });
-    }
-    const targetComp = compRes.rows[0];
-
-    if (userId) {
-      await pool.query(
-        `INSERT INTO user_companies (user_id, company_id, role)
-         VALUES ($1, $2, 'ADMIN')
-         ON CONFLICT (user_id, company_id) DO NOTHING`,
-        [userId, companyId]
-      );
-      await pool.query(`UPDATE users SET current_company_id = $1 WHERE id = $2`, [companyId, userId]);
-    }
-
-    res.json({
-      success: true,
-      message: `Переключено на компанию: ${targetComp.name}`,
-      data: { ...targetComp, is_current: true }
-    });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-// ============================================================================
-// 1. AUTHENTICATION & USERS
-// ============================================================================
-app.post('/api/v1/auth/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  console.log(`🔑 Login attempt: ${email}`);
-
-  try {
-    const result = await pool.query(
-      `SELECT u.*, d.name as department_name 
-       FROM users u 
-       LEFT JOIN departments d ON u.department_id = d.id 
-       WHERE LOWER(u.email) = LOWER($1) AND u.is_active = TRUE`,
-      [email ? email.trim() : '']
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(401).json({ message: 'Неверный адрес электронной почты или пароль' });
-    }
-
-    const user = result.rows[0];
-    let isMatch = false;
-
-    if (user.password_hash) {
-      isMatch = await bcrypt.compare(password, user.password_hash);
-    }
-    // Fallback for initial demo seed password
-    if (!isMatch && (password === '900622725' || password === 'Employee123!' || password === 'Admin123!')) {
-      isMatch = true;
-    }
-
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Неверный адрес электронной почты или пароль' });
-    }
-
-    const payload = {
-      sub: user.id,
-      email: user.email,
-      role: user.role,
-      fullName: user.full_name,
-    };
-
-    const accessToken = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
-    const refreshToken = jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
-
-    const userProfile = {
-      id: user.id,
-      email: user.email,
-      fullName: user.full_name,
-      role: user.role,
-      departmentId: user.department_id,
-      departmentName: user.department_name || 'Общий',
-      phone: user.phone,
-      avatarUrl: user.avatar_url,
-      position: user.position || 'Специалист',
-      isActive: user.is_active,
-      createdAt: user.created_at,
-    };
-
-    res.json({
-      accessToken,
-      refreshToken,
-      user: userProfile,
-    });
-  } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ message: 'Внутренняя ошибка сервера' });
-  }
-});
-
-app.post('/api/v1/auth/register', async (req, res) => {
-  const { email, password, fullName, phone, role, position } = req.body || {};
-  console.log(`📝 Registration attempt: ${email}`);
-
-  if (!email || !password || !fullName) {
-    return res.status(400).json({ message: 'Заполните все обязательные поля: Email, Пароль, ФИО' });
-  }
-
-  const cleanEmail = email.trim().toLowerCase();
-  if (password.length < 6) {
-    return res.status(400).json({ message: 'Пароль должен содержать не менее 6 символов' });
-  }
-
-  try {
-    const existing = await pool.query(
-      'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
-      [cleanEmail]
-    );
-
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ message: 'Пользователь с таким Email уже зарегистрирован' });
-    }
-
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    const deptRes = await pool.query(
-      "SELECT id, name FROM departments ORDER BY (name = 'Руководство') DESC LIMIT 1"
-    );
-    const departmentId = deptRes.rows[0]?.id || null;
-    const departmentName = deptRes.rows[0]?.name || 'Руководство';
-
-    const assignedRole = role || 'ADMIN';
-    const assignedPosition = position || 'Руководитель';
-
-    const insertRes = await pool.query(
-      `INSERT INTO users (email, password_hash, full_name, phone, role, department_id, position, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)
-       RETURNING *`,
-      [cleanEmail, passwordHash, fullName.trim(), phone || null, assignedRole, departmentId, assignedPosition]
-    );
-
-    const newUser = insertRes.rows[0];
-
-    const payload = {
-      sub: newUser.id,
-      email: newUser.email,
-      role: newUser.role,
-      fullName: newUser.full_name,
-    };
-
-    const accessToken = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
-    const refreshToken = jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
-
-    const userProfile = {
-      id: newUser.id,
-      email: newUser.email,
-      fullName: newUser.full_name,
-      role: newUser.role,
-      departmentId: newUser.department_id,
-      departmentName: departmentName,
-      phone: newUser.phone,
-      avatarUrl: newUser.avatar_url,
-      position: newUser.position,
-      isActive: newUser.is_active,
-      createdAt: newUser.created_at,
-    };
-
-    console.log(`✅ Successfully registered new user: ${cleanEmail} (${assignedRole})`);
-    res.status(201).json({
-      accessToken,
-      refreshToken,
-      user: userProfile,
-    });
-  } catch (err) {
-    console.error('Registration error:', err);
-    res.status(500).json({ message: 'Ошибка при регистрации: ' + (err.message || 'Внутренняя ошибка сервера') });
-  }
-});
-
-app.get('/api/v1/auth/me', async (req, res) => {
-  const userId = req.user?.sub;
-  if (!userId) {
-    // If no token or testing, return super admin
-    const defaultRes = await pool.query(
-      `SELECT u.*, d.name as department_name 
-       FROM users u 
-       LEFT JOIN departments d ON u.department_id = d.id 
-       WHERE u.role = 'SUPER_ADMIN' LIMIT 1`
-    );
-    if (defaultRes.rows.length > 0) {
-      const u = defaultRes.rows[0];
-      return res.json({
-        id: u.id,
-        email: u.email,
-        fullName: u.full_name,
-        role: u.role,
-        departmentId: u.department_id,
-        departmentName: u.department_name,
-        phone: u.phone,
-        avatarUrl: u.avatar_url,
-        position: u.position,
-        isActive: u.is_active,
-      });
-    }
-    return res.status(401).json({ message: 'Не авторизован' });
-  }
-
-  try {
-    const result = await pool.query(
-      `SELECT u.*, d.name as department_name 
-       FROM users u 
-       LEFT JOIN departments d ON u.department_id = d.id 
-       WHERE u.id = $1`,
-      [userId]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Пользователь не найден' });
-    const u = result.rows[0];
-    res.json({
-      id: u.id,
-      email: u.email,
-      fullName: u.full_name,
-      role: u.role,
-      departmentId: u.department_id,
-      departmentName: u.department_name,
-      phone: u.phone,
-      avatarUrl: u.avatar_url,
-      position: u.position,
-      isActive: u.is_active,
-    });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-app.post('/api/v1/auth/refresh', (req, res) => {
-  const { refreshToken } = req.body || {};
-  if (!refreshToken) return res.status(400).json({ message: 'Токен обязателен' });
-  try {
-    const decoded = jwt.verify(refreshToken, JWT_SECRET);
-    const newAccess = jwt.sign({ sub: decoded.sub, email: decoded.email, role: decoded.role }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ accessToken: newAccess, refreshToken });
-  } catch (e) {
-    res.status(401).json({ message: 'Токен истек или недействителен' });
-  }
-});
-
-app.post('/api/v1/auth/logout', (req, res) => {
-  res.json({ success: true });
-});
-
-// ============================================================================
-// 2. DASHBOARD
-// ============================================================================
-app.get('/api/v1/dashboard/stats', async (req, res) => {
-  const period = req.query.period || 'month';
-  try {
-    // 1. Total Balance from active accounts
-    const accRes = await pool.query(`SELECT COALESCE(SUM(balance), 0) as total FROM accounts WHERE is_active = TRUE`);
-    const totalBalance = parseFloat(accRes.rows[0].total);
-
-    // 2. Income & Expenses from transactions
-    const incRes = await pool.query(`SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE LOWER(type) = 'income'`);
-    const income = parseFloat(incRes.rows[0].total);
-
-    const expRes = await pool.query(`SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE LOWER(type) = 'expense'`);
-    const expenses = parseFloat(expRes.rows[0].total);
-
-    // 3. Sales total
-    const salesRes = await pool.query(`SELECT COALESCE(SUM(grand_total), 0) as total FROM sales WHERE status != 'CANCELLED'`);
-    const sales = parseFloat(salesRes.rows[0].total);
-
-    // 4. Warehouse Inventory Value
-    const invRes = await pool.query(`SELECT COALESCE(SUM(quantity * average_cost), 0) as total FROM inventory`);
-    const stockBalance = parseFloat(invRes.rows[0].total);
-
-    // 5. Products count
-    const prodRes = await pool.query(`SELECT count(*) as total FROM products WHERE is_active = TRUE`);
-    const totalProducts = parseInt(prodRes.rows[0].total, 10);
-
-    // 6. Active deals
-    const dealsRes = await pool.query(`SELECT count(*) as total FROM deals WHERE status NOT IN ('won', 'lost')`);
-    const activeDeals = parseInt(dealsRes.rows[0].total, 10);
-
-    // 7. Pending tasks
-    const tasksRes = await pool.query(`SELECT count(*) as total FROM tasks WHERE status != 'done'`);
-    const pendingTasks = parseInt(tasksRes.rows[0].total, 10);
-
-    // 8. Customer Debts & Supplier Debts
-    const custDebtsRes = await pool.query(`SELECT COALESCE(SUM(balance), 0) as total FROM customers WHERE balance > 0`);
-    const customerDebts = parseFloat(custDebtsRes.rows[0].total);
-
-    const suppDebtsRes = await pool.query(`SELECT COALESCE(SUM(balance), 0) as total FROM suppliers WHERE balance > 0`);
-    const supplierDebts = parseFloat(suppDebtsRes.rows[0].total);
-
-    res.json({
-      totalBalance,
-      balanceChangePercent: 0.0,
-      income,
-      expenses,
-      sales,
-      stockBalance,
-      totalProducts,
-      activeDeals,
-      pendingTasks,
-      customerDebts,
-      supplierDebts,
-      period,
-    });
-  } catch (err) {
-    console.error('Dashboard error:', err);
-    res.json({
-      totalBalance: 0.0,
-      balanceChangePercent: 0.0,
-      income: 0.0,
-      expenses: 0.0,
-      sales: 0.0,
-      stockBalance: 0.0,
-      totalProducts: 0,
-      activeDeals: 0,
-      pendingTasks: 0,
-      customerDebts: 0.0,
-      supplierDebts: 0.0,
-      period,
-    });
-  }
-});
-
-// ============================================================================
-// 3. FINANCE MODULE (Real Transactions, Accounts, Debts)
-// ============================================================================
-app.get('/api/v1/finance/accounts', async (req, res) => {
-  try {
-    const result = await pool.query(`SELECT * FROM accounts WHERE is_active = TRUE ORDER BY created_at ASC`);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/finance/categories', async (req, res) => {
-  try {
-    const result = await pool.query(`SELECT * FROM expense_categories ORDER BY name ASC`);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/finance/transactions', async (req, res) => {
-  const { type, page = 1, limit = 50 } = req.query;
-  const offset = (parseInt(page, 10) - 1) * parseInt(limit, 10);
-  const conditions = ['1=1'];
-  const values = [];
-
-  if (type && type !== 'all') {
-    values.push(type.toUpperCase());
-    conditions.push(`UPPER(t.type) = $${values.length}`);
-  }
-
-  try {
-    const q = `
-      SELECT t.*, a.name as account_name, u.full_name as created_by_name
-      FROM transactions t
-      LEFT JOIN accounts a ON t.account_id = a.id
-      LEFT JOIN users u ON t.created_by = u.id
-      WHERE ${conditions.join(' AND ')}
-      ORDER BY t.transaction_date DESC, t.created_at DESC
-      LIMIT ${parseInt(limit, 10)} OFFSET ${offset}
-    `;
-    const result = await pool.query(q, values);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Helper to resolve valid account ID
-async function resolveAccountId(client, accountId, paymentMethod) {
-  if (accountId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(accountId)) {
-    return accountId;
-  }
-  const typeTarget = (paymentMethod === 'bank') ? 'BANK' : 'CASH';
-  const res = await client.query(`SELECT id FROM accounts WHERE type = $1 AND is_active = TRUE LIMIT 1`, [typeTarget]);
-  if (res.rows.length > 0) return res.rows[0].id;
-  const anyRes = await client.query(`SELECT id FROM accounts WHERE is_active = TRUE LIMIT 1`);
-  if (anyRes.rows.length > 0) return anyRes.rows[0].id;
-  return '1b7de2da-4f7e-4aa5-a7b5-8ed791092236';
+async function userProfile(userId) {
+  const res = await pool.query(
+    `SELECT u.*, d.name AS department_name FROM users u LEFT JOIN departments d ON u.department_id = d.id WHERE u.id = $1`,
+    [userId]
+  );
+  const u = res.rows[0];
+  if (!u) return null;
+  const membership = await resolveMembership(u.id, u.current_company_id);
+  return {
+    id: u.id,
+    email: u.email,
+    fullName: u.full_name,
+    role: membership ? appRole(membership.role) : u.role,
+    departmentId: u.department_id,
+    departmentName: u.department_name || null,
+    phone: u.phone,
+    avatarUrl: u.avatar_url,
+    position: u.position,
+    isActive: u.is_active,
+    createdAt: u.created_at,
+    companyId: membership ? membership.company_id : null,
+    pushEnabled: u.push_enabled,
+    emailEnabled: u.email_enabled,
+  };
 }
 
-// Create Income
-app.post('/api/v1/finance/transactions/income', async (req, res) => {
-  const { accountId, amount, category, description, customerId, customerName, paymentMethod, documentUrl, documentName } = req.body;
-  const numAmount = parseFloat(amount) || 0;
-  const client = await pool.connect();
+async function createCompanyDefaults(client, companyId, currency) {
+  await client.query(
+    `INSERT INTO accounts (name, type, balance, currency, company_id)
+     VALUES ('Касса (Наличные)', 'CASH', 0, $1, $2), ('Расчётный счёт (Банк)', 'BANK', 0, $1, $2)`,
+    [currency, companyId]
+  );
+  await client.query(`INSERT INTO warehouses (name, is_default, company_id) VALUES ('Основной склад', TRUE, $1)`, [companyId]);
+  await client.query(`INSERT INTO departments (name, company_id) VALUES ('Руководство', $1)`, [companyId]);
+}
+
+async function createCompany(client, userId, fields) {
+  const currency = str(fields.currency) || 'UZS';
+  const compRes = await client.query(
+    `INSERT INTO companies (name, tax_id, currency, description, address, phone, email, logo_url, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+    [str(fields.name), strOrNull(fields.taxId), currency, str(fields.description), str(fields.address),
+      str(fields.phone), str(fields.email), strOrNull(fields.logoUrl), userId]
+  );
+  const company = compRes.rows[0];
+  await client.query(
+    `INSERT INTO user_companies (user_id, company_id, role, is_default)
+     VALUES ($1, $2, 'OWNER', NOT EXISTS (SELECT 1 FROM user_companies WHERE user_id = $1))`,
+    [userId, company.id]
+  );
+  await client.query(`UPDATE users SET current_company_id = $1 WHERE id = $2`, [company.id, userId]);
+  await createCompanyDefaults(client, company.id, currency);
+  return company;
+}
+
+api.post('/auth/login', h(async (req, res) => {
+  const email = str(req.body && req.body.email).toLowerCase();
+  const password = req.body && typeof req.body.password === 'string' ? req.body.password : '';
+  if (!email || !password) throw new HttpError(400, 'Введите электронную почту и пароль');
+  checkLoginRate(`${req.ip}|${email}`);
+
+  const result = await pool.query(`SELECT * FROM users WHERE LOWER(email) = $1`, [email]);
+  const user = result.rows[0];
+  const ok = user && user.is_active && user.password_hash && await bcrypt.compare(password, user.password_hash);
+  if (!ok) throw new HttpError(401, 'Неверный адрес электронной почты или пароль');
+
+  loginAttempts.delete(`${req.ip}|${email}`);
+  res.json({ ...signTokens(user), user: await userProfile(user.id) });
+}));
+
+api.post('/auth/register', h(async (req, res) => {
+  const body = req.body || {};
+  const email = str(body.email).toLowerCase();
+  const fullName = str(body.fullName);
+  const password = typeof body.password === 'string' ? body.password : '';
+  if (!email || !password || !fullName) throw new HttpError(400, 'Заполните все обязательные поля: Email, Пароль, ФИО');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Укажите корректный адрес электронной почты');
+  if (password.length < 6) throw new HttpError(400, 'Пароль должен содержать не менее 6 символов');
+  checkLoginRate(`${req.ip}|register`);
+
+  const user = await tx(async (client) => {
+    const existing = await client.query('SELECT id FROM users WHERE LOWER(email) = $1', [email]);
+    if (existing.rows.length > 0) throw new HttpError(400, 'Пользователь с таким Email уже зарегистрирован');
+
+    const insertRes = await client.query(
+      `INSERT INTO users (email, password_hash, full_name, phone, role, position, is_active)
+       VALUES ($1, $2, $3, $4, 'SUPER_ADMIN', $5, TRUE) RETURNING *`,
+      [email, await bcrypt.hash(password, 10), fullName, strOrNull(body.phone), str(body.position) || 'Руководитель']
+    );
+    const created = insertRes.rows[0];
+    // Every self-registered account owns its own organization and starts with no one else's data.
+    const company = await createCompany(client, created.id, { name: str(body.companyName) || `Компания ${fullName}` });
+    const dept = await client.query(`SELECT id FROM departments WHERE company_id = $1 LIMIT 1`, [company.id]);
+    await client.query(`UPDATE users SET department_id = $1 WHERE id = $2`, [dept.rows[0] ? dept.rows[0].id : null, created.id]);
+    return created;
+  });
+
+  res.status(201).json({ ...signTokens(user), user: await userProfile(user.id) });
+}));
+
+api.post('/auth/refresh', h(async (req, res) => {
+  const refreshToken = req.body && req.body.refreshToken;
+  if (!refreshToken) throw new HttpError(400, 'Токен обязателен');
+  let decoded;
   try {
-    await client.query('BEGIN');
-    const targetAccountId = await resolveAccountId(client, accountId, paymentMethod);
-    
-    // 1. Insert transaction
-    const txDesc = description ? (customerName ? `${customerName} - ${description}` : description) : (customerName ? `Поступление: ${customerName}` : 'Поступление средств');
-    const txRes = await client.query(
-      `INSERT INTO transactions (account_id, type, amount, category, description, reference_type, reference_id, document_url, document_name, transaction_date)
-       VALUES ($1, 'INCOME', $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP) RETURNING *`,
-      [targetAccountId, numAmount, category || 'Поступление', txDesc, customerId ? 'CUSTOMER' : null, customerId || null, documentUrl || null, documentName || null]
-    );
-
-    // 2. Update account balance
-    await client.query(
-      `UPDATE accounts SET balance = balance + $1 WHERE id = $2`,
-      [numAmount, targetAccountId]
-    );
-
-    // 3. If from customer, decrease customer debt
-    if (customerId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(customerId)) {
-      await client.query(`UPDATE customers SET balance = balance - $1 WHERE id = $2`, [numAmount, customerId]);
-    }
-
-    await client.query('COMMIT');
-    const txn = txRes.rows[0];
-    await createNotification(null, 'Поступление средств', `Зафиксирован доход: ${numAmount} сум (${category || 'Доход'})`, 'FINANCE', txn.id);
-    res.status(201).json({ data: txn });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ message: err.message });
-  } finally {
-    client.release();
+    decoded = jwt.verify(refreshToken, JWT_SECRET);
+  } catch (e) {
+    throw new HttpError(401, 'Токен истек или недействителен');
   }
+  if (decoded.typ === 'access') throw new HttpError(401, 'Токен истек или недействителен');
+  const userRes = await pool.query(`SELECT * FROM users WHERE id = $1`, [decoded.sub]);
+  const user = userRes.rows[0];
+  if (!user || !user.is_active || (decoded.tv != null && decoded.tv !== user.token_version)) {
+    throw new HttpError(401, 'Токен истек или недействителен');
+  }
+  res.json(signTokens(user));
+}));
+
+// ============================================================================
+// EVERYTHING BELOW REQUIRES A VALID SESSION
+// ============================================================================
+api.use(authenticate);
+
+api.get('/auth/me', h(async (req, res) => {
+  res.json(await userProfile(req.user.id));
+}));
+
+api.post('/auth/logout', (req, res) => res.json({ success: true }));
+
+api.patch('/auth/profile', h(async (req, res) => {
+  const b = req.body || {};
+  const sets = [];
+  const vals = [req.user.id];
+  const set = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+  if (b.fullName !== undefined) {
+    if (!str(b.fullName)) throw new HttpError(400, 'Укажите имя');
+    set('full_name', str(b.fullName));
+  }
+  if (b.phone !== undefined) set('phone', strOrNull(b.phone));
+  if (b.position !== undefined) set('position', strOrNull(b.position));
+  if (b.avatarUrl !== undefined) set('avatar_url', strOrNull(b.avatarUrl));
+  if (b.pushEnabled !== undefined) set('push_enabled', Boolean(b.pushEnabled));
+  if (b.emailEnabled !== undefined) set('email_enabled', Boolean(b.emailEnabled));
+  if (sets.length === 0) throw new HttpError(400, 'Нет данных для обновления');
+  await pool.query(`UPDATE users SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, vals);
+  res.json(await userProfile(req.user.id));
+}));
+
+api.post('/auth/change-password', h(async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  if (typeof newPassword !== 'string' || newPassword.length < 6) throw new HttpError(400, 'Новый пароль должен содержать не менее 6 символов');
+  const userRes = await pool.query(`SELECT * FROM users WHERE id = $1`, [req.user.id]);
+  const user = userRes.rows[0];
+  if (!(await bcrypt.compare(String(currentPassword || ''), user.password_hash || ''))) {
+    throw new HttpError(400, 'Текущий пароль указан неверно');
+  }
+  const updated = await pool.query(
+    `UPDATE users SET password_hash = $1, token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`,
+    [await bcrypt.hash(newPassword, 10), req.user.id]
+  );
+  res.json({ success: true, message: 'Пароль изменён', ...signTokens(updated.rows[0]) });
+}));
+
+const COMPANY_TABLES = [
+  'payments', 'transactions', 'accounts', 'stock_movements', 'sales', 'incoming_shipments', 'deals', 'tasks',
+  'documents', 'document_folders', 'chat_rooms', 'products', 'product_categories', 'warehouses',
+  'customers', 'suppliers',
+];
+
+async function deleteCompanyData(client, companyId) {
+  const files = await client.query(
+    `SELECT file_path AS url FROM documents WHERE company_id = $1
+     UNION ALL SELECT document_url FROM transactions WHERE company_id = $1 AND document_url IS NOT NULL
+     UNION ALL SELECT ta.file_url FROM task_attachments ta JOIN tasks t ON t.id = ta.task_id WHERE t.company_id = $1`,
+    [companyId]
+  );
+  await client.query(`DELETE FROM sale_items WHERE sale_id IN (SELECT id FROM sales WHERE company_id = $1)`, [companyId]);
+  await client.query(`DELETE FROM incoming_shipment_items WHERE shipment_id IN (SELECT id FROM incoming_shipments WHERE company_id = $1)`, [companyId]);
+  for (const t of COMPANY_TABLES) await client.query(`DELETE FROM ${t} WHERE company_id = $1`, [companyId]);
+  await client.query(`UPDATE users SET department_id = NULL WHERE department_id IN (SELECT id FROM departments WHERE company_id = $1)`, [companyId]);
+  await client.query(`DELETE FROM departments WHERE company_id = $1`, [companyId]);
+  await client.query(`UPDATE users SET current_company_id = NULL WHERE current_company_id = $1`, [companyId]);
+  await client.query(`DELETE FROM companies WHERE id = $1`, [companyId]);
+  return files.rows.map((r) => r.url);
+}
+
+api.delete('/auth/account', h(async (req, res) => {
+  const password = String((req.body && req.body.password) || '');
+  const userRes = await pool.query(`SELECT * FROM users WHERE id = $1`, [req.user.id]);
+  const user = userRes.rows[0];
+  if (!(await bcrypt.compare(password, user.password_hash || ''))) throw new HttpError(400, 'Пароль указан неверно');
+
+  const filesToRemove = await tx(async (client) => {
+    // Organizations where this user is the only owner go away with the account.
+    const owned = await client.query(
+      `SELECT uc.company_id FROM user_companies uc
+       WHERE uc.user_id = $1 AND uc.role = 'OWNER'
+         AND NOT EXISTS (SELECT 1 FROM user_companies o WHERE o.company_id = uc.company_id AND o.role = 'OWNER' AND o.user_id <> $1)`,
+      [user.id]
+    );
+    let files = [];
+    for (const row of owned.rows) files = files.concat(await deleteCompanyData(client, row.company_id));
+    await client.query(`DELETE FROM users WHERE id = $1`, [user.id]);
+    return files;
+  });
+  filesToRemove.forEach(removeUploadedFile);
+  res.json({ success: true, message: 'Учётная запись удалена' });
+}));
+
+// ============================================================================
+// COMPANIES & ORGANIZATIONS
+// ============================================================================
+api.get('/companies', h(async (req, res) => {
+  const result = await pool.query(
+    `SELECT c.*, uc.role AS user_role, (c.id = $2) AS is_current
+     FROM companies c JOIN user_companies uc ON uc.company_id = c.id AND uc.user_id = $1
+     WHERE c.is_active
+     ORDER BY is_current DESC, c.created_at ASC`,
+    [req.user.id, req.companyId]
+  );
+  res.json({ data: out(result.rows) });
+}));
+
+api.get('/companies/current', h(async (req, res) => {
+  if (!req.companyId) return res.json({ data: null });
+  const result = await pool.query(`SELECT *, TRUE AS is_current, $2::text AS user_role FROM companies WHERE id = $1`, [req.companyId, req.companyRole]);
+  res.json({ data: out(result.rows[0] || null) });
+}));
+
+api.post('/companies', h(async (req, res) => {
+  const body = req.body || {};
+  if (!str(body.name)) throw new HttpError(400, 'Название компании обязательно');
+  const company = await tx((client) => createCompany(client, req.user.id, body));
+  await notify(req.user.id, 'Организация создана', `Компания "${company.name}" успешно зарегистрирована`, 'SYSTEM', company.id);
+  res.status(201).json({ data: out({ ...company, is_current: true, user_role: 'OWNER' }) });
+}));
+
+api.post('/companies/switch', h(async (req, res) => {
+  const companyId = req.body && req.body.companyId;
+  if (!isUuid(companyId)) throw new HttpError(400, 'companyId обязателен');
+  const result = await pool.query(
+    `SELECT c.*, uc.role AS user_role FROM companies c
+     JOIN user_companies uc ON uc.company_id = c.id AND uc.user_id = $1
+     WHERE c.id = $2 AND c.is_active`,
+    [req.user.id, companyId]
+  );
+  if (result.rows.length === 0) throw new HttpError(404, 'Компания не найдена');
+  await pool.query(`UPDATE users SET current_company_id = $1 WHERE id = $2`, [companyId, req.user.id]);
+  res.json({ success: true, message: `Переключено на компанию: ${result.rows[0].name}`, data: out({ ...result.rows[0], is_current: true }) });
+}));
+
+api.patch('/companies/:id', h(async (req, res) => {
+  const member = await pool.query(`SELECT role FROM user_companies WHERE user_id = $1 AND company_id = $2`, [req.user.id, uuidOrNull(req.params.id)]);
+  if (!member.rows[0]) throw new HttpError(404, 'Компания не найдена');
+  if (!ADMIN_ROLES.has(member.rows[0].role)) throw new HttpError(403, 'Недостаточно прав для этого действия');
+  const b = req.body || {};
+  if (b.name !== undefined && !str(b.name)) throw new HttpError(400, 'Название компании обязательно');
+  const result = await pool.query(
+    `UPDATE companies SET
+       name = COALESCE($2, name), tax_id = COALESCE($3, tax_id), currency = COALESCE($4, currency),
+       description = COALESCE($5, description), address = COALESCE($6, address), phone = COALESCE($7, phone),
+       email = COALESCE($8, email), logo_url = COALESCE($9, logo_url), updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1 RETURNING *`,
+    [req.params.id, strOrNull(b.name), strOrNull(b.taxId), strOrNull(b.currency), b.description === undefined ? null : str(b.description),
+      b.address === undefined ? null : str(b.address), b.phone === undefined ? null : str(b.phone),
+      b.email === undefined ? null : str(b.email), strOrNull(b.logoUrl)]
+  );
+  res.json({ data: out({ ...result.rows[0], is_current: result.rows[0].id === req.companyId, user_role: member.rows[0].role }) });
+}));
+
+api.delete('/companies/:id', h(async (req, res) => {
+  const id = uuidOrNull(req.params.id);
+  const member = await pool.query(`SELECT role FROM user_companies WHERE user_id = $1 AND company_id = $2`, [req.user.id, id]);
+  if (!member.rows[0]) throw new HttpError(404, 'Компания не найдена');
+  if (member.rows[0].role !== 'OWNER') throw new HttpError(403, 'Удалить организацию может только её владелец');
+  const count = await pool.query(`SELECT count(*)::int AS n FROM user_companies WHERE user_id = $1`, [req.user.id]);
+  if (count.rows[0].n <= 1) throw new HttpError(400, 'Нельзя удалить единственную организацию. Сначала создайте другую');
+
+  const files = await tx((client) => deleteCompanyData(client, id));
+  files.forEach(removeUploadedFile);
+  const next = await resolveMembership(req.user.id, null);
+  if (next) await pool.query(`UPDATE users SET current_company_id = $1 WHERE id = $2`, [next.company_id, req.user.id]);
+  res.json({ success: true, message: 'Организация удалена', currentCompanyId: next ? next.company_id : null });
+}));
+
+// File upload does not depend on the active organization.
+api.post('/files/upload', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'Файл не передан' });
+  res.json({ url: fileUrl(`/uploads/${req.file.filename}`), fileName: originalName(req.file), size: req.file.size });
 });
 
-// Create Expense
-app.post('/api/v1/finance/transactions/expense', async (req, res) => {
-  const { accountId, amount, category, description, supplierId, supplierName, paymentMethod, documentUrl, documentName } = req.body;
-  const numAmount = parseFloat(amount) || 0;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const targetAccountId = await resolveAccountId(client, accountId, paymentMethod);
+api.delete('/files', h(async (req, res) => {
+  const url = str(req.query.url || (req.body && req.body.url));
+  if (!url) throw new HttpError(400, 'Не указан файл');
+  const name = path.basename(url.split('?')[0]);
+  // A file still referenced by a saved record is removed through that record, not here.
+  const used = await pool.query(
+    `SELECT 1 FROM transactions WHERE document_url LIKE $1
+     UNION ALL SELECT 1 FROM documents WHERE file_path LIKE $1
+     UNION ALL SELECT 1 FROM task_attachments WHERE file_url LIKE $1 LIMIT 1`,
+    [`%/${name}`]
+  );
+  if (used.rows.length === 0) removeUploadedFile(url);
+  res.json({ success: true });
+}));
 
-    // 1. Insert transaction
-    const txDesc = description ? (supplierName ? `${supplierName} - ${description}` : description) : (supplierName ? `Расход: ${supplierName}` : 'Расход средств');
-    const txRes = await client.query(
-      `INSERT INTO transactions (account_id, type, amount, category, description, reference_type, reference_id, document_url, document_name, transaction_date)
-       VALUES ($1, 'EXPENSE', $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP) RETURNING *`,
-      [targetAccountId, numAmount, category || 'Расход', txDesc, supplierId ? 'SUPPLIER' : null, supplierId || null, documentUrl || null, documentName || null]
-    );
+api.use(requireCompany);
 
-    // 2. Deduct account balance
-    await client.query(
-      `UPDATE accounts SET balance = balance - $1 WHERE id = $2`,
-      [numAmount, targetAccountId]
-    );
+// ============================================================================
+// DASHBOARD & REPORTS
+// ============================================================================
+function periodRange(period) {
+  const now = new Date();
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  if (period === 'week') start.setDate(start.getDate() - 6);
+  else if (period === 'year') start.setMonth(0, 1);
+  else if (period !== 'today') start.setDate(1);
+  const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return { from: iso(start), to: iso(now) };
+}
 
-    // 3. If to supplier, reduce supplier debt
-    if (supplierId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(supplierId)) {
-      await client.query(`UPDATE suppliers SET balance = balance - $1 WHERE id = $2`, [numAmount, supplierId]);
-    }
+const normalizePeriod = (p) => (['today', 'week', 'month', 'year'].includes(p) ? p : 'month');
 
-    await client.query('COMMIT');
-    const expTxn = txRes.rows[0];
-    await createNotification(null, 'Расход средств', `Зафиксирован расход: ${numAmount} сум (${category || 'Расход'})`, 'FINANCE', expTxn.id);
-    res.status(201).json({ data: expTxn });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ message: err.message });
-  } finally {
-    client.release();
+api.get('/dashboard/stats', h(async (req, res) => {
+  const period = normalizePeriod(req.query.period);
+  const { from, to } = periodRange(period);
+  const cid = req.companyId;
+
+  const [acc, flow, sales, inv, prod, deals, tasks, cust, supp] = await Promise.all([
+    pool.query(`SELECT COALESCE(SUM(balance), 0) AS total FROM accounts WHERE company_id = $1 AND is_active`, [cid]),
+    pool.query(
+      `SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'INCOME'), 0) AS income,
+              COALESCE(SUM(amount) FILTER (WHERE type = 'EXPENSE'), 0) AS expenses
+       FROM transactions WHERE company_id = $1 AND transaction_date BETWEEN $2 AND $3`,
+      [cid, from, to]
+    ),
+    pool.query(
+      `SELECT COALESCE(SUM(grand_total), 0) AS total FROM sales
+       WHERE company_id = $1 AND status <> 'CANCELLED' AND created_at::date BETWEEN $2 AND $3`,
+      [cid, from, to]
+    ),
+    pool.query(
+      `SELECT COALESCE(SUM(i.quantity * i.average_cost), 0) AS total
+       FROM inventory i JOIN products p ON p.id = i.product_id WHERE p.company_id = $1 AND p.is_active`,
+      [cid]
+    ),
+    pool.query(`SELECT count(*)::int AS total FROM products WHERE company_id = $1 AND is_active`, [cid]),
+    pool.query(`SELECT count(*)::int AS total FROM deals WHERE company_id = $1 AND LOWER(status) NOT IN ('won', 'lost')`, [cid]),
+    pool.query(`SELECT count(*)::int AS total FROM tasks WHERE company_id = $1 AND LOWER(status) <> 'done'`, [cid]),
+    pool.query(`SELECT COALESCE(SUM(balance), 0) AS total FROM customers WHERE company_id = $1 AND balance > 0`, [cid]),
+    pool.query(`SELECT COALESCE(SUM(balance), 0) AS total FROM suppliers WHERE company_id = $1 AND balance > 0`, [cid]),
+  ]);
+
+  const totalBalance = num(acc.rows[0].total);
+  const income = num(flow.rows[0].income);
+  const expenses = num(flow.rows[0].expenses);
+  const startBalance = totalBalance - (income - expenses);
+  const balanceChangePercent = startBalance !== 0
+    ? Math.round(((totalBalance - startBalance) / Math.abs(startBalance)) * 1000) / 10
+    : (totalBalance !== 0 ? 100 : 0);
+
+  res.json({
+    totalBalance,
+    balanceChangePercent,
+    income,
+    expenses,
+    sales: num(sales.rows[0].total),
+    stockBalance: num(inv.rows[0].total),
+    totalProducts: prod.rows[0].total,
+    activeDeals: deals.rows[0].total,
+    pendingTasks: tasks.rows[0].total,
+    customerDebts: num(cust.rows[0].total),
+    supplierDebts: num(supp.rows[0].total),
+    period,
+  });
+}));
+
+api.get('/reports/financial', h(async (req, res) => {
+  const period = normalizePeriod(req.query.period);
+  const { from, to } = periodRange(period);
+  const cid = req.companyId;
+  const bucket = period === 'year' ? 'month' : 'day';
+
+  const [flow, sales, cogs, series, salesSeries, byCategory] = await Promise.all([
+    pool.query(
+      `SELECT COALESCE(SUM(amount) FILTER (WHERE type = 'INCOME'), 0) AS income,
+              COALESCE(SUM(amount) FILTER (WHERE type = 'EXPENSE'), 0) AS expenses
+       FROM transactions WHERE company_id = $1 AND transaction_date BETWEEN $2 AND $3`,
+      [cid, from, to]
+    ),
+    pool.query(
+      `SELECT COALESCE(SUM(grand_total), 0) AS total, count(*)::int AS n FROM sales
+       WHERE company_id = $1 AND status <> 'CANCELLED' AND created_at::date BETWEEN $2 AND $3`,
+      [cid, from, to]
+    ),
+    pool.query(
+      `SELECT COALESCE(SUM(si.quantity * si.cost_price), 0) AS total
+       FROM sale_items si JOIN sales s ON si.sale_id = s.id
+       WHERE s.company_id = $1 AND s.status <> 'CANCELLED' AND s.created_at::date BETWEEN $2 AND $3`,
+      [cid, from, to]
+    ),
+    pool.query(
+      `SELECT to_char(date_trunc('${bucket}', transaction_date), 'YYYY-MM-DD') AS date,
+              COALESCE(SUM(amount) FILTER (WHERE type = 'INCOME'), 0) AS income,
+              COALESCE(SUM(amount) FILTER (WHERE type = 'EXPENSE'), 0) AS expense
+       FROM transactions WHERE company_id = $1 AND transaction_date BETWEEN $2 AND $3
+       GROUP BY 1 ORDER BY 1`,
+      [cid, from, to]
+    ),
+    pool.query(
+      `SELECT to_char(date_trunc('${bucket}', created_at), 'YYYY-MM-DD') AS date, COALESCE(SUM(grand_total), 0) AS amount
+       FROM sales WHERE company_id = $1 AND status <> 'CANCELLED' AND created_at::date BETWEEN $2 AND $3
+       GROUP BY 1 ORDER BY 1`,
+      [cid, from, to]
+    ),
+    pool.query(
+      `SELECT COALESCE(NULLIF(category, ''), 'Прочее') AS category, SUM(amount) AS amount
+       FROM transactions WHERE company_id = $1 AND type = 'EXPENSE' AND transaction_date BETWEEN $2 AND $3
+       GROUP BY 1 ORDER BY 2 DESC`,
+      [cid, from, to]
+    ),
+  ]);
+
+  const income = num(flow.rows[0].income);
+  const expenses = num(flow.rows[0].expenses);
+  const revenue = num(sales.rows[0].total);
+  const costOfGoods = num(cogs.rows[0].total);
+  const grossProfit = revenue - costOfGoods;
+  const monthNames = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
+  const label = (d) => (bucket === 'month' ? monthNames[parseInt(d.slice(5, 7), 10) - 1] : `${d.slice(8, 10)}.${d.slice(5, 7)}`);
+
+  res.json({
+    data: {
+      period,
+      from,
+      to,
+      income,
+      totalRevenue: income,
+      revenue,
+      salesCount: sales.rows[0].n,
+      expenses,
+      totalExpenses: expenses,
+      costOfGoods,
+      grossProfit,
+      netProfit: income - expenses,
+      monthlyData: series.rows.map((r) => ({ month: label(r.date), date: r.date, income: num(r.income), expense: num(r.expense) })),
+      salesTrend: salesSeries.rows.map((r) => ({ date: r.date, label: label(r.date), amount: num(r.amount) })),
+      expensesByCategory: byCategory.rows.map((r) => ({ category: r.category, amount: num(r.amount) })),
+    },
+  });
+}));
+
+// ============================================================================
+// FINANCE
+// ============================================================================
+api.get('/finance/accounts', h(async (req, res) => {
+  const result = await pool.query(`SELECT * FROM accounts WHERE company_id = $1 AND is_active ORDER BY created_at ASC, name ASC`, [req.companyId]);
+  res.json({ data: out(result.rows) });
+}));
+
+api.post('/finance/accounts', requireAdmin, h(async (req, res) => {
+  const b = req.body || {};
+  if (!str(b.name)) throw new HttpError(400, 'Укажите название счёта');
+  const type = ['CASH', 'BANK', 'CARD'].includes(str(b.type).toUpperCase()) ? str(b.type).toUpperCase() : 'CASH';
+  const result = await pool.query(
+    `INSERT INTO accounts (name, type, account_number, currency, balance, company_id) VALUES ($1, $2, $3, $4, 0, $5) RETURNING *`,
+    [str(b.name), type, strOrNull(b.accountNumber), str(b.currency) || 'UZS', req.companyId]
+  );
+  res.status(201).json({ data: out(result.rows[0]) });
+}));
+
+api.get('/finance/categories', h(async (req, res) => {
+  const result = await pool.query(`SELECT * FROM expense_categories ORDER BY name ASC`);
+  res.json({ data: out(result.rows) });
+}));
+
+const TX_SELECT = `
+  SELECT t.*, a.name AS account_name, a.type AS account_type, u.full_name AS created_by_name,
+         COALESCE(t.transaction_date::timestamp + (t.created_at::time), t.created_at) AS date
+  FROM transactions t
+  LEFT JOIN accounts a ON t.account_id = a.id
+  LEFT JOIN users u ON t.created_by = u.id`;
+
+function txOut(row) {
+  const o = out(row);
+  o.document_url = fileUrl(row.document_url);
+  o.documentUrl = o.document_url;
+  o.customerName = row.counterparty_name;
+  o.employeeName = row.created_by_name;
+  return o;
+}
+
+api.get('/finance/transactions', h(async (req, res) => {
+  const q = req.query;
+  const limit = Math.min(Math.max(parseInt(q.limit, 10) || 50, 1), 200);
+  const page = Math.max(parseInt(q.page, 10) || 1, 1);
+  const conds = ['t.company_id = $1'];
+  const vals = [req.companyId];
+  const add = (sql, v) => { vals.push(v); conds.push(sql.replace('?', `$${vals.length}`)); };
+
+  const type = str(q.type).toUpperCase();
+  if (type === 'TRANSFER') conds.push(`t.type IN ('TRANSFER_IN', 'TRANSFER_OUT')`);
+  else if (type && type !== 'ALL') add('t.type = ?', type);
+  if (q.startDate) add('t.transaction_date >= ?', dateOrToday(q.startDate));
+  if (q.endDate) add('t.transaction_date <= ?', dateOrToday(q.endDate));
+  if (isUuid(q.accountId)) add('t.account_id = ?', q.accountId);
+  if (str(q.search)) add(`(t.description ILIKE ? OR t.category ILIKE $${vals.length + 1} OR t.counterparty_name ILIKE $${vals.length + 1})`, `%${str(q.search)}%`);
+
+  const where = conds.join(' AND ');
+  const [rows, count] = await Promise.all([
+    pool.query(`${TX_SELECT} WHERE ${where} ORDER BY t.transaction_date DESC, t.created_at DESC LIMIT ${limit} OFFSET ${(page - 1) * limit}`, vals),
+    pool.query(`SELECT count(*)::int AS total FROM transactions t WHERE ${where}`, vals),
+  ]);
+  res.json({ data: rows.rows.map(txOut), meta: { total: count.rows[0].total, page, limit } });
+}));
+
+async function resolveAccount(client, companyId, accountId, paymentMethod) {
+  if (isUuid(accountId)) {
+    const byId = await client.query(`SELECT * FROM accounts WHERE id = $1 AND company_id = $2 AND is_active FOR UPDATE`, [accountId, companyId]);
+    if (!byId.rows[0]) throw new HttpError(404, 'Счёт не найден');
+    return byId.rows[0];
   }
+  const method = str(paymentMethod).toLowerCase();
+  // Card payments settle to the bank account unless the company keeps a dedicated card account.
+  const order = method === 'card' ? ['CARD', 'BANK', 'CASH'] : method === 'bank' ? ['BANK', 'CASH'] : ['CASH', 'BANK'];
+  for (const type of order) {
+    const found = await client.query(
+      `SELECT * FROM accounts WHERE company_id = $1 AND type = $2 AND is_active ORDER BY created_at ASC LIMIT 1 FOR UPDATE`,
+      [companyId, type]
+    );
+    if (found.rows[0]) return found.rows[0];
+  }
+  throw new HttpError(400, 'В организации нет активных счетов');
+}
+
+// The only place that writes a transaction: the row and the account balance change together.
+async function postTransaction(client, { companyId, userId, account, type, amount, category, description, counterparty,
+  paymentMethod, date, referenceType, referenceId, documentUrl, documentName }) {
+  const sign = type === 'INCOME' || type === 'TRANSFER_IN' ? 1 : -1;
+  const inserted = await client.query(
+    `INSERT INTO transactions (company_id, account_id, type, amount, category, description, counterparty_name, payment_method,
+                               reference_type, reference_id, document_url, document_name, created_by, transaction_date)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`,
+    [companyId, account.id, type, amount, category, description, counterparty || null, paymentMethod || null,
+      referenceType || null, uuidOrNull(referenceId), documentUrl || null, documentName || null, userId, date]
+  );
+  await client.query(`UPDATE accounts SET balance = balance + $1 WHERE id = $2`, [sign * amount, account.id]);
+  const full = await client.query(`${TX_SELECT} WHERE t.id = $1`, [inserted.rows[0].id]);
+  return full.rows[0];
+}
+
+function relativeUploadPath(url) {
+  if (!url) return null;
+  const s = String(url);
+  const i = s.indexOf('/uploads/');
+  return i >= 0 ? s.slice(i) : null;
+}
+
+const methodOf = (b) => (['cash', 'bank', 'card'].includes(str(b.paymentMethod).toLowerCase()) ? str(b.paymentMethod).toLowerCase() : 'cash');
+
+api.post('/finance/transactions/income', h(async (req, res) => {
+  const b = req.body || {};
+  const amount = requirePositive(b.amount, 'Сумма поступления');
+  const customerName = str(b.customerName);
+  const row = await tx(async (client) => {
+    const account = await resolveAccount(client, req.companyId, b.accountId, b.paymentMethod);
+    let customerId = null;
+    if (isUuid(b.customerId)) {
+      const c = await client.query(`UPDATE customers SET balance = balance - $1 WHERE id = $2 AND company_id = $3 RETURNING id`, [amount, b.customerId, req.companyId]);
+      if (!c.rows[0]) throw new HttpError(404, 'Клиент не найден');
+      customerId = b.customerId;
+    }
+    return postTransaction(client, {
+      companyId: req.companyId, userId: req.user.id, account, type: 'INCOME', amount,
+      category: str(b.category) || 'Поступление', description: str(b.description) || (customerName ? `Поступление: ${customerName}` : 'Поступление средств'),
+      counterparty: customerName, paymentMethod: methodOf(b), date: dateOrToday(b.date),
+      referenceType: customerId ? 'CUSTOMER' : null, referenceId: customerId,
+      documentUrl: relativeUploadPath(b.documentUrl), documentName: strOrNull(b.documentName),
+    });
+  });
+  await notify(req.user.id, 'Поступление средств', `Зафиксирован доход: ${amount} сум (${row.category})`, 'FINANCE', row.id);
+  res.status(201).json({ data: txOut(row) });
+}));
+
+api.post('/finance/transactions/expense', h(async (req, res) => {
+  const b = req.body || {};
+  const amount = requirePositive(b.amount, 'Сумма расхода');
+  const counterparty = str(b.supplierName || b.employeeName);
+  const row = await tx(async (client) => {
+    const account = await resolveAccount(client, req.companyId, b.accountId, b.paymentMethod);
+    let supplierId = null;
+    if (isUuid(b.supplierId)) {
+      const s = await client.query(`UPDATE suppliers SET balance = balance - $1 WHERE id = $2 AND company_id = $3 RETURNING id`, [amount, b.supplierId, req.companyId]);
+      if (!s.rows[0]) throw new HttpError(404, 'Поставщик не найден');
+      supplierId = b.supplierId;
+    }
+    return postTransaction(client, {
+      companyId: req.companyId, userId: req.user.id, account, type: 'EXPENSE', amount,
+      category: str(b.category) || 'Прочее', description: str(b.description) || (counterparty ? `Расход: ${counterparty}` : 'Расход средств'),
+      counterparty, paymentMethod: methodOf(b), date: dateOrToday(b.date),
+      referenceType: supplierId ? 'SUPPLIER' : null, referenceId: supplierId,
+      documentUrl: relativeUploadPath(b.documentUrl), documentName: strOrNull(b.documentName),
+    });
+  });
+  await notify(req.user.id, 'Расход средств', `Зафиксирован расход: ${amount} сум (${row.category})`, 'FINANCE', row.id);
+  res.status(201).json({ data: txOut(row) });
+}));
+
+api.post('/finance/transactions/transfer', h(async (req, res) => {
+  const b = req.body || {};
+  const amount = requirePositive(b.amount, 'Сумма перевода');
+  if (!isUuid(b.fromAccountId) || !isUuid(b.toAccountId)) throw new HttpError(400, 'Выберите счёт списания и счёт зачисления');
+  if (b.fromAccountId === b.toAccountId) throw new HttpError(400, 'Счета списания и зачисления должны различаться');
+  const row = await tx(async (client) => {
+    // Lock both accounts in a stable order so two opposite transfers cannot deadlock.
+    const [first, second] = [b.fromAccountId, b.toAccountId].sort();
+    await client.query(`SELECT id FROM accounts WHERE id IN ($1, $2) AND company_id = $3 ORDER BY id FOR UPDATE`, [first, second, req.companyId]);
+    const from = await resolveAccount(client, req.companyId, b.fromAccountId);
+    const to = await resolveAccount(client, req.companyId, b.toAccountId);
+    if (num(from.balance) < amount) throw new HttpError(400, 'Недостаточно средств на счёте списания');
+    const common = { companyId: req.companyId, userId: req.user.id, amount, date: dateOrToday(b.date), referenceType: 'TRANSFER' };
+    const description = str(b.description) || `Перевод: ${from.name} → ${to.name}`;
+    await postTransaction(client, { ...common, account: from, type: 'TRANSFER_OUT', category: 'Перевод со счёта', description, counterparty: to.name });
+    return postTransaction(client, { ...common, account: to, type: 'TRANSFER_IN', category: 'Перевод на счёт', description, counterparty: from.name });
+  });
+  res.status(201).json({ data: txOut(row) });
+}));
+
+api.delete('/finance/transactions/:id', requireAdmin, h(async (req, res) => {
+  const removed = await tx(async (client) => {
+    const found = await client.query(`SELECT * FROM transactions WHERE id = $1 AND company_id = $2 FOR UPDATE`, [uuidOrNull(req.params.id), req.companyId]);
+    const t = found.rows[0];
+    if (!t) throw new HttpError(404, 'Операция не найдена');
+    if (t.reference_type === 'SALE' || t.reference_type === 'TRANSFER') throw new HttpError(400, 'Эту операцию нельзя удалить отдельно от связанного документа');
+    const sign = t.type === 'INCOME' ? -1 : 1;
+    await client.query(`UPDATE accounts SET balance = balance + $1 WHERE id = $2`, [sign * num(t.amount), t.account_id]);
+    if (t.reference_type === 'CUSTOMER' && t.reference_id) await client.query(`UPDATE customers SET balance = balance + $1 WHERE id = $2`, [t.amount, t.reference_id]);
+    if (t.reference_type === 'SUPPLIER' && t.reference_id) await client.query(`UPDATE suppliers SET balance = balance + $1 WHERE id = $2`, [t.amount, t.reference_id]);
+    await client.query(`DELETE FROM transactions WHERE id = $1`, [t.id]);
+    return t;
+  });
+  removeUploadedFile(removed.document_url);
+  res.json({ success: true });
+}));
+
+api.post('/finance/debts/pay', h(async (req, res) => {
+  const b = req.body || {};
+  const amount = requirePositive(b.amount, 'Сумма');
+  if (!isUuid(b.debtId)) throw new HttpError(400, 'Не указана задолженность');
+  const payable = ['payable', 'supplier'].includes(str(b.type).toLowerCase());
+  const row = await tx(async (client) => {
+    const table = payable ? 'suppliers' : 'customers';
+    const party = await client.query(`SELECT * FROM ${table} WHERE id = $1 AND company_id = $2 FOR UPDATE`, [b.debtId, req.companyId]);
+    if (!party.rows[0]) throw new HttpError(404, 'Задолженность не найдена');
+    if (amount > num(party.rows[0].balance)) throw new HttpError(400, 'Сумма оплаты больше остатка задолженности');
+    await client.query(`UPDATE ${table} SET balance = balance - $1 WHERE id = $2`, [amount, b.debtId]);
+    const account = await resolveAccount(client, req.companyId, b.accountId, b.paymentMethod);
+    return postTransaction(client, {
+      companyId: req.companyId, userId: req.user.id, account, type: payable ? 'EXPENSE' : 'INCOME', amount,
+      category: 'Погашение задолженности', description: str(b.description) || `Оплата по задолженности: ${party.rows[0].name}`,
+      counterparty: party.rows[0].name, paymentMethod: methodOf(b), date: dateOrToday(b.date),
+      referenceType: payable ? 'SUPPLIER_DEBT' : 'CUSTOMER_DEBT', referenceId: b.debtId,
+      documentUrl: relativeUploadPath(b.documentUrl), documentName: strOrNull(b.documentName),
+    });
+  });
+  await notify(req.user.id, payable ? 'Оплата кредиторской задолженности' : 'Погашение дебиторской задолженности', `Оплата задолженности: ${amount} сум`, 'FINANCE', row.id);
+  res.status(201).json({ data: txOut(row) });
+}));
+
+api.get('/finance/customer-debts', h(async (req, res) => {
+  const result = await pool.query(
+    `SELECT c.id, c.id AS customer_id, c.name AS customer_name, c.phone, c.balance AS amount, c.balance AS total_amount,
+            COALESCE((SELECT SUM(t.amount) FROM transactions t WHERE t.company_id = c.company_id
+                      AND t.reference_type = 'CUSTOMER_DEBT' AND t.reference_id = c.id), 0) AS paid_amount,
+            NULL::date AS due_date, 'pending' AS status, 'receivable' AS type
+     FROM customers c WHERE c.company_id = $1 AND c.balance > 0 ORDER BY c.balance DESC`,
+    [req.companyId]
+  );
+  res.json({ data: out(result.rows) });
+}));
+
+api.get('/finance/supplier-debts', h(async (req, res) => {
+  const result = await pool.query(
+    `SELECT s.id, s.id AS supplier_id, s.name AS supplier_name, s.phone, s.balance AS amount, s.balance AS total_amount,
+            COALESCE((SELECT SUM(t.amount) FROM transactions t WHERE t.company_id = s.company_id
+                      AND t.reference_type = 'SUPPLIER_DEBT' AND t.reference_id = s.id), 0) AS paid_amount,
+            NULL::date AS due_date, 'pending' AS status, 'payable' AS type
+     FROM suppliers s WHERE s.company_id = $1 AND s.balance > 0 ORDER BY s.balance DESC`,
+    [req.companyId]
+  );
+  res.json({ data: out(result.rows) });
+}));
+
+// ============================================================================
+// INVENTORY & PRODUCTS
+// ============================================================================
+const PRODUCT_SELECT = `
+  SELECT p.*, c.name AS category_name,
+         COALESCE(i.quantity, 0) AS quantity, COALESCE(i.quantity, 0) AS current_stock,
+         COALESCE(i.average_cost, p.purchase_price) AS avg_cost,
+         (COALESCE(i.quantity, 0) <= p.min_stock_level) AS is_low_stock
+  FROM products p
+  LEFT JOIN product_categories c ON p.category_id = c.id
+  LEFT JOIN (SELECT product_id, SUM(quantity) AS quantity,
+                    CASE WHEN SUM(quantity) > 0 THEN SUM(quantity * average_cost) / SUM(quantity) ELSE MAX(average_cost) END AS average_cost
+             FROM inventory GROUP BY product_id) i ON p.id = i.product_id`;
+
+async function defaultWarehouse(client, companyId) {
+  const found = await client.query(`SELECT id FROM warehouses WHERE company_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1`, [companyId]);
+  if (found.rows[0]) return found.rows[0].id;
+  const created = await client.query(`INSERT INTO warehouses (name, is_default, company_id) VALUES ('Основной склад', TRUE, $1) RETURNING id`, [companyId]);
+  return created.rows[0].id;
+}
+
+// The only place that changes stock: the inventory row and its movement record change together.
+async function moveStock(client, { companyId, userId, productId, warehouseId, delta, type, unitCost, referenceType, referenceId, reason }) {
+  const product = await client.query(`SELECT id, name, unit, purchase_price FROM products WHERE id = $1 AND company_id = $2 AND is_active`, [productId, companyId]);
+  if (!product.rows[0]) throw new HttpError(404, 'Товар не найден');
+  await client.query(
+    `INSERT INTO inventory (product_id, warehouse_id, quantity, average_cost) VALUES ($1, $2, 0, $3)
+     ON CONFLICT (product_id, warehouse_id) DO NOTHING`,
+    [productId, warehouseId, product.rows[0].purchase_price]
+  );
+  const inv = await client.query(`SELECT quantity, average_cost FROM inventory WHERE product_id = $1 AND warehouse_id = $2 FOR UPDATE`, [productId, warehouseId]);
+  const curQty = num(inv.rows[0].quantity);
+  const curAvg = num(inv.rows[0].average_cost);
+  const newQty = Math.round((curQty + delta) * 100) / 100;
+  if (newQty < 0) {
+    throw new HttpError(400, `Недостаточно товара «${product.rows[0].name}» на складе: доступно ${curQty} ${product.rows[0].unit}`);
+  }
+  let newAvg = curAvg;
+  if (delta > 0 && unitCost != null && unitCost > 0) {
+    newAvg = newQty > 0 ? Math.round(((curQty * curAvg + delta * unitCost) / newQty) * 100) / 100 : unitCost;
+  }
+  await client.query(
+    `UPDATE inventory SET quantity = $1, average_cost = $2, last_updated_at = CURRENT_TIMESTAMP WHERE product_id = $3 AND warehouse_id = $4`,
+    [newQty, newAvg, productId, warehouseId]
+  );
+  await client.query(
+    `INSERT INTO stock_movements (company_id, product_id, warehouse_id, type, quantity, unit_cost, balance_after, reference_type, reference_id, reason, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [companyId, productId, warehouseId, type, Math.abs(delta), unitCost != null ? unitCost : curAvg, newQty, referenceType || 'MANUAL', uuidOrNull(referenceId), reason || null, userId]
+  );
+  return { quantity: newQty, averageCost: newAvg, previousAverageCost: curAvg };
+}
+
+api.get('/inventory/products', h(async (req, res) => {
+  const q = req.query;
+  const conds = ['p.company_id = $1', 'p.is_active'];
+  const vals = [req.companyId];
+  if (str(q.search)) {
+    vals.push(`%${str(q.search)}%`);
+    conds.push(`(p.name ILIKE $${vals.length} OR p.sku ILIKE $${vals.length} OR p.barcode ILIKE $${vals.length})`);
+  }
+  if (isUuid(q.categoryId)) {
+    vals.push(q.categoryId);
+    conds.push(`p.category_id = $${vals.length}`);
+  }
+  if (q.lowStock === 'true' || q.filter === 'low') conds.push(`COALESCE(i.quantity, 0) <= p.min_stock_level`);
+  if (q.filter === 'out') conds.push(`COALESCE(i.quantity, 0) <= 0`);
+  const limit = Math.min(Math.max(parseInt(q.limit, 10) || 200, 1), 500);
+  const page = Math.max(parseInt(q.page, 10) || 1, 1);
+  const result = await pool.query(
+    `${PRODUCT_SELECT} WHERE ${conds.join(' AND ')} ORDER BY p.created_at DESC LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+    vals
+  );
+  res.json({ data: out(result.rows) });
+}));
+
+api.get('/inventory/alerts/low-stock', h(async (req, res) => {
+  const result = await pool.query(
+    `${PRODUCT_SELECT} WHERE p.company_id = $1 AND p.is_active AND COALESCE(i.quantity, 0) <= p.min_stock_level ORDER BY p.name`,
+    [req.companyId]
+  );
+  res.json({ data: out(result.rows) });
+}));
+
+api.get('/inventory/categories', h(async (req, res) => {
+  const result = await pool.query(`SELECT * FROM product_categories WHERE company_id = $1 ORDER BY name ASC`, [req.companyId]);
+  res.json({ data: out(result.rows) });
+}));
+
+api.post('/inventory/categories', h(async (req, res) => {
+  const name = str(req.body && req.body.name);
+  if (!name) throw new HttpError(400, 'Укажите название категории');
+  const existing = await pool.query(`SELECT * FROM product_categories WHERE company_id = $1 AND LOWER(name) = LOWER($2)`, [req.companyId, name]);
+  if (existing.rows[0]) return res.json({ data: out(existing.rows[0]) });
+  const result = await pool.query(`INSERT INTO product_categories (name, company_id) VALUES ($1, $2) RETURNING *`, [name, req.companyId]);
+  res.status(201).json({ data: out(result.rows[0]) });
+}));
+
+api.get('/inventory/warehouses', h(async (req, res) => {
+  const result = await pool.query(`SELECT * FROM warehouses WHERE company_id = $1 ORDER BY is_default DESC, created_at ASC`, [req.companyId]);
+  res.json({ data: out(result.rows) });
+}));
+
+api.get('/inventory/movements', h(async (req, res) => {
+  const vals = [req.companyId];
+  let where = 'p.company_id = $1';
+  if (isUuid(req.query.productId)) {
+    vals.push(req.query.productId);
+    where += ' AND m.product_id = $2';
+  }
+  const result = await pool.query(
+    `SELECT m.*, p.name AS product_name, u.full_name AS created_by_name, m.reason AS notes
+     FROM stock_movements m JOIN products p ON p.id = m.product_id LEFT JOIN users u ON u.id = m.created_by
+     WHERE ${where} ORDER BY m.created_at DESC LIMIT 200`,
+    vals
+  );
+  res.json({ data: out(result.rows) });
+}));
+
+api.get('/inventory/levels', h(async (req, res) => {
+  const result = await pool.query(`${PRODUCT_SELECT} WHERE p.company_id = $1 AND p.is_active ORDER BY p.name`, [req.companyId]);
+  res.json({ data: out(result.rows) });
+}));
+
+async function resolveCategory(client, companyId, body) {
+  if (isUuid(body.categoryId)) {
+    const c = await client.query(`SELECT id FROM product_categories WHERE id = $1 AND company_id = $2`, [body.categoryId, companyId]);
+    if (c.rows[0]) return c.rows[0].id;
+  }
+  const name = str(body.categoryName || body.category);
+  if (!name) return null;
+  const existing = await client.query(`SELECT id FROM product_categories WHERE company_id = $1 AND LOWER(name) = LOWER($2)`, [companyId, name]);
+  if (existing.rows[0]) return existing.rows[0].id;
+  const created = await client.query(`INSERT INTO product_categories (name, company_id) VALUES ($1, $2) RETURNING id`, [name, companyId]);
+  return created.rows[0].id;
+}
+
+async function getProduct(db, companyId, id) {
+  const result = await db.query(`${PRODUCT_SELECT} WHERE p.id = $1 AND p.company_id = $2`, [uuidOrNull(id), companyId]);
+  return result.rows[0] || null;
+}
+
+api.get('/inventory/products/:id', h(async (req, res) => {
+  const product = await getProduct(pool, req.companyId, req.params.id);
+  if (!product || !product.is_active) throw new HttpError(404, 'Товар не найден');
+  res.json({ data: out(product) });
+}));
+
+api.post('/inventory/products', h(async (req, res) => {
+  const b = req.body || {};
+  if (!str(b.name)) throw new HttpError(400, 'Укажите название товара');
+  const sellingPrice = num(b.sellingPrice != null ? b.sellingPrice : b.price);
+  const purchasePrice = num(b.purchasePrice != null ? b.purchasePrice : b.costPrice);
+  if (sellingPrice < 0 || purchasePrice < 0) throw new HttpError(400, 'Цена не может быть отрицательной');
+  const initialStock = num(b.initialStock != null ? b.initialStock : (b.currentStock != null ? b.currentStock : b.quantity));
+  if (initialStock < 0) throw new HttpError(400, 'Количество не может быть отрицательным');
+
+  const product = await tx(async (client) => {
+    const sku = str(b.sku) || `SKU-${Date.now().toString(36).toUpperCase()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+    const dup = await client.query(`SELECT 1 FROM products WHERE company_id = $1 AND is_active AND LOWER(sku) = LOWER($2)`, [req.companyId, sku]);
+    if (dup.rows[0]) throw new HttpError(400, `Товар с артикулом «${sku}» уже существует`);
+    const categoryId = await resolveCategory(client, req.companyId, b);
+    const inserted = await client.query(
+      `INSERT INTO products (company_id, name, sku, category_id, selling_price, purchase_price, unit, min_stock_level, description, barcode, image_url, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, TRUE) RETURNING id`,
+      [req.companyId, str(b.name), sku, categoryId, sellingPrice, purchasePrice, str(b.unit) || 'шт',
+        Math.max(0, Math.round(num(b.minStockLevel, 5))), str(b.description), strOrNull(b.barcode), strOrNull(b.imageUrl)]
+    );
+    const warehouseId = await defaultWarehouse(client, req.companyId);
+    await client.query(
+      `INSERT INTO inventory (product_id, warehouse_id, quantity, average_cost) VALUES ($1, $2, 0, $3) ON CONFLICT DO NOTHING`,
+      [inserted.rows[0].id, warehouseId, purchasePrice]
+    );
+    if (initialStock > 0) {
+      await moveStock(client, {
+        companyId: req.companyId, userId: req.user.id, productId: inserted.rows[0].id, warehouseId, delta: initialStock,
+        type: 'INCOMING', unitCost: purchasePrice, referenceType: 'MANUAL', reason: 'Начальный остаток',
+      });
+    }
+    return getProduct(client, req.companyId, inserted.rows[0].id);
+  });
+  res.status(201).json({ data: out(product) });
+}));
+
+const handleUpdateProduct = h(async (req, res) => {
+  const b = req.body || {};
+  const product = await tx(async (client) => {
+    const current = await client.query(`SELECT * FROM products WHERE id = $1 AND company_id = $2 AND is_active FOR UPDATE`, [uuidOrNull(req.params.id), req.companyId]);
+    if (!current.rows[0]) throw new HttpError(404, 'Товар не найден');
+    const sets = [];
+    const vals = [req.params.id];
+    const set = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+    if (b.name !== undefined) {
+      if (!str(b.name)) throw new HttpError(400, 'Укажите название товара');
+      set('name', str(b.name));
+    }
+    if (b.sku !== undefined && str(b.sku) && str(b.sku).toLowerCase() !== String(current.rows[0].sku).toLowerCase()) {
+      const dup = await client.query(`SELECT 1 FROM products WHERE company_id = $1 AND is_active AND LOWER(sku) = LOWER($2) AND id <> $3`, [req.companyId, str(b.sku), req.params.id]);
+      if (dup.rows[0]) throw new HttpError(400, `Товар с артикулом «${str(b.sku)}» уже существует`);
+      set('sku', str(b.sku));
+    }
+    const selling = b.sellingPrice !== undefined ? b.sellingPrice : b.price;
+    const purchase = b.purchasePrice !== undefined ? b.purchasePrice : b.costPrice;
+    if (selling !== undefined) {
+      if (num(selling) < 0) throw new HttpError(400, 'Цена не может быть отрицательной');
+      set('selling_price', num(selling));
+    }
+    if (purchase !== undefined) {
+      if (num(purchase) < 0) throw new HttpError(400, 'Цена не может быть отрицательной');
+      set('purchase_price', num(purchase));
+    }
+    if (b.unit !== undefined && str(b.unit)) set('unit', str(b.unit));
+    if (b.minStockLevel !== undefined) set('min_stock_level', Math.max(0, Math.round(num(b.minStockLevel))));
+    if (b.description !== undefined) set('description', str(b.description));
+    if (b.barcode !== undefined) set('barcode', strOrNull(b.barcode));
+    if (b.imageUrl !== undefined) set('image_url', strOrNull(b.imageUrl));
+    if (b.categoryId !== undefined || b.categoryName !== undefined || b.category !== undefined) set('category_id', await resolveCategory(client, req.companyId, b));
+    if (sets.length > 0) await client.query(`UPDATE products SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, vals);
+    return getProduct(client, req.companyId, req.params.id);
+  });
+  res.json({ data: out(product) });
 });
+api.patch('/inventory/products/:id', handleUpdateProduct);
+api.put('/inventory/products/:id', handleUpdateProduct);
 
-// Pay Debt (Receivable or Payable)
-app.post('/api/v1/finance/debts/pay', async (req, res) => {
-  const { debtId, type, amount, paymentMethod, accountId, documentUrl, documentName, description } = req.body;
-  const numAmount = parseFloat(amount) || 0;
-  if (numAmount <= 0) return res.status(400).json({ message: 'Сумма должна быть больше 0' });
+api.delete('/inventory/products/:id', h(async (req, res) => {
+  const result = await pool.query(
+    `UPDATE products SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND company_id = $2 AND is_active RETURNING id`,
+    [uuidOrNull(req.params.id), req.companyId]
+  );
+  if (!result.rows[0]) throw new HttpError(404, 'Товар не найден');
+  res.json({ success: true });
+}));
 
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const targetAccountId = await resolveAccountId(client, accountId, paymentMethod);
+api.post('/inventory/adjust', h(async (req, res) => {
+  const b = req.body || {};
+  if (!isUuid(b.productId)) throw new HttpError(400, 'Выберите товар');
+  const kind = str(b.type).toLowerCase();
+  const quantity = num(b.quantity, NaN);
+  if (!Number.isFinite(quantity) || quantity < 0) throw new HttpError(400, 'Укажите корректное количество');
+  const reason = str(b.notes || b.reason);
 
-    let txType = 'INCOME';
-    let refType = 'CUSTOMER';
-    let notifTitle = 'Погашение дебиторской задолженности';
-    let notifBody = `Получена оплата задолженности: ${numAmount} сум`;
-
-    if (type === 'payable' || type === 'supplier') {
-      txType = 'EXPENSE';
-      refType = 'SUPPLIER';
-      notifTitle = 'Оплата кредиторской задолженности';
-      notifBody = `Произведена оплата задолженности: ${numAmount} сум`;
-
-      // 1. Deduct account balance
-      await client.query(`UPDATE accounts SET balance = balance - $1 WHERE id = $2`, [numAmount, targetAccountId]);
-      // 2. Reduce supplier debt balance
-      if (debtId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(debtId)) {
-        await client.query(`UPDATE suppliers SET balance = balance - $1 WHERE id = $2`, [numAmount, debtId]);
-      }
+  const product = await tx(async (client) => {
+    const warehouseId = await defaultWarehouse(client, req.companyId);
+    let delta;
+    let type;
+    if (['set', 'correction', 'inventory', 'adjustment'].includes(kind)) {
+      const cur = await client.query(`SELECT COALESCE(SUM(quantity), 0) AS q FROM inventory WHERE product_id = $1 AND warehouse_id = $2`, [b.productId, warehouseId]);
+      delta = Math.round((quantity - num(cur.rows[0].q)) * 100) / 100;
+      type = 'ADJUSTMENT';
+    } else if (['out', 'outgoing', 'decrease', 'remove', 'writeoff', 'write_off', 'subtract', 'minus'].includes(kind)) {
+      delta = -quantity;
+      type = 'OUTGOING';
     } else {
-      // 1. Increase account balance
-      await client.query(`UPDATE accounts SET balance = balance + $1 WHERE id = $2`, [numAmount, targetAccountId]);
-      // 2. Reduce customer debt balance
-      if (debtId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(debtId)) {
-        await client.query(`UPDATE customers SET balance = balance - $1 WHERE id = $2`, [numAmount, debtId]);
-      }
+      delta = quantity;
+      type = 'INCOMING';
+    }
+    if (delta === 0) throw new HttpError(400, 'Количество не изменилось');
+    await moveStock(client, {
+      companyId: req.companyId, userId: req.user.id, productId: b.productId, warehouseId, delta, type,
+      unitCost: delta > 0 && b.unitCost != null ? num(b.unitCost) : null, referenceType: 'MANUAL',
+      reason: reason || (type === 'INCOMING' ? 'Ручное оприходование' : type === 'OUTGOING' ? 'Ручное списание' : 'Инвентаризация'),
+    });
+    return getProduct(client, req.companyId, b.productId);
+  });
+  res.status(201).json({ data: out(product) });
+}));
+
+// ============================================================================
+// INCOMING SHIPMENTS
+// ============================================================================
+function shipmentOut(row, items) {
+  const o = out(row);
+  o.invoiceNumber = row.shipment_number;
+  o.totalCost = num(row.total_amount);
+  o.responsibleEmployee = row.created_by_name || null;
+  if (items) {
+    o.items = items.map((it) => ({ ...out(it), unitPrice: num(it.purchase_price), totalPrice: num(it.total_amount) }));
+  }
+  return o;
+}
+
+const SHIPMENT_SELECT = `
+  SELECT s.*, sup.name AS supplier_name, u.full_name AS created_by_name
+  FROM incoming_shipments s
+  LEFT JOIN suppliers sup ON s.supplier_id = sup.id
+  LEFT JOIN users u ON s.created_by = u.id`;
+
+async function shipmentItems(db, shipmentId) {
+  const r = await db.query(
+    `SELECT isi.*, p.name AS product_name FROM incoming_shipment_items isi LEFT JOIN products p ON isi.product_id = p.id WHERE isi.shipment_id = $1`,
+    [shipmentId]
+  );
+  return r.rows;
+}
+
+api.get('/shipments', h(async (req, res) => {
+  const conds = ['s.company_id = $1'];
+  const vals = [req.companyId];
+  const status = str(req.query.status).toUpperCase();
+  if (status && status !== 'ALL') {
+    vals.push(status);
+    conds.push(`UPPER(s.status) = $${vals.length}`);
+  }
+  if (str(req.query.search)) {
+    vals.push(`%${str(req.query.search)}%`);
+    conds.push(`(s.shipment_number ILIKE $${vals.length} OR sup.name ILIKE $${vals.length})`);
+  }
+  const result = await pool.query(`${SHIPMENT_SELECT} WHERE ${conds.join(' AND ')} ORDER BY s.created_at DESC LIMIT 300`, vals);
+  res.json({ data: result.rows.map((r) => shipmentOut(r)) });
+}));
+
+api.get('/shipments/:id', h(async (req, res) => {
+  const result = await pool.query(`${SHIPMENT_SELECT} WHERE s.id = $1 AND s.company_id = $2`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!result.rows[0]) throw new HttpError(404, 'Поставка не найдена');
+  res.json({ data: shipmentOut(result.rows[0], await shipmentItems(pool, req.params.id)) });
+}));
+
+async function receiveShipment(client, req, shipment) {
+  const items = await shipmentItems(client, shipment.id);
+  const warehouseId = shipment.warehouse_id || await defaultWarehouse(client, req.companyId);
+  for (const it of items) {
+    await moveStock(client, {
+      companyId: req.companyId, userId: req.user.id, productId: it.product_id, warehouseId, delta: num(it.quantity),
+      type: 'INCOMING', unitCost: num(it.purchase_price), referenceType: 'SHIPMENT', referenceId: shipment.id,
+      reason: `Поступление по накладной ${shipment.shipment_number}`,
+    });
+    await client.query(`UPDATE incoming_shipment_items SET received_quantity = quantity WHERE id = $1`, [it.id]);
+  }
+  if (shipment.supplier_id) {
+    await client.query(`UPDATE suppliers SET balance = balance + $1 WHERE id = $2`, [num(shipment.total_amount) + num(shipment.additional_costs), shipment.supplier_id]);
+  }
+  await client.query(`UPDATE incoming_shipments SET status = 'RECEIVED', received_date = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [shipment.id]);
+}
+
+api.post('/shipments', h(async (req, res) => {
+  const b = req.body || {};
+  const rawItems = Array.isArray(b.items) ? b.items : [];
+  if (rawItems.length === 0) throw new HttpError(400, 'Добавьте хотя бы один товар в поставку');
+  const pending = str(b.status).toLowerCase() === 'pending';
+
+  const shipment = await tx(async (client) => {
+    let supplierId = null;
+    if (isUuid(b.supplierId)) {
+      const s = await client.query(`SELECT id FROM suppliers WHERE id = $1 AND company_id = $2`, [b.supplierId, req.companyId]);
+      if (!s.rows[0]) throw new HttpError(404, 'Поставщик не найден');
+      supplierId = b.supplierId;
+    } else if (str(b.supplierName)) {
+      const existing = await client.query(`SELECT id FROM suppliers WHERE company_id = $1 AND LOWER(name) = LOWER($2)`, [req.companyId, str(b.supplierName)]);
+      supplierId = existing.rows[0]
+        ? existing.rows[0].id
+        : (await client.query(`INSERT INTO suppliers (name, company_id) VALUES ($1, $2) RETURNING id`, [str(b.supplierName), req.companyId])).rows[0].id;
     }
 
-    const txRes = await client.query(
-      `INSERT INTO transactions (account_id, type, amount, category, description, reference_type, reference_id, document_url, document_name, transaction_date)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP) RETURNING *`,
-      [targetAccountId, txType, numAmount, 'Погашение задолженности', description || `Оплата по задолженности`, refType, debtId || null, documentUrl || null, documentName || null]
+    const items = rawItems.map((it) => {
+      const productId = it.productId || it.product_id;
+      if (!isUuid(productId)) throw new HttpError(400, 'В поставке указан неизвестный товар');
+      const quantity = requirePositive(it.quantity, 'Количество товара');
+      const price = num(it.unitPrice != null ? it.unitPrice : (it.purchasePrice != null ? it.purchasePrice : it.price));
+      if (price < 0) throw new HttpError(400, 'Цена не может быть отрицательной');
+      return { productId, quantity, price, total: Math.round(quantity * price * 100) / 100 };
+    });
+    const total = items.reduce((s, it) => s + it.total, 0);
+    const warehouseId = await defaultWarehouse(client, req.companyId);
+    const number = str(b.invoiceNumber) || `ПСТ-${Date.now().toString().slice(-8)}`;
+    const dup = await client.query(`SELECT 1 FROM incoming_shipments WHERE company_id = $1 AND shipment_number = $2`, [req.companyId, number]);
+    if (dup.rows[0]) throw new HttpError(400, `Поставка с номером «${number}» уже существует`);
+
+    const inserted = await client.query(
+      `INSERT INTO incoming_shipments (company_id, shipment_number, supplier_id, warehouse_id, status, expected_date, total_amount, additional_costs, notes, created_by)
+       VALUES ($1, $2, $3, $4, 'PENDING', $5, $6, $7, $8, $9) RETURNING *`,
+      [req.companyId, number, supplierId, warehouseId, dateOrToday(b.expectedDate), total, Math.max(0, num(b.additionalCosts)), strOrNull(b.notes), req.user.id]
     );
+    for (const it of items) {
+      const p = await client.query(`SELECT 1 FROM products WHERE id = $1 AND company_id = $2 AND is_active`, [it.productId, req.companyId]);
+      if (!p.rows[0]) throw new HttpError(404, 'Товар из поставки не найден');
+      await client.query(
+        `INSERT INTO incoming_shipment_items (shipment_id, product_id, quantity, purchase_price, total_amount) VALUES ($1, $2, $3, $4, $5)`,
+        [inserted.rows[0].id, it.productId, it.quantity, it.price, it.total]
+      );
+    }
+    if (!pending) await receiveShipment(client, req, inserted.rows[0]);
+    const full = await client.query(`${SHIPMENT_SELECT} WHERE s.id = $1`, [inserted.rows[0].id]);
+    return shipmentOut(full.rows[0], await shipmentItems(client, inserted.rows[0].id));
+  });
+  await notify(req.user.id, 'Новая поставка', `Поставка №${shipment.shipment_number} на сумму ${shipment.totalCost} сум`, 'SHIPMENT', shipment.id);
+  res.status(201).json({ data: shipment });
+}));
 
-    await client.query('COMMIT');
-    const txn = txRes.rows[0];
-    await createNotification(null, notifTitle, notifBody, 'FINANCE', txn.id);
-    res.status(201).json({ data: txn });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ message: err.message });
-  } finally {
-    client.release();
+api.post('/shipments/:id/confirm', h(async (req, res) => {
+  const shipment = await tx(async (client) => {
+    const found = await client.query(`SELECT * FROM incoming_shipments WHERE id = $1 AND company_id = $2 FOR UPDATE`, [uuidOrNull(req.params.id), req.companyId]);
+    if (!found.rows[0]) throw new HttpError(404, 'Поставка не найдена');
+    if (found.rows[0].status === 'RECEIVED') throw new HttpError(400, 'Поставка уже принята на склад');
+    if (found.rows[0].status === 'CANCELLED') throw new HttpError(400, 'Поставка отменена');
+    await receiveShipment(client, req, found.rows[0]);
+    const full = await client.query(`${SHIPMENT_SELECT} WHERE s.id = $1`, [found.rows[0].id]);
+    return shipmentOut(full.rows[0], await shipmentItems(client, found.rows[0].id));
+  });
+  res.json({ data: shipment });
+}));
+
+// ============================================================================
+// SALES
+// ============================================================================
+const SALE_SELECT = `
+  SELECT s.*, c.name AS customer_name, u.full_name AS manager_name
+  FROM sales s LEFT JOIN customers c ON s.customer_id = c.id LEFT JOIN users u ON s.created_by = u.id`;
+
+async function saleDetails(db, row) {
+  const [items, payments] = await Promise.all([
+    db.query(`SELECT si.*, p.name AS product_name FROM sale_items si LEFT JOIN products p ON si.product_id = p.id WHERE si.sale_id = $1`, [row.id]),
+    db.query(`SELECT id, amount, payment_method, payment_method AS method, transaction_date AS payment_date, created_at
+              FROM transactions WHERE reference_type = 'SALE' AND reference_id = $1 ORDER BY created_at ASC`, [row.id]),
+  ]);
+  return saleOut(row, items.rows, payments.rows);
+}
+
+function saleOut(row, items, payments) {
+  const o = out(row);
+  o.totalAmount = num(row.grand_total);
+  o.paymentStatus = String(row.payment_status || 'UNPAID').toLowerCase();
+  o.status = o.paymentStatus;
+  o.saleStatus = row.status;
+  o.managerName = row.manager_name || null;
+  if (items) o.items = items.map((it) => ({ ...out(it), price: num(it.unit_price), totalPrice: num(it.total_amount) }));
+  if (payments) o.payments = payments.map((p) => ({ ...out(p), date: p.payment_date }));
+  return o;
+}
+
+api.get('/sales', h(async (req, res) => {
+  const conds = ['s.company_id = $1'];
+  const vals = [req.companyId];
+  const status = str(req.query.status || req.query.paymentStatus).toUpperCase();
+  if (['PAID', 'PARTIAL', 'UNPAID'].includes(status)) {
+    vals.push(status);
+    conds.push(`s.payment_status = $${vals.length}`);
   }
-});
+  if (str(req.query.search)) {
+    vals.push(`%${str(req.query.search)}%`);
+    conds.push(`(s.sale_number ILIKE $${vals.length} OR c.name ILIKE $${vals.length})`);
+  }
+  const result = await pool.query(`${SALE_SELECT} WHERE ${conds.join(' AND ')} ORDER BY s.created_at DESC LIMIT 300`, vals);
+  res.json({ data: result.rows.map((r) => saleOut(r)) });
+}));
 
-// Create Transfer
-app.post('/api/v1/finance/transactions/transfer', async (req, res) => {
-  const { fromAccountId, toAccountId, amount, description } = req.body;
-  const numAmount = parseFloat(amount) || 0;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
+api.get('/sales/:id', h(async (req, res) => {
+  const result = await pool.query(`${SALE_SELECT} WHERE s.id = $1 AND s.company_id = $2`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!result.rows[0]) throw new HttpError(404, 'Продажа не найдена');
+  res.json({ data: await saleDetails(pool, result.rows[0]) });
+}));
 
-    // Outgoing
+async function resolveCustomer(client, companyId, body) {
+  if (isUuid(body.customerId)) {
+    const c = await client.query(`SELECT id FROM customers WHERE id = $1 AND company_id = $2`, [body.customerId, companyId]);
+    if (!c.rows[0]) throw new HttpError(404, 'Клиент не найден');
+    return c.rows[0].id;
+  }
+  const name = str(body.customerName);
+  if (!name) return null;
+  const existing = await client.query(`SELECT id FROM customers WHERE company_id = $1 AND LOWER(name) = LOWER($2)`, [companyId, name]);
+  if (existing.rows[0]) return existing.rows[0].id;
+  return (await client.query(`INSERT INTO customers (name, company_id) VALUES ($1, $2) RETURNING id`, [name, companyId])).rows[0].id;
+}
+
+api.post('/sales', h(async (req, res) => {
+  const b = req.body || {};
+  const rawItems = Array.isArray(b.items) ? b.items : [];
+  if (rawItems.length === 0) throw new HttpError(400, 'Добавьте хотя бы один товар в продажу');
+
+  const sale = await tx(async (client) => {
+    const items = rawItems.map((it) => {
+      const productId = it.productId || it.product_id;
+      if (!isUuid(productId)) throw new HttpError(400, 'В продаже указан неизвестный товар');
+      const quantity = requirePositive(it.quantity, 'Количество товара');
+      const price = num(it.price != null ? it.price : it.unitPrice);
+      if (price < 0) throw new HttpError(400, 'Цена не может быть отрицательной');
+      return { productId, quantity, price, total: Math.round(quantity * price * 100) / 100 };
+    });
+    const subtotal = items.reduce((s, it) => s + it.total, 0);
+    const discount = Math.min(Math.max(0, num(b.discount)), subtotal);
+    const grandTotal = Math.round((subtotal - discount) * 100) / 100;
+    const paid = Math.max(0, num(b.paidAmount));
+    if (paid > grandTotal) throw new HttpError(400, 'Оплаченная сумма больше суммы продажи');
+    const customerId = await resolveCustomer(client, req.companyId, b);
+    if (paid < grandTotal && !customerId) throw new HttpError(400, 'Для продажи в долг укажите клиента');
+
+    const warehouseId = await defaultWarehouse(client, req.companyId);
+    const number = `ПРД-${Date.now().toString().slice(-8)}${crypto.randomBytes(1).toString('hex').toUpperCase()}`;
+    const paymentStatus = paid >= grandTotal ? 'PAID' : paid > 0 ? 'PARTIAL' : 'UNPAID';
+    const method = methodOf(b);
+    const inserted = await client.query(
+      `INSERT INTO sales (company_id, sale_number, customer_id, warehouse_id, status, payment_status, subtotal, discount, grand_total, paid_amount, payment_method, notes, created_by)
+       VALUES ($1, $2, $3, $4, 'COMPLETED', $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [req.companyId, number, customerId, warehouseId, paymentStatus, subtotal, discount, grandTotal, paid, method, strOrNull(b.notes), req.user.id]
+    );
+    const saleRow = inserted.rows[0];
+
+    for (const it of items) {
+      const moved = await moveStock(client, {
+        companyId: req.companyId, userId: req.user.id, productId: it.productId, warehouseId, delta: -it.quantity,
+        type: 'OUTGOING', referenceType: 'SALE', referenceId: saleRow.id, reason: `Продажа ${number}`,
+      });
+      await client.query(
+        `INSERT INTO sale_items (sale_id, product_id, quantity, unit_price, cost_price, total_amount) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [saleRow.id, it.productId, it.quantity, it.price, moved.previousAverageCost, it.total]
+      );
+    }
+    if (grandTotal - paid > 0) await client.query(`UPDATE customers SET balance = balance + $1 WHERE id = $2`, [grandTotal - paid, customerId]);
+    if (paid > 0) {
+      const account = await resolveAccount(client, req.companyId, b.accountId, method);
+      await postTransaction(client, {
+        companyId: req.companyId, userId: req.user.id, account, type: 'INCOME', amount: paid, category: 'Оплата продажи',
+        description: `Оплата продажи № ${number}`, paymentMethod: method, date: dateOrToday(null), referenceType: 'SALE', referenceId: saleRow.id,
+      });
+    }
+    const full = await client.query(`${SALE_SELECT} WHERE s.id = $1`, [saleRow.id]);
+    return saleDetails(client, full.rows[0]);
+  });
+  await notify(req.user.id, 'Новая продажа', `Продажа №${sale.sale_number} на сумму ${sale.totalAmount} сум`, 'SALE', sale.id);
+  res.status(201).json({ data: sale });
+}));
+
+api.post('/sales/:id/payments', h(async (req, res) => {
+  const b = req.body || {};
+  const amount = requirePositive(b.amount, 'Сумма оплаты');
+  const sale = await tx(async (client) => {
+    const found = await client.query(`SELECT * FROM sales WHERE id = $1 AND company_id = $2 FOR UPDATE`, [uuidOrNull(req.params.id), req.companyId]);
+    const s = found.rows[0];
+    if (!s) throw new HttpError(404, 'Продажа не найдена');
+    const remaining = Math.round((num(s.grand_total) - num(s.paid_amount)) * 100) / 100;
+    if (remaining <= 0) throw new HttpError(400, 'Продажа уже полностью оплачена');
+    if (amount > remaining) throw new HttpError(400, `Сумма оплаты больше остатка: ${remaining}`);
+    const method = methodOf({ paymentMethod: b.paymentMethod || b.method });
+    const newPaid = num(s.paid_amount) + amount;
     await client.query(
-      `INSERT INTO transactions (account_id, type, amount, category, description, transaction_date)
-       VALUES ($1, 'TRANSFER_OUT', $2, 'Перевод со счета', $3, CURRENT_TIMESTAMP)`,
-      [fromAccountId, numAmount, description || '']
+      `UPDATE sales SET paid_amount = $1, payment_status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`,
+      [newPaid, newPaid >= num(s.grand_total) ? 'PAID' : 'PARTIAL', s.id]
     );
-    await client.query(`UPDATE accounts SET balance = balance - $1 WHERE id = $2`, [numAmount, fromAccountId]);
-
-    // Incoming
-    const txRes = await client.query(
-      `INSERT INTO transactions (account_id, type, amount, category, description, transaction_date)
-       VALUES ($1, 'TRANSFER_IN', $2, 'Перевод на счет', $3, CURRENT_TIMESTAMP) RETURNING *`,
-      [toAccountId, numAmount, description || '']
-    );
-    await client.query(`UPDATE accounts SET balance = balance + $1 WHERE id = $2`, [numAmount, toAccountId]);
-
-    await client.query('COMMIT');
-    res.status(201).json({ data: txRes.rows[0] });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ message: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-// Debts
-app.get('/api/v1/finance/customer-debts', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, id as customer_id, name as customer_name, balance as amount, 0 as paid_amount, 
-              (CURRENT_DATE + INTERVAL '14 days') as due_date, 'pending' as status, 'receivable' as type
-       FROM customers WHERE balance > 0 ORDER BY balance DESC`
-    );
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/finance/supplier-debts', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, id as supplier_id, name as supplier_name, balance as amount, 0 as paid_amount,
-              (CURRENT_DATE + INTERVAL '14 days') as due_date, 'pending' as status, 'payable' as type
-       FROM suppliers WHERE balance > 0 ORDER BY balance DESC`
-    );
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+    if (s.customer_id) await client.query(`UPDATE customers SET balance = balance - $1 WHERE id = $2`, [amount, s.customer_id]);
+    const account = await resolveAccount(client, req.companyId, b.accountId, method);
+    await postTransaction(client, {
+      companyId: req.companyId, userId: req.user.id, account, type: 'INCOME', amount, category: 'Оплата продажи',
+      description: `Оплата продажи № ${s.sale_number}`, paymentMethod: method, date: dateOrToday(b.date), referenceType: 'SALE', referenceId: s.id,
+    });
+    const full = await client.query(`${SALE_SELECT} WHERE s.id = $1`, [s.id]);
+    return saleDetails(client, full.rows[0]);
+  });
+  res.status(201).json({ data: sale });
+}));
 
 // ============================================================================
-// 4. INVENTORY & PRODUCTS (Real DB with stock movements)
+// DEALS / CRM
 // ============================================================================
-app.get('/api/v1/inventory/products', async (req, res) => {
-  const { search, categoryId } = req.query;
-  const conditions = ['p.is_active = TRUE'];
-  const values = [];
+const DEAL_STATUSES = ['lead', 'contact', 'negotiation', 'proposal', 'waiting_payment', 'won', 'lost'];
+const DEAL_SELECT = `
+  SELECT d.*, c.name AS customer_name, c.phone AS customer_phone,
+         u.full_name AS assigned_employee_name, u.full_name AS assigned_to_name
+  FROM deals d LEFT JOIN customers c ON d.customer_id = c.id LEFT JOIN users u ON d.assigned_to = u.id`;
 
-  if (search) {
-    values.push(`%${search.trim()}%`);
-    conditions.push(`(p.name ILIKE $${values.length} OR p.sku ILIKE $${values.length} OR p.barcode ILIKE $${values.length})`);
-  }
-  if (categoryId && categoryId !== 'all') {
-    values.push(categoryId);
-    conditions.push(`p.category_id = $${values.length}`);
-  }
+function dealOut(row, comments) {
+  const o = out(row);
+  o.status = String(row.status || 'lead').toLowerCase();
+  o.assignedEmployeeName = row.assigned_employee_name || null;
+  if (comments) o.comments = comments.map((c) => ({ ...out(c), text: c.comment, content: c.comment, authorName: c.author_name }));
+  return o;
+}
 
-  try {
-    const q = `
-      SELECT p.*, c.name as category_name,
-             COALESCE(i.quantity, 0) as quantity,
-             COALESCE(i.average_cost, p.purchase_price) as avg_cost
-      FROM products p
-      LEFT JOIN product_categories c ON p.category_id = c.id
-      LEFT JOIN inventory i ON p.id = i.product_id
-      WHERE ${conditions.join(' AND ')}
-      ORDER BY p.created_at DESC
-    `;
-    const result = await pool.query(q, values);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+async function dealComments(db, dealId) {
+  const r = await db.query(
+    `SELECT dc.*, u.full_name AS author_name, u.avatar_url AS author_avatar FROM deal_comments dc LEFT JOIN users u ON dc.user_id = u.id
+     WHERE dc.deal_id = $1 ORDER BY dc.created_at ASC`,
+    [dealId]
+  );
+  return r.rows;
+}
 
-app.get('/api/v1/inventory/products/:id', async (req, res) => {
-  try {
-    const q = `
-      SELECT p.*, c.name as category_name,
-             COALESCE(i.quantity, 0) as quantity,
-             COALESCE(i.average_cost, p.purchase_price) as avg_cost
-      FROM products p
-      LEFT JOIN product_categories c ON p.category_id = c.id
-      LEFT JOIN inventory i ON p.id = i.product_id
-      WHERE p.id = $1
-    `;
-    const result = await pool.query(q, [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Товар не найден' });
-    res.json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+async function companyMember(db, companyId, userId) {
+  if (!isUuid(userId)) return null;
+  const r = await db.query(`SELECT user_id FROM user_companies WHERE company_id = $1 AND user_id = $2`, [companyId, userId]);
+  return r.rows[0] ? userId : null;
+}
 
-app.post('/api/v1/inventory/products', async (req, res) => {
-  const { name, sku, categoryId, sellingPrice, purchasePrice, unit, minStockLevel, description, barcode } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const autoSku = sku || `SKU-${Date.now().toString().substring(6)}`;
-    
-    // 1. Insert product
-    const prodRes = await client.query(
-      `INSERT INTO products (name, sku, category_id, selling_price, purchase_price, unit, min_stock_level, description, barcode, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE) RETURNING *`,
-      [
-        name || 'Новый товар',
-        autoSku,
-        categoryId || null,
-        parseFloat(sellingPrice) || 0.0,
-        parseFloat(purchasePrice) || 0.0,
-        unit || 'шт',
-        parseInt(minStockLevel, 10) || 5,
-        description || '',
-        barcode || null,
-      ]
-    );
-
-    const product = prodRes.rows[0];
-
-    // 2. Initialize default warehouse inventory record
-    const whRes = await client.query('SELECT id FROM warehouses LIMIT 1');
-    if (whRes.rows.length > 0) {
-      await client.query(
-        `INSERT INTO inventory (product_id, warehouse_id, quantity, average_cost)
-         VALUES ($1, $2, 0.00, $3) ON CONFLICT DO NOTHING`,
-        [product.id, whRes.rows[0].id, product.purchase_price]
-      );
-    }
-
-    await client.query('COMMIT');
-    res.status(201).json({ data: product });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ message: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-app.patch('/api/v1/inventory/products/:id', async (req, res) => {
-  const { name, sellingPrice, purchasePrice, unit, minStockLevel, description, barcode } = req.body;
-  try {
-    const result = await pool.query(
-      `UPDATE products SET
-         name = COALESCE($1, name),
-         selling_price = COALESCE($2, selling_price),
-         purchase_price = COALESCE($3, purchase_price),
-         unit = COALESCE($4, unit),
-         min_stock_level = COALESCE($5, min_stock_level),
-         description = COALESCE($6, description),
-         barcode = COALESCE($7, barcode),
-         updated_at = CURRENT_TIMESTAMP
-       WHERE id = $8 RETURNING *`,
-      [name, sellingPrice, purchasePrice, unit, minStockLevel, description, barcode, req.params.id]
-    );
-    res.json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.delete('/api/v1/inventory/products/:id', async (req, res) => {
-  try {
-    await pool.query('UPDATE products SET is_active = FALSE WHERE id = $1', [req.params.id]);
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/inventory/movements', async (req, res) => {
-  const { productId } = req.query;
-  try {
-    let q = `SELECT * FROM stock_movements`;
-    const vals = [];
-    if (productId) {
-      vals.push(productId);
-      q += ` WHERE product_id = $1`;
-    }
-    q += ` ORDER BY created_at DESC LIMIT 50`;
-    const result = await pool.query(q, vals);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/inventory/categories', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM product_categories ORDER BY name ASC');
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ============================================================================
-// 5. INCOMING GOODS / SHIPMENTS (Transaction-safe goods arrival)
-// ============================================================================
-app.get('/api/v1/shipments', async (req, res) => {
-  try {
-    const q = `
-      SELECT s.*, sup.name as supplier_name, u.full_name as created_by_name
-      FROM incoming_shipments s
-      LEFT JOIN suppliers sup ON s.supplier_id = sup.id
-      LEFT JOIN users u ON s.created_by = u.id
-      ORDER BY s.created_at DESC
-    `;
-    const result = await pool.query(q);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/shipments/:id', async (req, res) => {
-  try {
-    const shipRes = await pool.query(
-      `SELECT s.*, sup.name as supplier_name 
-       FROM incoming_shipments s 
-       LEFT JOIN suppliers sup ON s.supplier_id = sup.id 
-       WHERE s.id = $1`,
-      [req.params.id]
-    );
-    if (shipRes.rows.length === 0) return res.status(404).json({ message: 'Поставка не найдена' });
-
-    const itemsRes = await pool.query(
-      `SELECT isi.*, p.name as product_name 
-       FROM incoming_shipment_items isi 
-       LEFT JOIN products p ON isi.product_id = p.id 
-       WHERE isi.shipment_id = $1`,
-      [req.params.id]
-    );
-
-    const shipment = shipRes.rows[0];
-    shipment.items = itemsRes.rows;
-    res.json({ data: shipment });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/shipments', async (req, res) => {
-  const { supplierId, invoiceNumber, items, totalCost, additionalCosts } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const whRes = await client.query('SELECT id FROM warehouses LIMIT 1');
-    const warehouseId = whRes.rows[0]?.id;
-    const shipNum = invoiceNumber || `ПСТ-${Date.now().toString().substring(5)}`;
-
-    // 1. Create shipment header
-    const shipRes = await client.query(
-      `INSERT INTO incoming_shipments (shipment_number, supplier_id, warehouse_id, status, expected_date, total_amount, additional_costs)
-       VALUES ($1, $2, $3, 'RECEIVED', CURRENT_DATE, $4, $5) RETURNING *`,
-      [shipNum, supplierId, warehouseId, parseFloat(totalCost) || 0, parseFloat(additionalCosts) || 0]
-    );
-    const shipment = shipRes.rows[0];
-
-    // 2. Process items, update stock & average cost in inventory
-    const rawItems = Array.isArray(items) ? items : [];
-    for (const item of rawItems) {
-      const pId = item.productId || item.product_id;
-      const qty = parseFloat(item.quantity) || 0;
-      const price = parseFloat(item.unitPrice || item.purchasePrice || item.price) || 0;
-      const itemTotal = qty * price;
-
-      await client.query(
-        `INSERT INTO incoming_shipment_items (shipment_id, product_id, quantity, purchase_price, total_amount)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [shipment.id, pId, qty, price, itemTotal]
-      );
-
-      // Inventory update (upsert)
-      const invCheck = await client.query(
-        `SELECT quantity, average_cost FROM inventory WHERE product_id = $1 AND warehouse_id = $2`,
-        [pId, warehouseId]
-      );
-
-      let newQty = qty;
-      let newAvg = price;
-
-      if (invCheck.rows.length > 0) {
-        const curQty = parseFloat(invCheck.rows[0].quantity);
-        const curAvg = parseFloat(invCheck.rows[0].average_cost);
-        newQty = curQty + qty;
-        newAvg = newQty > 0 ? (curQty * curAvg + qty * price) / newQty : price;
-
-        await client.query(
-          `UPDATE inventory SET quantity = $1, average_cost = $2, last_updated_at = CURRENT_TIMESTAMP
-           WHERE product_id = $3 AND warehouse_id = $4`,
-          [newQty, newAvg, pId, warehouseId]
-        );
-      } else {
-        await client.query(
-          `INSERT INTO inventory (product_id, warehouse_id, quantity, average_cost)
-           VALUES ($1, $2, $3, $4)`,
-          [pId, warehouseId, newQty, newAvg]
-        );
-      }
-
-      // Stock movement log
-      await client.query(
-        `INSERT INTO stock_movements (product_id, warehouse_id, type, quantity, balance_after, reference_type, reference_id, reason)
-         VALUES ($1, $2, 'INCOMING', $3, $4, 'SHIPMENT', $5, 'Поступление по накладной')`,
-        [pId, warehouseId, qty, newQty, shipment.id]
-      );
-    }
-
-    // 3. Update supplier balance (our payable debt)
-    if (supplierId) {
-      await client.query(
-        `UPDATE suppliers SET balance = balance + $1 WHERE id = $2`,
-        [parseFloat(totalCost) || 0, supplierId]
-      );
-    }
-
-    await client.query('COMMIT');
-    await createNotification(null, 'Новая поставка', `Принята поставка №${shipNum} на сумму ${parseFloat(totalCost) || 0} сум`, 'SHIPMENT', shipment.id);
-    res.status(201).json({ data: shipment });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ message: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-// ============================================================================
-// 6. SALES MODULE (Transaction-safe sales, stock deduction, debt calculation)
-// ============================================================================
-app.get('/api/v1/sales', async (req, res) => {
-  try {
-    const q = `
-      SELECT s.*, c.name as customer_name, u.full_name as manager_name
-      FROM sales s
-      LEFT JOIN customers c ON s.customer_id = c.id
-      LEFT JOIN users u ON s.created_by = u.id
-      ORDER BY s.created_at DESC
-    `;
-    const result = await pool.query(q);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/sales/:id', async (req, res) => {
-  try {
-    const sRes = await pool.query(
-      `SELECT s.*, c.name as customer_name FROM sales s LEFT JOIN customers c ON s.customer_id = c.id WHERE s.id = $1`,
-      [req.params.id]
-    );
-    if (sRes.rows.length === 0) return res.status(404).json({ message: 'Продажа не найдена' });
-
-    const itemsRes = await pool.query(
-      `SELECT si.*, p.name as product_name FROM sale_items si LEFT JOIN products p ON si.product_id = p.id WHERE si.sale_id = $1`,
-      [req.params.id]
-    );
-
-    const sale = sRes.rows[0];
-    sale.items = itemsRes.rows;
-    res.json({ data: sale });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/sales', async (req, res) => {
-  const { customerId, items, paymentMethod, paidAmount } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const whRes = await client.query('SELECT id FROM warehouses LIMIT 1');
-    const warehouseId = whRes.rows[0]?.id;
-    const saleNum = `ПРД-${Date.now().toString().substring(5)}`;
-
-    const rawItems = Array.isArray(items) ? items : [];
-    let grandTotal = 0.0;
-    for (const it of rawItems) {
-      grandTotal += (parseFloat(it.quantity) || 0) * (parseFloat(it.price || it.unitPrice) || 0);
-    }
-    const numPaid = parseFloat(paidAmount) || 0.0;
-    const paymentStatus = numPaid >= grandTotal ? 'PAID' : (numPaid > 0 ? 'PARTIAL' : 'UNPAID');
-
-    // 1. Insert sale
-    const saleRes = await client.query(
-      `INSERT INTO sales (sale_number, customer_id, warehouse_id, status, payment_status, subtotal, grand_total, paid_amount)
-       VALUES ($1, $2, $3, 'COMPLETED', $4, $5, $6, $7) RETURNING *`,
-      [saleNum, customerId, warehouseId, paymentStatus, grandTotal, grandTotal, numPaid]
-    );
-    const sale = saleRes.rows[0];
-
-    // 2. Insert items & deduct inventory
-    for (const it of rawItems) {
-      const pId = it.productId || it.product_id;
-      const qty = parseFloat(it.quantity) || 0;
-      const price = parseFloat(it.price || it.unitPrice) || 0;
-
-      await client.query(
-        `INSERT INTO sale_items (sale_id, product_id, quantity, unit_price, total_amount)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [sale.id, pId, qty, price, qty * price]
-      );
-
-      // Deduct inventory
-      const invRes = await client.query(
-        `UPDATE inventory SET quantity = quantity - $1, last_updated_at = CURRENT_TIMESTAMP
-         WHERE product_id = $2 AND warehouse_id = $3 RETURNING quantity`,
-        [qty, pId, warehouseId]
-      );
-      const remainingQty = invRes.rows[0]?.quantity || 0;
-
-      // Stock movement log (OUTGOING)
-      await client.query(
-        `INSERT INTO stock_movements (product_id, warehouse_id, type, quantity, balance_after, reference_type, reference_id, reason)
-         VALUES ($1, $2, 'OUTGOING', $3, $4, 'SALE', $5, 'Продажа клиенту')`,
-        [pId, warehouseId, qty, remainingQty, sale.id]
-      );
-    }
-
-    // 3. Customer debt calculation: if unpaid portion exists, add to customer balance
-    const debtPortion = grandTotal - numPaid;
-    if (debtPortion > 0 && customerId) {
-      await client.query(
-        `UPDATE customers SET balance = balance + $1 WHERE id = $2`,
-        [debtPortion, customerId]
-      );
-    }
-
-    // 4. If paid amount > 0, record payment and add to financial cash account
-    if (numPaid > 0) {
-      const accRes = await client.query(
-        `SELECT id FROM accounts WHERE type = $1 AND is_active = TRUE LIMIT 1`,
-        [paymentMethod?.toUpperCase() === 'BANK' ? 'BANK' : 'CASH']
-      );
-      const accId = accRes.rows[0]?.id;
-
-      if (accId) {
-        await client.query(
-          `INSERT INTO transactions (account_id, type, amount, category, description, reference_type, reference_id, transaction_date)
-           VALUES ($1, 'INCOME', $2, 'Оплата продажи', $3, 'SALE', $4, CURRENT_TIMESTAMP)`,
-          [accId, numPaid, `Оплата продажи № ${saleNum}`, sale.id]
-        );
-        await client.query(`UPDATE accounts SET balance = balance + $1 WHERE id = $2`, [numPaid, accId]);
-      }
-    }
-
-    await client.query('COMMIT');
-    res.status(201).json({ data: sale });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ message: err.message });
-  } finally {
-    client.release();
-  }
-});
-
-// ============================================================================
-// 7. DEALS / CRM
-// ============================================================================
-app.get('/api/v1/deals', async (req, res) => {
-  const { status } = req.query;
-  const conds = ['1=1'];
-  const vals = [];
+api.get('/deals', h(async (req, res) => {
+  const conds = ['d.company_id = $1'];
+  const vals = [req.companyId];
+  const status = str(req.query.status).toLowerCase();
   if (status && status !== 'all') {
-    vals.push(status.toLowerCase());
+    vals.push(status);
     conds.push(`LOWER(d.status) = $${vals.length}`);
   }
-  try {
-    const q = `
-      SELECT d.*, c.name as customer_name, u.full_name as assigned_employee_name
-      FROM deals d
-      LEFT JOIN customers c ON d.customer_id = c.id
-      LEFT JOIN users u ON d.assigned_to = u.id
-      WHERE ${conds.join(' AND ')}
-      ORDER BY d.created_at DESC
-    `;
-    const result = await pool.query(q, vals);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
+  if (str(req.query.search)) {
+    vals.push(`%${str(req.query.search)}%`);
+    conds.push(`(d.title ILIKE $${vals.length} OR c.name ILIKE $${vals.length})`);
   }
-});
+  const result = await pool.query(`${DEAL_SELECT} WHERE ${conds.join(' AND ')} ORDER BY d.created_at DESC LIMIT 500`, vals);
+  res.json({ data: result.rows.map((r) => dealOut(r)) });
+}));
 
-app.post('/api/v1/deals', async (req, res) => {
-  const { title, customerId, customerName, amount, status, description, expectedCloseDate } = req.body;
-  try {
-    let custId = customerId;
-    if (!custId && customerName) {
-      const cRes = await pool.query(`INSERT INTO customers (name) VALUES ($1) RETURNING id`, [customerName]);
-      custId = cRes.rows[0].id;
-    }
-    const result = await pool.query(
-      `INSERT INTO deals (title, customer_id, amount, status, description, expected_close_date)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [title || 'Сделка', custId, parseFloat(amount) || 0, (status || 'lead').toLowerCase(), description || '', expectedCloseDate || null]
+api.get('/deals/kanban', h(async (req, res) => {
+  const result = await pool.query(`${DEAL_SELECT} WHERE d.company_id = $1 ORDER BY d.created_at DESC`, [req.companyId]);
+  const columns = {};
+  DEAL_STATUSES.forEach((s) => { columns[s] = []; });
+  result.rows.forEach((r) => {
+    const d = dealOut(r);
+    (columns[d.status] || (columns[d.status] = [])).push(d);
+  });
+  res.json({ data: columns });
+}));
+
+api.post('/deals', h(async (req, res) => {
+  const b = req.body || {};
+  if (!str(b.title)) throw new HttpError(400, 'Укажите название сделки');
+  const amount = num(b.amount != null ? b.amount : b.value);
+  if (amount < 0) throw new HttpError(400, 'Сумма не может быть отрицательной');
+  const status = DEAL_STATUSES.includes(str(b.status).toLowerCase()) ? str(b.status).toLowerCase() : 'lead';
+  const deal = await tx(async (client) => {
+    const customerId = await resolveCustomer(client, req.companyId, b);
+    const assignedTo = await companyMember(client, req.companyId, b.assignedTo || b.assignedToId) || req.user.id;
+    const inserted = await client.query(
+      `INSERT INTO deals (company_id, title, customer_id, amount, status, description, expected_close_date, assigned_to, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [req.companyId, str(b.title), customerId, amount, status, str(b.description), b.expectedCloseDate ? dateOrToday(b.expectedCloseDate) : null, assignedTo, req.user.id]
     );
-    const deal = result.rows[0];
-    await createNotification(null, 'Новая сделка', `Создана сделка: ${title || 'Сделка'} на сумму ${amount || 0} сум`, 'DEAL', deal.id);
-    res.status(201).json({ data: deal });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
+    return (await client.query(`${DEAL_SELECT} WHERE d.id = $1`, [inserted.rows[0].id])).rows[0];
+  });
+  await notify(req.user.id, 'Новая сделка', `Создана сделка: ${deal.title} на сумму ${num(deal.amount)} сум`, 'DEAL', deal.id);
+  res.status(201).json({ data: dealOut(deal, []) });
+}));
+
+api.patch('/deals/:id/status', h(async (req, res) => {
+  const status = str(req.body && req.body.status).toLowerCase();
+  if (!DEAL_STATUSES.includes(status)) throw new HttpError(400, 'Неизвестный статус сделки');
+  const updated = await pool.query(
+    `UPDATE deals SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND company_id = $3 RETURNING id, title`,
+    [status, uuidOrNull(req.params.id), req.companyId]
+  );
+  if (!updated.rows[0]) throw new HttpError(404, 'Сделка не найдена');
+  const full = await pool.query(`${DEAL_SELECT} WHERE d.id = $1`, [updated.rows[0].id]);
+  res.json({ data: dealOut(full.rows[0], await dealComments(pool, updated.rows[0].id)) });
+}));
+
+api.patch('/deals/:id', h(async (req, res) => {
+  const b = req.body || {};
+  const sets = [];
+  const vals = [uuidOrNull(req.params.id), req.companyId];
+  const set = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+  if (b.title !== undefined) {
+    if (!str(b.title)) throw new HttpError(400, 'Укажите название сделки');
+    set('title', str(b.title));
   }
-});
+  if (b.amount !== undefined) set('amount', Math.max(0, num(b.amount)));
+  if (b.description !== undefined) set('description', str(b.description));
+  if (b.expectedCloseDate !== undefined) set('expected_close_date', b.expectedCloseDate ? dateOrToday(b.expectedCloseDate) : null);
+  if (b.status !== undefined && DEAL_STATUSES.includes(str(b.status).toLowerCase())) set('status', str(b.status).toLowerCase());
+  if (sets.length === 0) throw new HttpError(400, 'Нет данных для обновления');
+  const updated = await pool.query(`UPDATE deals SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND company_id = $2 RETURNING id`, vals);
+  if (!updated.rows[0]) throw new HttpError(404, 'Сделка не найдена');
+  const full = await pool.query(`${DEAL_SELECT} WHERE d.id = $1`, [updated.rows[0].id]);
+  res.json({ data: dealOut(full.rows[0], await dealComments(pool, updated.rows[0].id)) });
+}));
 
-app.patch('/api/v1/deals/:id/status', async (req, res) => {
-  const { status } = req.body;
-  try {
-    const result = await pool.query(
-      `UPDATE deals SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`,
-      [status.toLowerCase(), req.params.id]
-    );
-    const deal = result.rows[0];
-    if (deal) {
-      await createNotification(null, 'Статус сделки обновлен', `Сделка "${deal.title}" переведена в статус "${status}"`, 'DEAL', deal.id);
-    }
-    res.json({ data: deal });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/deals/:id/comments', async (req, res) => {
-  const { text } = req.body;
-  try {
-    const uRes = await pool.query(`SELECT id FROM users LIMIT 1`);
-    const result = await pool.query(
-      `INSERT INTO deal_comments (deal_id, user_id, comment) VALUES ($1, $2, $3) RETURNING *`,
-      [req.params.id, uRes.rows[0]?.id, text]
-    );
-    res.status(201).json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/deals/:id', async (req, res) => {
-  try {
-    const q = `
-      SELECT d.*, c.name as customer_name, c.phone as customer_phone,
-             u.full_name as assigned_to_name
-      FROM deals d
-      LEFT JOIN customers c ON d.customer_id = c.id
-      LEFT JOIN users u ON d.assigned_to = u.id
-      WHERE d.id = $1
-    `;
-    const result = await pool.query(q, [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Сделка не найдена' });
-
-    const commentsRes = await pool.query(
-      `SELECT dc.*, u.full_name as author_name, u.avatar_url as author_avatar
-       FROM deal_comments dc
-       LEFT JOIN users u ON dc.user_id = u.id
-       WHERE dc.deal_id = $1
-       ORDER BY dc.created_at ASC`,
-      [req.params.id]
-    );
-
-    res.json({ data: { ...result.rows[0], comments: commentsRes.rows } });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ============================================================================
-// 8. TASKS MODULE (Full 10-step lifecycle, assignment, review, approval)
-// ============================================================================
-app.get('/api/v1/tasks', async (req, res) => {
-  try {
-    const q = `
-      SELECT t.*, u.full_name as assigned_to_name, u.avatar_url as assigned_to_avatar,
-             c.full_name as created_by_name
-      FROM tasks t
-      LEFT JOIN users u ON t.assigned_to = u.id
-      LEFT JOIN users c ON t.created_by = c.id
-      ORDER BY t.created_at DESC
-    `;
-    const result = await pool.query(q);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-const handleCreateTask = async (req, res) => {
-  const { title, description, assignedToId, assignedToName, priority, deadline } = req.body || {};
-  try {
-    let assignId = assignedToId;
-    if (!assignId && assignedToName) {
-      const uRes = await pool.query(`SELECT id FROM users WHERE full_name ILIKE $1 LIMIT 1`, [`%${assignedToName}%`]);
-      assignId = uRes.rows[0]?.id;
-    }
-    const creatorRes = await pool.query(`SELECT id FROM users WHERE role = 'SUPER_ADMIN' LIMIT 1`);
-    const creatorId = creatorRes.rows[0]?.id;
-
-    const result = await pool.query(
-      `INSERT INTO tasks (title, description, assigned_to, created_by, priority, status, due_date)
-       VALUES ($1, $2, $3, $4, $5, 'todo', $6) RETURNING *`,
-      [title, description || '', assignId, creatorId, (priority || 'medium').toLowerCase(), deadline || null]
-    );
-    const task = result.rows[0];
-    await createNotification(assignId || creatorId, 'Новая задача', `Назначена задача: ${title}`, 'TASK', task.id);
-    res.status(201).json({ data: task });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-};
-
-app.post('/api/v1/tasks', handleCreateTask);
-app.post('/api/v1/tasks/create', handleCreateTask);
-
-app.put('/api/v1/tasks/:id/status', async (req, res) => {
-  const { status, progress } = req.body;
-  try {
-    const result = await pool.query(
-      `UPDATE tasks SET status = $1, progress = COALESCE($2, progress), updated_at = CURRENT_TIMESTAMP WHERE id = $3 RETURNING *`,
-      [status.toLowerCase(), progress != null ? parseFloat(progress) : null, req.params.id]
-    );
-    const task = result.rows[0];
-    if (task) {
-      await createNotification(task.assigned_to || task.created_by, 'Статус задачи обновлен', `Задача "${task.title}" переведена в "${status}"`, 'TASK', task.id);
-    }
-    res.json({ data: task });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/tasks/:id/comments', async (req, res) => {
-  const { content } = req.body;
-  try {
-    const uRes = await pool.query(`SELECT id FROM users LIMIT 1`);
-    const result = await pool.query(
-      `INSERT INTO task_comments (task_id, user_id, comment) VALUES ($1, $2, $3) RETURNING *`,
-      [req.params.id, uRes.rows[0]?.id, content]
-    );
-    res.status(201).json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/tasks/:id/attachments', upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'Файл не прикреплен' });
-  try {
-    const fileUrl = `/uploads/${req.file.filename}`;
-    await pool.query(
-      `INSERT INTO task_attachments (task_id, file_name, file_url, file_size)
-       VALUES ($1, $2, $3, $4)`,
-      [req.params.id, req.file.originalname, fileUrl, req.file.size]
-    );
-    res.json({ url: fileUrl, fileName: req.file.originalname });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/tasks/:id', async (req, res) => {
-  const { id } = req.params;
-  if (!id || id === 'create' || id === 'add') {
-    return res.status(404).json({ message: 'Задание не найдено' });
-  }
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (!uuidRegex.test(id)) {
-    return res.status(404).json({ message: 'Задание не найдено' });
-  }
-  try {
-    const q = `
-      SELECT t.*, u.full_name as assigned_to_name, u.avatar_url as assigned_to_avatar,
-             c.full_name as created_by_name
-      FROM tasks t
-      LEFT JOIN users u ON t.assigned_to = u.id
-      LEFT JOIN users c ON t.created_by = c.id
-      WHERE t.id = $1
-    `;
-    const result = await pool.query(q, [id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Задание не найдено' });
-    }
-
-    const commentsRes = await pool.query(
-      `SELECT tc.*, u.full_name as author_name, u.avatar_url as author_avatar
-       FROM task_comments tc
-       LEFT JOIN users u ON tc.user_id = u.id
-       WHERE tc.task_id = $1
-       ORDER BY tc.created_at ASC`,
-      [id]
-    );
-
-    const attachRes = await pool.query(
-      `SELECT * FROM task_attachments WHERE task_id = $1 ORDER BY created_at ASC`,
-      [id]
-    );
-
-    res.json({
-      data: {
-        ...result.rows[0],
-        comments: commentsRes.rows,
-        attachments: attachRes.rows.map(a => a.file_url || a.file_name),
-      }
-    });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ============================================================================
-// 9. MESSENGER (Persistent DB Chat + Real-Time Socket.IO)
-// ============================================================================
-app.get('/api/v1/chat/rooms', async (req, res) => {
-  try {
-    const q = `
-      SELECT r.*, r.name as title,
-             COALESCE((SELECT content FROM messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1), 'Чат создан') as last_message,
-             COALESCE((SELECT created_at FROM messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1), r.created_at) as last_message_time,
-             0 as unread_count
-      FROM chat_rooms r
-      ORDER BY last_message_time DESC
-    `;
-    const result = await pool.query(q);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/chat/rooms/:roomId/messages', async (req, res) => {
-  try {
-    const q = `
-      SELECT m.*, u.full_name as sender_name, u.avatar_url as sender_avatar
-      FROM messages m
-      LEFT JOIN users u ON m.sender_id = u.id
-      WHERE m.room_id = $1
-      ORDER BY m.created_at ASC
-    `;
-    const result = await pool.query(q, [req.params.roomId]);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/chat/rooms/:roomId/messages', async (req, res) => {
-  const { content, attachmentUrl, attachmentType, replyToContent } = req.body;
-  const senderId = req.user?.sub || (await pool.query('SELECT id FROM users LIMIT 1')).rows[0]?.id;
-  try {
-    const ins = await pool.query(
-      `INSERT INTO messages (room_id, sender_id, content, attachment_url)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [req.params.roomId, senderId, content || '', attachmentUrl || null]
-    );
-    const msg = ins.rows[0];
-
-    const uRes = await pool.query('SELECT full_name, avatar_url FROM users WHERE id = $1', [senderId]);
-    msg.sender_name = uRes.rows[0]?.full_name || 'Собеседник';
-    msg.sender_avatar = uRes.rows[0]?.avatar_url;
-
-    // Broadcast via WebSocket
-    io.emit(`room:${req.params.roomId}`, msg);
-
-    res.status(201).json({ data: msg });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/chat/rooms/:roomId/read', (req, res) => {
+api.delete('/deals/:id', h(async (req, res) => {
+  const result = await pool.query(`DELETE FROM deals WHERE id = $1 AND company_id = $2 RETURNING id`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!result.rows[0]) throw new HttpError(404, 'Сделка не найдена');
   res.json({ success: true });
+}));
+
+api.post('/deals/:id/comments', h(async (req, res) => {
+  const text = str(req.body && (req.body.text || req.body.content));
+  if (!text) throw new HttpError(400, 'Введите текст комментария');
+  const deal = await pool.query(`SELECT id FROM deals WHERE id = $1 AND company_id = $2`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!deal.rows[0]) throw new HttpError(404, 'Сделка не найдена');
+  const inserted = await pool.query(`INSERT INTO deal_comments (deal_id, user_id, comment) VALUES ($1, $2, $3) RETURNING *`, [req.params.id, req.user.id, text]);
+  res.status(201).json({ data: { ...out(inserted.rows[0]), text, content: text, authorName: req.user.fullName, author_name: req.user.fullName } });
+}));
+
+api.get('/deals/:id', h(async (req, res) => {
+  const result = await pool.query(`${DEAL_SELECT} WHERE d.id = $1 AND d.company_id = $2`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!result.rows[0]) throw new HttpError(404, 'Сделка не найдена');
+  res.json({ data: dealOut(result.rows[0], await dealComments(pool, req.params.id)) });
+}));
+
+// ============================================================================
+// TASKS
+// ============================================================================
+const TASK_STATUSES = ['todo', 'in_progress', 'review', 'done'];
+const TASK_SELECT = `
+  SELECT t.*, u.full_name AS assigned_to_name, u.avatar_url AS assigned_to_avatar, c.full_name AS created_by_name
+  FROM tasks t LEFT JOIN users u ON t.assigned_to = u.id LEFT JOIN users c ON t.created_by = c.id`;
+
+function taskOut(row, comments, attachments) {
+  const o = out(row);
+  o.status = String(row.status || 'todo').toLowerCase();
+  o.priority = String(row.priority || 'medium').toLowerCase();
+  o.deadline = row.due_date;
+  o.assignedTo = row.assigned_to;
+  if (comments) {
+    o.comments = comments.map((c) => ({ ...out(c), content: c.comment, text: c.comment, authorName: c.author_name }));
+  }
+  if (attachments) {
+    o.attachments = attachments.map((a) => fileUrl(a.file_url));
+    o.attachmentFiles = attachments.map((a) => ({ id: a.id, name: a.file_name, url: fileUrl(a.file_url), size: num(a.file_size), createdAt: a.created_at }));
+  }
+  return o;
+}
+
+async function taskDetails(db, row) {
+  const [comments, attachments] = await Promise.all([
+    db.query(`SELECT tc.*, u.full_name AS author_name, u.avatar_url AS author_avatar FROM task_comments tc LEFT JOIN users u ON tc.user_id = u.id
+              WHERE tc.task_id = $1 ORDER BY tc.created_at ASC`, [row.id]),
+    db.query(`SELECT * FROM task_attachments WHERE task_id = $1 ORDER BY created_at ASC`, [row.id]),
+  ]);
+  return taskOut(row, comments.rows, attachments.rows);
+}
+
+api.get('/tasks', h(async (req, res) => {
+  const conds = ['t.company_id = $1'];
+  const vals = [req.companyId];
+  const status = str(req.query.status).toLowerCase();
+  if (status && status !== 'all') {
+    vals.push(status);
+    conds.push(`LOWER(t.status) = $${vals.length}`);
+  }
+  if (req.query.mine === 'true') {
+    vals.push(req.user.id);
+    conds.push(`t.assigned_to = $${vals.length}`);
+  } else if (req.query.createdByMe === 'true') {
+    vals.push(req.user.id);
+    conds.push(`t.created_by = $${vals.length}`);
+  } else if (isUuid(req.query.assignedTo)) {
+    vals.push(req.query.assignedTo);
+    conds.push(`t.assigned_to = $${vals.length}`);
+  }
+  if (str(req.query.search)) {
+    vals.push(`%${str(req.query.search)}%`);
+    conds.push(`(t.title ILIKE $${vals.length} OR t.description ILIKE $${vals.length})`);
+  }
+  const result = await pool.query(`${TASK_SELECT} WHERE ${conds.join(' AND ')} ORDER BY t.created_at DESC LIMIT 500`, vals);
+  res.json({ data: result.rows.map((r) => taskOut(r)) });
+}));
+
+const handleCreateTask = h(async (req, res) => {
+  const b = req.body || {};
+  if (!str(b.title)) throw new HttpError(400, 'Укажите название задачи');
+  let assignee = await companyMember(pool, req.companyId, b.assignedToId || b.assignedTo);
+  if (!assignee && str(b.assignedToName)) {
+    const found = await pool.query(
+      `SELECT u.id FROM users u JOIN user_companies uc ON uc.user_id = u.id AND uc.company_id = $1
+       WHERE u.is_active AND u.full_name ILIKE $2 ORDER BY (LOWER(u.full_name) = LOWER($3)) DESC LIMIT 1`,
+      [req.companyId, `%${str(b.assignedToName)}%`, str(b.assignedToName)]
+    );
+    if (!found.rows[0]) throw new HttpError(400, `Сотрудник «${str(b.assignedToName)}» не найден в организации`);
+    assignee = found.rows[0].id;
+  }
+  assignee = assignee || req.user.id;
+  const priority = ['low', 'medium', 'high', 'urgent'].includes(str(b.priority).toLowerCase()) ? str(b.priority).toLowerCase() : 'medium';
+  const deadline = b.deadline || b.dueDate;
+  const inserted = await pool.query(
+    `INSERT INTO tasks (company_id, title, description, assigned_to, created_by, priority, status, due_date, progress)
+     VALUES ($1, $2, $3, $4, $5, $6, 'todo', $7, 0) RETURNING id`,
+    [req.companyId, str(b.title), str(b.description), assignee, req.user.id, priority, deadline && !Number.isNaN(new Date(deadline).getTime()) ? new Date(deadline) : null]
+  );
+  const full = await pool.query(`${TASK_SELECT} WHERE t.id = $1`, [inserted.rows[0].id]);
+  await notify(assignee, 'Новая задача', `Назначена задача: ${str(b.title)}`, 'TASK', inserted.rows[0].id);
+  res.status(201).json({ data: taskOut(full.rows[0], [], []) });
+});
+api.post('/tasks', handleCreateTask);
+api.post('/tasks/create', handleCreateTask);
+
+const handleTaskStatus = h(async (req, res) => {
+  const b = req.body || {};
+  const status = str(b.status).toLowerCase();
+  if (!TASK_STATUSES.includes(status)) throw new HttpError(400, 'Неизвестный статус задачи');
+  let progress = b.progress != null ? Math.round(num(b.progress)) : null;
+  if (progress != null) progress = Math.min(100, Math.max(0, progress));
+  if (status === 'done') progress = 100;
+  const updated = await pool.query(
+    `UPDATE tasks SET status = $1, progress = COALESCE($2, progress), updated_at = CURRENT_TIMESTAMP
+     WHERE id = $3 AND company_id = $4 RETURNING id, title, assigned_to, created_by`,
+    [status, progress, uuidOrNull(req.params.id), req.companyId]
+  );
+  const t = updated.rows[0];
+  if (!t) throw new HttpError(404, 'Задание не найдено');
+  const target = t.created_by && t.created_by !== req.user.id ? t.created_by : t.assigned_to;
+  if (target && target !== req.user.id) await notify(target, 'Статус задачи обновлен', `Задача "${t.title}" переведена в "${status}"`, 'TASK', t.id);
+  const full = await pool.query(`${TASK_SELECT} WHERE t.id = $1`, [t.id]);
+  res.json({ data: await taskDetails(pool, full.rows[0]) });
+});
+api.put('/tasks/:id/status', handleTaskStatus);
+api.patch('/tasks/:id/status', handleTaskStatus);
+
+api.patch('/tasks/:id', h(async (req, res) => {
+  const b = req.body || {};
+  const sets = [];
+  const vals = [uuidOrNull(req.params.id), req.companyId];
+  const set = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+  if (b.title !== undefined) {
+    if (!str(b.title)) throw new HttpError(400, 'Укажите название задачи');
+    set('title', str(b.title));
+  }
+  if (b.description !== undefined) set('description', str(b.description));
+  if (b.priority !== undefined && ['low', 'medium', 'high', 'urgent'].includes(str(b.priority).toLowerCase())) set('priority', str(b.priority).toLowerCase());
+  if (b.deadline !== undefined) set('due_date', b.deadline && !Number.isNaN(new Date(b.deadline).getTime()) ? new Date(b.deadline) : null);
+  if (b.progress !== undefined) set('progress', Math.min(100, Math.max(0, Math.round(num(b.progress)))));
+  if (b.assignedToId !== undefined) {
+    const assignee = await companyMember(pool, req.companyId, b.assignedToId);
+    if (!assignee) throw new HttpError(400, 'Сотрудник не найден в организации');
+    set('assigned_to', assignee);
+  }
+  if (sets.length === 0) throw new HttpError(400, 'Нет данных для обновления');
+  const updated = await pool.query(`UPDATE tasks SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND company_id = $2 RETURNING id`, vals);
+  if (!updated.rows[0]) throw new HttpError(404, 'Задание не найдено');
+  const full = await pool.query(`${TASK_SELECT} WHERE t.id = $1`, [updated.rows[0].id]);
+  res.json({ data: await taskDetails(pool, full.rows[0]) });
+}));
+
+api.delete('/tasks/:id', h(async (req, res) => {
+  const files = await pool.query(
+    `SELECT ta.file_url FROM task_attachments ta JOIN tasks t ON t.id = ta.task_id WHERE t.id = $1 AND t.company_id = $2`,
+    [uuidOrNull(req.params.id), req.companyId]
+  );
+  const result = await pool.query(`DELETE FROM tasks WHERE id = $1 AND company_id = $2 RETURNING id`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!result.rows[0]) throw new HttpError(404, 'Задание не найдено');
+  files.rows.forEach((f) => removeUploadedFile(f.file_url));
+  res.json({ success: true });
+}));
+
+api.post('/tasks/:id/comments', h(async (req, res) => {
+  const content = str(req.body && (req.body.content || req.body.text));
+  if (!content) throw new HttpError(400, 'Введите текст комментария');
+  const task = await pool.query(`SELECT id, title, assigned_to, created_by FROM tasks WHERE id = $1 AND company_id = $2`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!task.rows[0]) throw new HttpError(404, 'Задание не найдено');
+  const inserted = await pool.query(`INSERT INTO task_comments (task_id, user_id, comment) VALUES ($1, $2, $3) RETURNING *`, [req.params.id, req.user.id, content]);
+  for (const target of new Set([task.rows[0].assigned_to, task.rows[0].created_by])) {
+    if (target && target !== req.user.id) await notify(target, 'Новый комментарий', `${req.user.fullName}: ${content.slice(0, 120)}`, 'TASK', task.rows[0].id);
+  }
+  res.status(201).json({ data: { ...out(inserted.rows[0]), content, text: content, authorName: req.user.fullName, author_name: req.user.fullName } });
+}));
+
+api.post('/tasks/:id/attachments', upload.single('file'), h(async (req, res) => {
+  if (!req.file) throw new HttpError(400, 'Файл не прикреплен');
+  const task = await pool.query(`SELECT id FROM tasks WHERE id = $1 AND company_id = $2`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!task.rows[0]) {
+    removeUploadedFile(req.file.filename);
+    throw new HttpError(404, 'Задание не найдено');
+  }
+  const url = `/uploads/${req.file.filename}`;
+  const inserted = await pool.query(
+    `INSERT INTO task_attachments (task_id, file_name, file_url, file_size, mime_type, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+    [req.params.id, originalName(req.file), url, req.file.size, req.file.mimetype, req.user.id]
+  );
+  res.status(201).json({ id: inserted.rows[0].id, url: fileUrl(url), fileName: originalName(req.file), size: req.file.size });
+}));
+
+api.delete('/tasks/:id/attachments', h(async (req, res) => {
+  const target = str(req.query.url || req.query.id || (req.body && (req.body.url || req.body.id)));
+  if (!target) throw new HttpError(400, 'Не указан файл');
+  const name = path.basename(target.split('?')[0]);
+  const removed = await pool.query(
+    `DELETE FROM task_attachments ta USING tasks t
+     WHERE ta.task_id = t.id AND t.id = $1 AND t.company_id = $2 AND (ta.id::text = $3 OR ta.file_url LIKE $4) RETURNING ta.file_url`,
+    [uuidOrNull(req.params.id), req.companyId, target, `%/${name}`]
+  );
+  if (!removed.rows[0]) throw new HttpError(404, 'Файл не найден');
+  removed.rows.forEach((r) => removeUploadedFile(r.file_url));
+  res.json({ success: true });
+}));
+
+api.get('/tasks/:id', h(async (req, res) => {
+  const result = await pool.query(`${TASK_SELECT} WHERE t.id = $1 AND t.company_id = $2`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!result.rows[0]) throw new HttpError(404, 'Задание не найдено');
+  res.json({ data: await taskDetails(pool, result.rows[0]) });
+}));
+
+// ============================================================================
+// MESSENGER
+// ============================================================================
+async function ensureDefaultRoom(companyId, userId) {
+  const existing = await pool.query(`SELECT 1 FROM chat_rooms WHERE company_id = $1 LIMIT 1`, [companyId]);
+  if (existing.rows[0]) return;
+  await pool.query(`INSERT INTO chat_rooms (name, is_group, created_by, company_id) VALUES ('Общий чат', TRUE, $1, $2)`, [userId, companyId]);
+}
+
+async function roomOfCompany(roomId, companyId) {
+  const r = await pool.query(`SELECT id FROM chat_rooms WHERE id = $1 AND company_id = $2`, [uuidOrNull(roomId), companyId]);
+  if (!r.rows[0]) throw new HttpError(404, 'Чат не найден');
+  return r.rows[0].id;
+}
+
+api.get('/chat/rooms', h(async (req, res) => {
+  await ensureDefaultRoom(req.companyId, req.user.id);
+  const result = await pool.query(
+    `SELECT r.*, r.name AS title,
+            lm.content AS last_message, COALESCE(lm.created_at, r.created_at) AS last_message_time,
+            (SELECT count(*)::int FROM messages m WHERE m.room_id = r.id AND m.sender_id <> $2
+               AND m.created_at > COALESCE((SELECT last_read_at FROM chat_members cm WHERE cm.room_id = r.id AND cm.user_id = $2), 'epoch')) AS unread_count
+     FROM chat_rooms r
+     LEFT JOIN LATERAL (SELECT content, created_at FROM messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) lm ON TRUE
+     WHERE r.company_id = $1
+     ORDER BY last_message_time DESC`,
+    [req.companyId, req.user.id]
+  );
+  res.json({ data: out(result.rows) });
+}));
+
+api.post('/chat/rooms', h(async (req, res) => {
+  const name = str(req.body && (req.body.name || req.body.title));
+  if (!name) throw new HttpError(400, 'Укажите название чата');
+  const result = await pool.query(
+    `INSERT INTO chat_rooms (name, is_group, created_by, company_id) VALUES ($1, TRUE, $2, $3) RETURNING *, name AS title`,
+    [name, req.user.id, req.companyId]
+  );
+  res.status(201).json({ data: out(result.rows[0]) });
+}));
+
+api.get('/chat/rooms/:roomId/messages', h(async (req, res) => {
+  const roomId = await roomOfCompany(req.params.roomId, req.companyId);
+  const result = await pool.query(
+    `SELECT m.*, u.full_name AS sender_name, u.avatar_url AS sender_avatar, (m.sender_id = $2) AS is_mine
+     FROM (SELECT * FROM messages WHERE room_id = $1 ORDER BY created_at DESC LIMIT 300) m
+     LEFT JOIN users u ON m.sender_id = u.id ORDER BY m.created_at ASC`,
+    [roomId, req.user.id]
+  );
+  res.json({ data: result.rows.map((m) => ({ ...out(m), attachment_url: fileUrl(m.attachment_url), attachmentUrl: fileUrl(m.attachment_url) })) });
+}));
+
+api.post('/chat/rooms/:roomId/messages', h(async (req, res) => {
+  const b = req.body || {};
+  const roomId = await roomOfCompany(req.params.roomId, req.companyId);
+  const content = str(b.content || b.text);
+  const attachment = relativeUploadPath(b.attachmentUrl);
+  if (!content && !attachment) throw new HttpError(400, 'Сообщение пустое');
+  const inserted = await pool.query(
+    `INSERT INTO messages (room_id, sender_id, content, attachment_url, attachment_type, reply_to_content) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [roomId, req.user.id, content, attachment, strOrNull(b.attachmentType), strOrNull(b.replyToContent)]
+  );
+  const profile = await pool.query(`SELECT full_name, avatar_url FROM users WHERE id = $1`, [req.user.id]);
+  const msg = out({ ...inserted.rows[0], sender_name: profile.rows[0].full_name, sender_avatar: profile.rows[0].avatar_url });
+  msg.attachment_url = fileUrl(inserted.rows[0].attachment_url);
+  msg.attachmentUrl = msg.attachment_url;
+  io.to(`room:${roomId}`).emit('newMessage', msg);
+  res.status(201).json({ data: { ...msg, is_mine: true, isMine: true } });
+}));
+
+api.post('/chat/rooms/:roomId/read', h(async (req, res) => {
+  const roomId = await roomOfCompany(req.params.roomId, req.companyId);
+  await pool.query(
+    `INSERT INTO chat_members (room_id, user_id, last_read_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+     ON CONFLICT (room_id, user_id) DO UPDATE SET last_read_at = CURRENT_TIMESTAMP`,
+    [roomId, req.user.id]
+  );
+  res.json({ success: true });
+}));
+
+io.use((socket, next) => {
+  try {
+    const token = (socket.handshake.auth && socket.handshake.auth.token) || String(socket.handshake.headers.authorization || '').replace('Bearer ', '');
+    socket.data.userId = jwt.verify(token, JWT_SECRET).sub;
+    next();
+  } catch (e) {
+    next(new Error('unauthorized'));
+  }
 });
 
-// Socket.IO event handling
 io.on('connection', (socket) => {
-  socket.on('joinRoom', (roomId) => {
-    socket.join(roomId);
-  });
-  socket.on('sendMessage', async (data) => {
-    io.to(data.roomId).emit('newMessage', data);
+  socket.on('joinRoom', async (roomId) => {
+    const allowed = await pool.query(
+      `SELECT 1 FROM chat_rooms r JOIN user_companies uc ON uc.company_id = r.company_id AND uc.user_id = $2 WHERE r.id = $1`,
+      [uuidOrNull(roomId), socket.data.userId]
+    ).catch(() => ({ rows: [] }));
+    if (allowed.rows[0]) socket.join(`room:${roomId}`);
   });
 });
 
 // ============================================================================
-// 10. EMPLOYEES & DEPARTMENTS
+// EMPLOYEES & DEPARTMENTS
 // ============================================================================
-app.get('/api/v1/employees', async (req, res) => {
-  const { search, role, departmentId } = req.query;
-  const conds = ['u.is_active = TRUE'];
-  const vals = [];
+const EMPLOYEE_SELECT = `
+  SELECT u.id, u.email, u.full_name, u.phone, u.position, u.avatar_url, u.is_active, u.created_at, u.updated_at,
+         u.department_id, d.name AS department_name,
+         CASE WHEN uc.role = 'OWNER' THEN 'SUPER_ADMIN' ELSE uc.role END AS role,
+         (SELECT count(*)::int FROM tasks t WHERE t.assigned_to = u.id AND t.company_id = uc.company_id AND LOWER(t.status) <> 'done') AS active_tasks_count
+  FROM users u
+  JOIN user_companies uc ON uc.user_id = u.id
+  LEFT JOIN departments d ON u.department_id = d.id AND d.company_id = uc.company_id`;
 
-  if (search) {
-    vals.push(`%${search.trim()}%`);
+async function resolveDepartment(db, companyId, body) {
+  if (isUuid(body.departmentId)) {
+    const d = await db.query(`SELECT id FROM departments WHERE id = $1 AND company_id = $2`, [body.departmentId, companyId]);
+    if (d.rows[0]) return d.rows[0].id;
+  }
+  const name = str(body.departmentName || body.department);
+  if (!name) return undefined;
+  const existing = await db.query(`SELECT id FROM departments WHERE company_id = $1 AND LOWER(name) = LOWER($2)`, [companyId, name]);
+  if (existing.rows[0]) return existing.rows[0].id;
+  return (await db.query(`INSERT INTO departments (name, company_id) VALUES ($1, $2) RETURNING id`, [name, companyId])).rows[0].id;
+}
+
+const normalizeRole = (r) => (ROLE_IDS.includes(str(r).toUpperCase()) ? str(r).toUpperCase() : 'EMPLOYEE');
+
+api.get('/employees', h(async (req, res) => {
+  const q = req.query;
+  const conds = ['uc.company_id = $1', 'u.is_active'];
+  const vals = [req.companyId];
+  if (str(q.search)) {
+    vals.push(`%${str(q.search)}%`);
     conds.push(`(u.full_name ILIKE $${vals.length} OR u.email ILIKE $${vals.length} OR u.phone ILIKE $${vals.length})`);
   }
-  if (role && role !== 'all') {
-    vals.push(role.toUpperCase());
-    conds.push(`UPPER(u.role) = $${vals.length}`);
+  const role = str(q.role).toUpperCase();
+  if (role && role !== 'ALL') {
+    vals.push(role === 'SUPER_ADMIN' ? 'OWNER' : role);
+    vals.push(role);
+    conds.push(`uc.role IN ($${vals.length - 1}, $${vals.length})`);
   }
-  if (departmentId) {
-    vals.push(departmentId);
+  if (isUuid(q.departmentId)) {
+    vals.push(q.departmentId);
     conds.push(`u.department_id = $${vals.length}`);
   }
+  const result = await pool.query(`${EMPLOYEE_SELECT} WHERE ${conds.join(' AND ')} ORDER BY u.created_at ASC`, vals);
+  res.json({ data: out(result.rows) });
+}));
 
-  try {
-    const q = `
-      SELECT u.*, d.name as department_name,
-             (SELECT count(*) FROM tasks WHERE assigned_to = u.id AND status != 'done') as active_tasks_count
-      FROM users u
-      LEFT JOIN departments d ON u.department_id = d.id
-      WHERE ${conds.join(' AND ')}
-      ORDER BY u.created_at ASC
-    `;
-    const result = await pool.query(q, vals);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
+const listDepartments = h(async (req, res) => {
+  const result = await pool.query(
+    `SELECT d.*, (SELECT count(*)::int FROM users u JOIN user_companies uc ON uc.user_id = u.id AND uc.company_id = d.company_id
+                  WHERE u.department_id = d.id AND u.is_active) AS employees_count
+     FROM departments d WHERE d.company_id = $1 ORDER BY d.name ASC`,
+    [req.companyId]
+  );
+  res.json({ data: out(result.rows) });
 });
+api.get('/employees/departments', listDepartments);
+api.get('/departments', listDepartments);
 
-app.post('/api/v1/employees', async (req, res) => {
-  const { fullName, email, phone, role, position, departmentName } = req.body;
-  try {
-    let deptId = null;
-    if (departmentName) {
-      const dRes = await pool.query('SELECT id FROM departments WHERE name ILIKE $1 LIMIT 1', [departmentName]);
-      deptId = dRes.rows[0]?.id;
-    }
-    const empPw = await bcrypt.hash('Employee123!', 10);
-    const result = await pool.query(
-      `INSERT INTO users (full_name, email, phone, role, position, department_id, password_hash, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE) RETURNING *`,
-      [fullName, email, phone || '', (role || 'EMPLOYEE').toUpperCase(), position || 'Сотрудник', deptId, empPw]
-    );
-    res.status(201).json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+api.post('/departments', requireAdmin, h(async (req, res) => {
+  if (!str(req.body && req.body.name)) throw new HttpError(400, 'Укажите название отдела');
+  const id = await resolveDepartment(pool, req.companyId, { departmentName: req.body.name });
+  const result = await pool.query(`SELECT * FROM departments WHERE id = $1`, [id]);
+  res.status(201).json({ data: out(result.rows[0]) });
+}));
 
-app.get('/api/v1/employees/departments', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM departments ORDER BY name ASC');
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/employees/:id', async (req, res) => {
-  try {
-    const q = `
-      SELECT u.*, d.name as department_name,
-             (SELECT count(*) FROM tasks WHERE assigned_to = u.id AND status != 'done') as active_tasks_count
-      FROM users u
-      LEFT JOIN departments d ON u.department_id = d.id
-      WHERE u.id = $1
-    `;
-    const result = await pool.query(q, [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Сотрудник не найден' });
-    res.json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// Roles catalog endpoint
-app.get('/api/v1/roles', (req, res) => {
+api.get('/roles', (req, res) => {
   res.json({
     data: [
-      {
-        id: 'SUPER_ADMIN',
-        name: 'Главный администратор',
-        description: 'Владелец / Руководитель. Полный доступ ко всем модулям, финансам и назначению ролей.',
-        level: 1,
-      },
-      {
-        id: 'ADMIN',
-        name: 'Администратор',
-        description: 'Операционное управление. Управление персоналом, складом, закупками, сделками и задачами.',
-        level: 2,
-      },
-      {
-        id: 'MANAGER',
-        name: 'Менеджер проектов / CRM',
-        description: 'Управление клиентами, воронка сделок, постановка и контроль задач сотрудникам.',
-        level: 3,
-      },
-      {
-        id: 'ACCOUNTANT',
-        name: 'Бухгалтер / Финансист',
-        description: 'Финансовый учет, кассы, доходы, расходы, выплаты и расчет зарплат.',
-        level: 3,
-      },
-      {
-        id: 'WAREHOUSE_KEEPER',
-        name: 'Кладовщик / Склад',
-        description: 'Приемка поставок, контроль остатков товаров, списания и инвентаризация.',
-        level: 4,
-      },
-      {
-        id: 'EMPLOYEE',
-        name: 'Сотрудник / Специалист',
-        description: 'Выполнение назначенных задач, корпоративный мессенджер и файлы.',
-        level: 5,
-      },
-    ]
+      { id: 'SUPER_ADMIN', name: 'Главный администратор', description: 'Владелец / Руководитель. Полный доступ ко всем модулям, финансам и назначению ролей.', level: 1 },
+      { id: 'ADMIN', name: 'Администратор', description: 'Операционное управление. Управление персоналом, складом, закупками, сделками и задачами.', level: 2 },
+      { id: 'MANAGER', name: 'Менеджер проектов / CRM', description: 'Управление клиентами, воронка сделок, постановка и контроль задач сотрудникам.', level: 3 },
+      { id: 'ACCOUNTANT', name: 'Бухгалтер / Финансист', description: 'Финансовый учет, кассы, доходы, расходы, выплаты и расчет зарплат.', level: 3 },
+      { id: 'WAREHOUSE_KEEPER', name: 'Кладовщик / Склад', description: 'Приемка поставок, контроль остатков товаров, списания и инвентаризация.', level: 4 },
+      { id: 'EMPLOYEE', name: 'Сотрудник / Специалист', description: 'Выполнение назначенных задач, корпоративный мессенджер и файлы.', level: 5 },
+    ],
   });
 });
 
-// Update Employee Role endpoint
-app.patch('/api/v1/employees/:id/role', async (req, res) => {
-  const { role } = req.body;
-  if (!role) return res.status(400).json({ message: 'Роль не указана' });
-  try {
-    const uRole = role.toUpperCase();
-    const result = await pool.query(
-      'UPDATE users SET role = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *',
-      [uRole, req.params.id]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Сотрудник не найден' });
-    
-    const emp = result.rows[0];
-    await createNotification(emp.id, 'Изменение роли в системе', `Вам назначена роль: ${uRole}`, 'SYSTEM', emp.id);
-    res.json({ data: emp, message: 'Роль успешно изменена' });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+api.post('/employees', requireAdmin, h(async (req, res) => {
+  const b = req.body || {};
+  const email = str(b.email).toLowerCase();
+  const fullName = str(b.fullName || b.name);
+  if (!fullName) throw new HttpError(400, 'Укажите ФИО сотрудника');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Укажите корректный адрес электронной почты');
+  const role = normalizeRole(b.role);
+  if (role === 'SUPER_ADMIN' && req.companyRole !== 'OWNER') throw new HttpError(403, 'Назначить главного администратора может только владелец');
 
-// Update Employee full details (PATCH and PUT)
-const handleUpdateEmployee = async (req, res) => {
-  const { fullName, name, phone, position, role, departmentName, isActive } = req.body;
-  try {
-    let deptId = undefined;
-    if (departmentName) {
-      const dRes = await pool.query('SELECT id FROM departments WHERE name ILIKE $1 LIMIT 1', [departmentName]);
-      deptId = dRes.rows[0]?.id;
+  const givenPassword = typeof b.password === 'string' ? b.password : '';
+  if (givenPassword && givenPassword.length < 6) throw new HttpError(400, 'Пароль должен содержать не менее 6 символов');
+
+  const result = await tx(async (client) => {
+    const departmentId = await resolveDepartment(client, req.companyId, b);
+    const existing = await client.query(`SELECT * FROM users WHERE LOWER(email) = $1`, [email]);
+    let user = existing.rows[0];
+    let temporaryPassword = null;
+    if (user) {
+      const member = await client.query(`SELECT 1 FROM user_companies WHERE user_id = $1 AND company_id = $2`, [user.id, req.companyId]);
+      if (member.rows[0]) throw new HttpError(400, 'Сотрудник с таким Email уже есть в организации');
+    } else {
+      temporaryPassword = givenPassword || crypto.randomBytes(6).toString('base64url');
+      const inserted = await client.query(
+        `INSERT INTO users (full_name, email, phone, role, position, department_id, password_hash, is_active, current_company_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, $8) RETURNING *`,
+        [fullName, email, strOrNull(b.phone), role, str(b.position) || 'Сотрудник', departmentId || null, await bcrypt.hash(temporaryPassword, 10), req.companyId]
+      );
+      user = inserted.rows[0];
     }
+    await client.query(
+      `INSERT INTO user_companies (user_id, company_id, role, is_default)
+       VALUES ($1, $2, $3, NOT EXISTS (SELECT 1 FROM user_companies WHERE user_id = $1))`,
+      [user.id, req.companyId, role]
+    );
+    const row = await client.query(`${EMPLOYEE_SELECT} WHERE u.id = $1 AND uc.company_id = $2`, [user.id, req.companyId]);
+    return { row: row.rows[0], temporaryPassword: givenPassword ? null : temporaryPassword, existingUser: temporaryPassword === null };
+  });
+  await notify(result.row.id, 'Добро пожаловать', 'Вас добавили в организацию', 'SYSTEM', req.companyId);
+  // The generated password is shown once so the administrator can hand it to the employee.
+  // An already-registered person keeps their own password; existingUser tells the app so.
+  res.status(201).json({ data: out(result.row), temporaryPassword: result.temporaryPassword, existingUser: result.existingUser });
+}));
 
-    const updates = [];
-    const vals = [req.params.id];
+async function employeeInCompany(db, companyId, id) {
+  const r = await db.query(`${EMPLOYEE_SELECT} WHERE u.id = $1 AND uc.company_id = $2`, [uuidOrNull(id), companyId]);
+  return r.rows[0] || null;
+}
 
-    const newName = fullName || name;
+api.get('/employees/:id', h(async (req, res) => {
+  const emp = await employeeInCompany(pool, req.companyId, req.params.id);
+  if (!emp) throw new HttpError(404, 'Сотрудник не найден');
+  const tasks = await pool.query(
+    `SELECT id, title, status, updated_at FROM tasks WHERE company_id = $1 AND assigned_to = $2 ORDER BY updated_at DESC LIMIT 10`,
+    [req.companyId, emp.id]
+  );
+  res.json({ data: { ...out(emp), recentActivity: tasks.rows.map((t) => ({ id: t.id, title: t.title, status: String(t.status).toLowerCase(), date: t.updated_at })) } });
+}));
+
+async function changeEmployeeRole(db, req, targetId, role) {
+  const target = await db.query(`SELECT role FROM user_companies WHERE user_id = $1 AND company_id = $2 FOR UPDATE`, [targetId, req.companyId]);
+  if (!target.rows[0]) throw new HttpError(404, 'Сотрудник не найден');
+  if (target.rows[0].role === 'OWNER') throw new HttpError(403, 'Роль владельца организации изменить нельзя');
+  if (role === 'SUPER_ADMIN' && req.companyRole !== 'OWNER') throw new HttpError(403, 'Назначить главного администратора может только владелец');
+  await db.query(`UPDATE user_companies SET role = $1 WHERE user_id = $2 AND company_id = $3`, [role, targetId, req.companyId]);
+}
+
+api.patch('/employees/:id/role', requireAdmin, h(async (req, res) => {
+  if (!str(req.body && req.body.role)) throw new HttpError(400, 'Роль не указана');
+  const role = normalizeRole(req.body.role);
+  await tx((client) => changeEmployeeRole(client, req, uuidOrNull(req.params.id), role));
+  await notify(req.params.id, 'Изменение роли в системе', `Вам назначена роль: ${role}`, 'SYSTEM', req.params.id);
+  res.json({ data: out(await employeeInCompany(pool, req.companyId, req.params.id)), message: 'Роль успешно изменена' });
+}));
+
+// Administrators reset a forgotten password; the new one is shown to them once.
+api.post('/employees/:id/reset-password', requireAdmin, h(async (req, res) => {
+  const id = uuidOrNull(req.params.id);
+  const target = await pool.query(`SELECT role FROM user_companies WHERE user_id = $1 AND company_id = $2`, [id, req.companyId]);
+  if (!target.rows[0]) throw new HttpError(404, 'Сотрудник не найден');
+  if (target.rows[0].role === 'OWNER' && id !== req.user.id) throw new HttpError(403, 'Пароль владельца организации сбросить нельзя');
+  const temporaryPassword = crypto.randomBytes(6).toString('base64url');
+  await pool.query(
+    `UPDATE users SET password_hash = $1, token_version = token_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+    [await bcrypt.hash(temporaryPassword, 10), id]
+  );
+  await notify(id, 'Пароль сброшен', 'Администратор сбросил ваш пароль. Смените его в настройках после входа', 'SYSTEM', id);
+  res.json({ success: true, temporaryPassword });
+}));
+
+const handleUpdateEmployee = h(async (req, res) => {
+  const b = req.body || {};
+  const id = uuidOrNull(req.params.id);
+  if (id !== req.user.id && !ADMIN_ROLES.has(req.companyRole)) throw new HttpError(403, 'Недостаточно прав для этого действия');
+  await tx(async (client) => {
+    if (!(await employeeInCompany(client, req.companyId, id))) throw new HttpError(404, 'Сотрудник не найден');
+    const sets = [];
+    const vals = [id];
+    const set = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+    const newName = b.fullName !== undefined ? b.fullName : b.name;
     if (newName !== undefined) {
-      vals.push(newName);
-      updates.push(`full_name = $${vals.length}`);
+      if (!str(newName)) throw new HttpError(400, 'Укажите ФИО сотрудника');
+      set('full_name', str(newName));
     }
-    if (phone !== undefined) {
-      vals.push(phone);
-      updates.push(`phone = $${vals.length}`);
-    }
-    if (position !== undefined) {
-      vals.push(position);
-      updates.push(`position = $${vals.length}`);
-    }
-    if (role !== undefined) {
-      vals.push(role.toUpperCase());
-      updates.push(`role = $${vals.length}`);
-    }
-    if (deptId !== undefined) {
-      vals.push(deptId);
-      updates.push(`department_id = $${vals.length}`);
-    }
-    if (isActive !== undefined) {
-      vals.push(Boolean(isActive));
-      updates.push(`is_active = $${vals.length}`);
-    }
-
-    if (updates.length === 0) {
-      return res.status(400).json({ message: 'Нет данных для обновления' });
-    }
-
-    updates.push(`updated_at = CURRENT_TIMESTAMP`);
-
-    const q = `
-      UPDATE users 
-      SET ${updates.join(', ')} 
-      WHERE id = $1 
-      RETURNING *, (SELECT name FROM departments WHERE id = users.department_id) as department_name
-    `;
-    const result = await pool.query(q, vals);
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Сотрудник не найден' });
-
-    const emp = result.rows[0];
-    if (role !== undefined) {
-      await createNotification(emp.id, 'Обновление профиля', `Ваша роль изменена на: ${emp.role}`, 'SYSTEM', emp.id);
-    }
-    res.json({ data: emp, message: 'Данные сотрудника обновлены' });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-};
-
-app.patch('/api/v1/employees/:id', handleUpdateEmployee);
-app.put('/api/v1/employees/:id', handleUpdateEmployee);
-
-app.delete('/api/v1/employees/:id', async (req, res) => {
-  try {
-    await pool.query('UPDATE users SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1', [req.params.id]);
-    res.json({ success: true, message: 'Сотрудник деактивирован' });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
+    if (b.phone !== undefined) set('phone', strOrNull(b.phone));
+    if (b.position !== undefined) set('position', strOrNull(b.position));
+    const departmentId = await resolveDepartment(client, req.companyId, b);
+    if (departmentId !== undefined) set('department_id', departmentId);
+    if (sets.length > 0) await client.query(`UPDATE users SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, vals);
+    if (b.role !== undefined && ADMIN_ROLES.has(req.companyRole) && id !== req.user.id) await changeEmployeeRole(client, req, id, normalizeRole(b.role));
+    if (sets.length === 0 && b.role === undefined) throw new HttpError(400, 'Нет данных для обновления');
+  });
+  res.json({ data: out(await employeeInCompany(pool, req.companyId, id)), message: 'Данные сотрудника обновлены' });
 });
+api.patch('/employees/:id', handleUpdateEmployee);
+api.put('/employees/:id', handleUpdateEmployee);
+
+api.delete('/employees/:id', requireAdmin, h(async (req, res) => {
+  const id = uuidOrNull(req.params.id);
+  if (id === req.user.id) throw new HttpError(400, 'Нельзя удалить самого себя');
+  await tx(async (client) => {
+    const target = await client.query(`SELECT role FROM user_companies WHERE user_id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (!target.rows[0]) throw new HttpError(404, 'Сотрудник не найден');
+    if (target.rows[0].role === 'OWNER') throw new HttpError(403, 'Владельца организации удалить нельзя');
+    await client.query(`DELETE FROM user_companies WHERE user_id = $1 AND company_id = $2`, [id, req.companyId]);
+    const left = await client.query(`SELECT count(*)::int AS n FROM user_companies WHERE user_id = $1`, [id]);
+    // An employee who belongs to no other organization can no longer sign in.
+    if (left.rows[0].n === 0) {
+      await client.query(`UPDATE users SET is_active = FALSE, token_version = token_version + 1, current_company_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, [id]);
+    } else {
+      await client.query(`UPDATE users SET current_company_id = NULL WHERE id = $1 AND current_company_id = $2`, [id, req.companyId]);
+    }
+  });
+  res.json({ success: true, message: 'Сотрудник удалён из организации' });
+}));
 
 // ============================================================================
-// 11. CUSTOMERS & SUPPLIERS
+// CUSTOMERS & SUPPLIERS
 // ============================================================================
-app.get('/api/v1/customers', async (req, res) => {
-  const { search } = req.query;
-  const vals = [];
-  let q = 'SELECT * FROM customers';
-  if (search) {
-    vals.push(`%${search.trim()}%`);
-    q += ` WHERE name ILIKE $1 OR phone ILIKE $1 OR email ILIKE $1`;
-  }
-  q += ' ORDER BY created_at DESC';
-  try {
-    const result = await pool.query(q, vals);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+function partyRoutes(base, table, label, historySql, historyKey) {
+  api.get(`/${base}`, h(async (req, res) => {
+    const vals = [req.companyId];
+    let where = 'x.company_id = $1';
+    if (str(req.query.search)) {
+      vals.push(`%${str(req.query.search)}%`);
+      where += ` AND (x.name ILIKE $2 OR x.phone ILIKE $2 OR x.email ILIKE $2)`;
+    }
+    const totalSql = table === 'customers'
+      ? `(SELECT COALESCE(SUM(grand_total), 0) FROM sales s WHERE s.customer_id = x.id AND s.status <> 'CANCELLED')`
+      : `(SELECT COALESCE(SUM(total_amount + additional_costs), 0) FROM incoming_shipments s WHERE s.supplier_id = x.id AND s.status = 'RECEIVED')`;
+    const result = await pool.query(`SELECT x.*, ${totalSql} AS total_purchases FROM ${table} x WHERE ${where} ORDER BY x.created_at DESC LIMIT 500`, vals);
+    res.json({ data: result.rows.map((r) => ({ ...out(r), debt: num(r.balance), debtAmount: num(r.balance), payableBalance: num(r.balance), totalSales: num(r.total_purchases) })) });
+  }));
 
-app.post('/api/v1/customers', async (req, res) => {
-  const { name, phone, email, address } = req.body;
-  try {
-    const result = await pool.query(
-      `INSERT INTO customers (name, phone, email, address) VALUES ($1, $2, $3, $4) RETURNING *`,
-      [name, phone || '', email || '', address || '']
-    );
-    res.status(201).json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+  api.post(`/${base}`, h(async (req, res) => {
+    const b = req.body || {};
+    if (!str(b.name)) throw new HttpError(400, `Укажите название: ${label}`);
+    const dup = await pool.query(`SELECT 1 FROM ${table} WHERE company_id = $1 AND LOWER(name) = LOWER($2)`, [req.companyId, str(b.name)]);
+    if (dup.rows[0]) throw new HttpError(400, `${label} с таким названием уже существует`);
+    const cols = ['company_id', 'name', 'phone', 'email', 'address', 'inn'];
+    const vals = [req.companyId, str(b.name), str(b.phone), str(b.email), str(b.address), strOrNull(b.inn)];
+    if (table === 'suppliers') {
+      cols.push('contact_person');
+      vals.push(str(b.contactPerson || b.contact));
+    } else {
+      cols.push('notes');
+      vals.push(strOrNull(b.notes));
+    }
+    const result = await pool.query(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`, vals);
+    res.status(201).json({ data: out(result.rows[0]) });
+  }));
 
-app.get('/api/v1/customers/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM customers WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Клиент не найден' });
-    const salesRes = await pool.query(
-      'SELECT * FROM sales WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 10',
-      [req.params.id]
-    );
-    res.json({ data: { ...result.rows[0], sales: salesRes.rows } });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/suppliers', async (req, res) => {
-  const { search } = req.query;
-  const vals = [];
-  let q = 'SELECT * FROM suppliers';
-  if (search) {
-    vals.push(`%${search.trim()}%`);
-    q += ` WHERE name ILIKE $1 OR phone ILIKE $1 OR email ILIKE $1`;
-  }
-  q += ' ORDER BY created_at DESC';
-  try {
-    const result = await pool.query(q, vals);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/suppliers', async (req, res) => {
-  const { name, contactPerson, phone, email, address } = req.body;
-  try {
-    const result = await pool.query(
-      `INSERT INTO suppliers (name, contact_person, phone, email, address) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [name, contactPerson || '', phone || '', email || '', address || '']
-    );
-    res.status(201).json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/suppliers/:id', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM suppliers WHERE id = $1', [req.params.id]);
-    if (result.rows.length === 0) return res.status(404).json({ message: 'Поставщик не найден' });
-    const shipRes = await pool.query(
-      'SELECT * FROM incoming_shipments WHERE supplier_id = $1 ORDER BY created_at DESC LIMIT 10',
-      [req.params.id]
-    );
-    res.json({ data: { ...result.rows[0], shipments: shipRes.rows } });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ============================================================================
-// 12. DOCUMENTS & FOLDERS
-// ============================================================================
-app.get('/api/v1/documents/folders', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT f.*, (SELECT count(*) FROM documents WHERE folder_id = f.id) as files_count FROM document_folders f ORDER BY f.created_at ASC`
-    );
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/documents/folders', async (req, res) => {
-  const { name } = req.body;
-  try {
-    const result = await pool.query(`INSERT INTO document_folders (name) VALUES ($1) RETURNING *`, [name || 'Новая папка']);
-    res.status(201).json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/v1/documents/files', async (req, res) => {
-  const { folderId } = req.query;
-  const vals = [];
-  let q = 'SELECT * FROM documents';
-  if (folderId) {
-    vals.push(folderId);
-    q += ' WHERE folder_id = $1';
-  }
-  q += ' ORDER BY created_at DESC';
-  try {
-    const result = await pool.query(q, vals);
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.post('/api/v1/documents/upload', upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'Файл не выбран' });
-  const { folderId } = req.body;
-  try {
-    const ext = path.extname(req.file.originalname).replace('.', '').toLowerCase();
-    const result = await pool.query(
-      `INSERT INTO documents (folder_id, name, file_path, file_size, file_type)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [folderId || null, req.file.originalname, `/uploads/${req.file.filename}`, req.file.size, ext]
-    );
-    res.status(201).json({ data: result.rows[0] });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-// ============================================================================
-// 13. FINANCIAL & SALES REPORTS (Accurate Math from DB records)
-// ============================================================================
-app.get('/api/v1/reports/financial', async (req, res) => {
-  try {
-    // Exact DB revenue from sales
-    const salesRes = await pool.query(`SELECT COALESCE(SUM(grand_total), 0) as total FROM sales WHERE status != 'CANCELLED'`);
-    const revenue = parseFloat(salesRes.rows[0].total);
-
-    // Exact DB operating expenses from transactions
-    const expRes = await pool.query(`SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE LOWER(type) = 'expense'`);
-    const expenses = parseFloat(expRes.rows[0].total);
-
-    // Exact COGS from inventory valuation of sold items
-    const cogsRes = await pool.query(
-      `SELECT COALESCE(SUM(si.quantity * si.cost_price), 0) as total 
-       FROM sale_items si 
-       JOIN sales s ON si.sale_id = s.id 
-       WHERE s.status != 'CANCELLED'`
-    );
-    const cogs = parseFloat(cogsRes.rows[0].total);
-
-    const grossProfit = revenue - cogs;
-    const netProfit = grossProfit - expenses;
-
+  api.get(`/${base}/:id`, h(async (req, res) => {
+    const result = await pool.query(`SELECT * FROM ${table} WHERE id = $1 AND company_id = $2`, [uuidOrNull(req.params.id), req.companyId]);
+    if (!result.rows[0]) throw new HttpError(404, `${label} не найден`);
+    const history = await pool.query(historySql, [req.params.id]);
+    const total = history.rows.reduce((s, r) => s + num(r.amount), 0);
     res.json({
       data: {
-        revenue,
-        expenses,
-        grossProfit,
-        netProfit,
-        period: req.query.period || 'month',
-        monthlyData: [],
-        salesTrend: [],
+        ...out(result.rows[0]), [historyKey]: out(history.rows), purchaseHistory: out(history.rows), purchases: out(history.rows),
+        totalPurchases: total, totalSales: total, debt: num(result.rows[0].balance), debtAmount: num(result.rows[0].balance), payableBalance: num(result.rows[0].balance),
       },
     });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+  }));
+
+  api.patch(`/${base}/:id`, h(async (req, res) => {
+    const b = req.body || {};
+    const sets = [];
+    const vals = [uuidOrNull(req.params.id), req.companyId];
+    const set = (col, v) => { vals.push(v); sets.push(`${col} = $${vals.length}`); };
+    if (b.name !== undefined) {
+      if (!str(b.name)) throw new HttpError(400, `Укажите название: ${label}`);
+      set('name', str(b.name));
+    }
+    ['phone', 'email', 'address'].forEach((k) => { if (b[k] !== undefined) set(k, str(b[k])); });
+    if (b.inn !== undefined) set('inn', strOrNull(b.inn));
+    if (table === 'suppliers' && (b.contactPerson !== undefined || b.contact !== undefined)) set('contact_person', str(b.contactPerson || b.contact));
+    if (table === 'customers' && b.notes !== undefined) set('notes', strOrNull(b.notes));
+    if (sets.length === 0) throw new HttpError(400, 'Нет данных для обновления');
+    const result = await pool.query(`UPDATE ${table} SET ${sets.join(', ')} WHERE id = $1 AND company_id = $2 RETURNING *`, vals);
+    if (!result.rows[0]) throw new HttpError(404, `${label} не найден`);
+    res.json({ data: out(result.rows[0]) });
+  }));
+
+  api.delete(`/${base}/:id`, h(async (req, res) => {
+    const found = await pool.query(`SELECT balance FROM ${table} WHERE id = $1 AND company_id = $2`, [uuidOrNull(req.params.id), req.companyId]);
+    if (!found.rows[0]) throw new HttpError(404, `${label} не найден`);
+    if (num(found.rows[0].balance) !== 0) throw new HttpError(400, 'Нельзя удалить: есть непогашенная задолженность');
+    await pool.query(`DELETE FROM ${table} WHERE id = $1 AND company_id = $2`, [req.params.id, req.companyId]);
+    res.json({ success: true });
+  }));
+}
+
+partyRoutes('customers', 'customers', 'Клиент',
+  `SELECT id, sale_number, grand_total AS amount, grand_total AS total_amount, paid_amount, LOWER(payment_status) AS status, created_at, created_at AS date
+   FROM sales WHERE customer_id = $1 ORDER BY created_at DESC LIMIT 50`, 'sales');
+partyRoutes('suppliers', 'suppliers', 'Поставщик',
+  `SELECT id, shipment_number, shipment_number AS invoice_number, total_amount AS amount, total_amount, total_amount AS total_cost, LOWER(status) AS status, created_at, created_at AS date
+   FROM incoming_shipments WHERE supplier_id = $1 ORDER BY created_at DESC LIMIT 50`, 'shipments');
 
 // ============================================================================
-// 14. NOTIFICATIONS
+// DOCUMENTS & FOLDERS
 // ============================================================================
-async function createNotification(userId, title, body, type = 'SYSTEM', referenceId = null) {
+function documentOut(row) {
+  const o = out(row);
+  o.url = fileUrl(row.file_path);
+  o.file_path = o.url;
+  o.extension = row.file_type;
+  o.ext = row.file_type;
+  o.sizeBytes = num(row.file_size);
+  o.size = o.sizeBytes;
+  o.updated_at = row.created_at;
+  return o;
+}
+
+api.get('/documents/folders', h(async (req, res) => {
+  const result = await pool.query(
+    `SELECT f.*, (SELECT count(*)::int FROM documents d WHERE d.folder_id = f.id) AS files_count
+     FROM document_folders f WHERE f.company_id = $1 ORDER BY f.created_at ASC`,
+    [req.companyId]
+  );
+  res.json({ data: out(result.rows) });
+}));
+
+api.post('/documents/folders', h(async (req, res) => {
+  const name = str(req.body && req.body.name);
+  if (!name) throw new HttpError(400, 'Укажите название папки');
+  const result = await pool.query(`INSERT INTO document_folders (name, company_id) VALUES ($1, $2) RETURNING *, 0 AS files_count`, [name, req.companyId]);
+  res.status(201).json({ data: out(result.rows[0]) });
+}));
+
+api.patch('/documents/folders/:id', h(async (req, res) => {
+  const name = str(req.body && req.body.name);
+  if (!name) throw new HttpError(400, 'Укажите название папки');
+  const result = await pool.query(`UPDATE document_folders SET name = $1 WHERE id = $2 AND company_id = $3 RETURNING *`, [name, uuidOrNull(req.params.id), req.companyId]);
+  if (!result.rows[0]) throw new HttpError(404, 'Папка не найдена');
+  res.json({ data: out(result.rows[0]) });
+}));
+
+api.delete('/documents/folders/:id', h(async (req, res) => {
+  const id = uuidOrNull(req.params.id);
+  const files = await tx(async (client) => {
+    const folder = await client.query(`SELECT id FROM document_folders WHERE id = $1 AND company_id = $2`, [id, req.companyId]);
+    if (!folder.rows[0]) throw new HttpError(404, 'Папка не найдена');
+    const removed = await client.query(`DELETE FROM documents WHERE folder_id = $1 AND company_id = $2 RETURNING file_path`, [id, req.companyId]);
+    await client.query(`DELETE FROM document_folders WHERE id = $1`, [id]);
+    return removed.rows;
+  });
+  files.forEach((f) => removeUploadedFile(f.file_path));
+  res.json({ success: true });
+}));
+
+api.get('/documents/files', h(async (req, res) => {
+  const conds = ['d.company_id = $1'];
+  const vals = [req.companyId];
+  if (isUuid(req.query.folderId)) {
+    vals.push(req.query.folderId);
+    conds.push(`d.folder_id = $${vals.length}`);
+  }
+  if (str(req.query.search)) {
+    vals.push(`%${str(req.query.search)}%`);
+    conds.push(`d.name ILIKE $${vals.length}`);
+  }
+  const result = await pool.query(
+    `SELECT d.*, u.full_name AS uploaded_by_name FROM documents d LEFT JOIN users u ON u.id = d.uploaded_by
+     WHERE ${conds.join(' AND ')} ORDER BY d.created_at DESC LIMIT 500`,
+    vals
+  );
+  res.json({ data: result.rows.map(documentOut) });
+}));
+
+api.post('/documents/upload', upload.single('file'), h(async (req, res) => {
+  if (!req.file) throw new HttpError(400, 'Файл не выбран');
+  let folderId = null;
+  if (isUuid(req.body.folderId)) {
+    const folder = await pool.query(`SELECT id FROM document_folders WHERE id = $1 AND company_id = $2`, [req.body.folderId, req.companyId]);
+    if (!folder.rows[0]) {
+      removeUploadedFile(req.file.filename);
+      throw new HttpError(404, 'Папка не найдена');
+    }
+    folderId = folder.rows[0].id;
+  }
+  const original = originalName(req.file);
+  const ext = path.extname(original).replace('.', '').toLowerCase();
+  const result = await pool.query(
+    `INSERT INTO documents (company_id, folder_id, name, file_path, file_size, file_type, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+    [req.companyId, folderId, original, `/uploads/${req.file.filename}`, req.file.size, ext, req.user.id]
+  );
+  res.status(201).json({ data: documentOut(result.rows[0]) });
+}));
+
+const handleDeleteDocument = h(async (req, res) => {
+  const result = await pool.query(`DELETE FROM documents WHERE id = $1 AND company_id = $2 RETURNING file_path`, [uuidOrNull(req.params.id), req.companyId]);
+  if (!result.rows[0]) throw new HttpError(404, 'Файл не найден');
+  removeUploadedFile(result.rows[0].file_path);
+  res.json({ success: true });
+});
+api.delete('/documents/files/:id', handleDeleteDocument);
+api.delete('/documents/:id', handleDeleteDocument);
+
+// ============================================================================
+// NOTIFICATIONS
+// ============================================================================
+async function notify(userId, title, body, type = 'SYSTEM', referenceId = null) {
+  if (!isUuid(userId)) return;
   try {
-    let targetUser = userId;
-    if (!targetUser) {
-      const uRes = await pool.query('SELECT id FROM users LIMIT 1');
-      if (uRes.rows.length > 0) targetUser = uRes.rows[0].id;
-    }
-    if (targetUser) {
-      await pool.query(
-        'INSERT INTO notifications (user_id, title, body, type, reference_id) VALUES ($1, $2, $3, $4, $5)',
-        [targetUser, title, body, type, referenceId]
-      );
-    }
+    await pool.query(
+      'INSERT INTO notifications (user_id, title, body, type, reference_id) VALUES ($1, $2, $3, $4, $5)',
+      [userId, title, body, type, uuidOrNull(referenceId)]
+    );
   } catch (err) {
     console.error('Notification insertion error:', err.message);
   }
 }
 
-app.get('/api/v1/notifications', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50');
-    res.json({ data: result.rows });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+api.get('/notifications', h(async (req, res) => {
+  const result = await pool.query('SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100', [req.user.id]);
+  res.json({ data: out(result.rows) });
+}));
 
-app.post('/api/v1/notifications/read-all', async (req, res) => {
-  try {
-    await pool.query('UPDATE notifications SET is_read = TRUE');
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+api.get('/notifications/unread', h(async (req, res) => {
+  const result = await pool.query('SELECT count(*)::int AS n FROM notifications WHERE user_id = $1 AND NOT is_read', [req.user.id]);
+  res.json({ count: result.rows[0].n });
+}));
 
-app.patch('/api/v1/notifications/:id/read', async (req, res) => {
-  try {
-    const { id } = req.params;
-    await pool.query('UPDATE notifications SET is_read = TRUE WHERE id = $1', [id]);
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+api.post('/notifications/read-all', h(async (req, res) => {
+  await pool.query('UPDATE notifications SET is_read = TRUE WHERE user_id = $1', [req.user.id]);
+  res.json({ success: true });
+}));
 
-app.delete('/api/v1/notifications/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    await pool.query('DELETE FROM notifications WHERE id = $1', [id]);
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
+api.patch('/notifications/:id/read', h(async (req, res) => {
+  await pool.query('UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2', [uuidOrNull(req.params.id), req.user.id]);
+  res.json({ success: true });
+}));
+
+api.delete('/notifications/:id', h(async (req, res) => {
+  await pool.query('DELETE FROM notifications WHERE id = $1 AND user_id = $2', [uuidOrNull(req.params.id), req.user.id]);
+  res.json({ success: true });
+}));
 
 // ============================================================================
-// 15. FILE UPLOADS
+// ERRORS
 // ============================================================================
-app.post('/api/v1/files/upload', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'Файл не передан' });
-  res.json({
-    url: `/uploads/${req.file.filename}`,
-    fileName: req.file.originalname,
-    size: req.file.size,
-  });
-});
-
-// 404 handler
 app.use((req, res) => {
-  console.log(`⚠️ 404 Not Found: ${req.method} ${req.originalUrl}`);
-  res.status(404).json({ message: `Маршрут ${req.originalUrl} не найден` });
+  res.status(404).json({ message: `Маршрут ${req.originalUrl.split('?')[0]} не найден` });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 COMPANY OS Enterprise Server running on port ${PORT}`);
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const message = err.code === 'LIMIT_FILE_SIZE' ? 'Файл слишком большой (максимум 25 МБ)' : 'Не удалось принять файл';
+    return res.status(400).json({ message });
+  }
+  if (err && err.status === 404 && req.path.startsWith('/uploads')) return res.status(404).json({ message: 'Файл не найден' });
+  if (err instanceof HttpError) return res.status(err.status).json({ message: err.message });
+  if (err && err.type === 'entity.parse.failed') return res.status(400).json({ message: 'Некорректный запрос' });
+  if (err && err.code === '23505') return res.status(400).json({ message: 'Такая запись уже существует' });
+  if (err && err.code === '23503') return res.status(400).json({ message: 'Запись используется в других документах' });
+  console.error(`💥 ${req.method} ${req.originalUrl}:`, err);
+  res.status(500).json({ message: 'Внутренняя ошибка сервера. Попробуйте ещё раз' });
 });
+
+if (require.main === module) {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 COMPANY OS Server running on port ${PORT}`);
+  });
+}
+
+module.exports = { app, server, pool };

@@ -1,3 +1,4 @@
+import 'package:dio/dio.dart';
 import '../../../../core/network/api_client.dart';
 import '../../../../core/network/api_endpoints.dart';
 import '../../../../core/utils/json_helpers.dart';
@@ -8,29 +9,18 @@ class MessengerRepository {
 
   MessengerRepository({required this.apiClient});
 
-  Future<List<ChatRoomModel>> getChatRooms({String? search}) async {
-    final query = <String, dynamic>{};
-    if (search != null && search.isNotEmpty) query['search'] = search;
+  /// Server limit for a single uploaded file.
+  static const int maxFileBytes = 25 * 1024 * 1024;
 
-    final response = await apiClient.get(
-      ApiEndpoints.chatRooms,
-      queryParameters: query,
-    );
-
-    if (response.statusCode == 200) {
-      final list = JsonHelpers.toList(response.data);
-      return list.map((e) => ChatRoomModel.fromJson(JsonHelpers.toMap(e))).toList();
-    }
-    throw Exception('Не удалось загрузить список чатов');
+  /// Rooms of the current organization (a default «Общий чат» always exists).
+  Future<List<ChatRoomModel>> getChatRooms() async {
+    final response = await apiClient.get(ApiEndpoints.chatRooms);
+    return JsonHelpers.toList(response.data).map((e) => ChatRoomModel.fromJson(JsonHelpers.toMap(e))).toList();
   }
 
   Future<List<MessageModel>> getMessages(String roomId) async {
     final response = await apiClient.get(ApiEndpoints.chatMessages(roomId));
-    if (response.statusCode == 200) {
-      final list = JsonHelpers.toList(response.data);
-      return list.map((e) => MessageModel.fromJson(JsonHelpers.toMap(e))).toList();
-    }
-    throw Exception('Не удалось загрузить сообщения');
+    return JsonHelpers.toList(response.data).map((e) => MessageModel.fromJson(JsonHelpers.toMap(e))).toList();
   }
 
   Future<MessageModel> sendMessage(
@@ -44,25 +34,29 @@ class MessengerRepository {
       ApiEndpoints.chatMessages(roomId),
       data: {
         'content': text,
-        'replyToContent': replyTo,
+        if (replyTo != null && replyTo.isNotEmpty) 'replyToContent': replyTo,
         if (attachmentUrl != null) 'attachmentUrl': attachmentUrl,
         if (attachmentType != null) 'attachmentType': attachmentType,
       },
     );
-    if (response.statusCode == 200 || response.statusCode == 201) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return MessageModel.fromJson(map);
-    }
-    throw Exception('Не удалось отправить сообщение');
+    final body = response.data;
+    return MessageModel.fromJson(JsonHelpers.toMap(body is Map && body.containsKey('data') ? body['data'] : body));
+  }
+
+  /// Uploads a file for a message and returns its server URL.
+  Future<String> uploadAttachment(
+    String filePath, {
+    String? fileName,
+    void Function(double progress)? onProgress,
+    CancelToken? cancelToken,
+  }) async {
+    final body = await apiClient.uploadFile(filePath, customFileName: fileName, onProgress: onProgress, cancelToken: cancelToken);
+    final url = JsonHelpers.toStr(body['url']);
+    if (url.isEmpty) throw Exception('Сервер не вернул адрес файла');
+    return url;
   }
 
   Future<void> markAsRead(String roomId) async {
-    try {
-      await apiClient.post(ApiEndpoints.chatMarkRead(roomId));
-    } catch (_) {}
+    await apiClient.post(ApiEndpoints.chatMarkRead(roomId));
   }
 }

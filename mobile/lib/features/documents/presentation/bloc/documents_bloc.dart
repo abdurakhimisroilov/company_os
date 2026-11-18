@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/network/api_error.dart';
 import '../../data/models/document_model.dart';
 import '../../data/repositories/documents_repository.dart';
 
@@ -14,17 +16,16 @@ class LoadDocumentsEvent extends DocumentsEvent {
   final String? folderId;
   final String? folderName;
   final String? search;
-  const LoadDocumentsEvent({this.folderId, this.folderName, this.search});
-  @override
-  List<Object?> get props => [folderId, folderName, search];
-}
 
-class UploadDocumentEvent extends DocumentsEvent {
-  final String folderId;
-  final String fileName;
-  const UploadDocumentEvent({required this.folderId, required this.fileName});
+  /// Keeps the loaded content on screen while the request runs.
+  final bool silent;
+
+  /// Completed when the request settles (used by pull-to-refresh).
+  final Completer<void>? completer;
+
+  const LoadDocumentsEvent({this.folderId, this.folderName, this.search, this.silent = false, this.completer});
   @override
-  List<Object?> get props => [folderId, fileName];
+  List<Object?> get props => [folderId, folderName, search, silent, completer];
 }
 
 // ─── States ─────────────────────────────────────────────────────────────────
@@ -45,23 +46,20 @@ class DocumentsLoaded extends DocumentsState {
   final String? currentFolderName;
   final String searchQuery;
 
+  /// Set when a background refresh failed; the previous content stays visible.
+  final String? refreshError;
+
   const DocumentsLoaded({
     required this.folders,
     required this.files,
     this.currentFolderId,
     this.currentFolderName,
     this.searchQuery = '',
+    this.refreshError,
   });
 
   @override
-  List<Object?> get props => [folders, files, currentFolderId, currentFolderName, searchQuery];
-}
-
-class DocumentsActionSuccess extends DocumentsState {
-  final String message;
-  const DocumentsActionSuccess(this.message);
-  @override
-  List<Object?> get props => [message];
+  List<Object?> get props => [folders, files, currentFolderId, currentFolderName, searchQuery, refreshError];
 }
 
 class DocumentsError extends DocumentsState {
@@ -71,39 +69,51 @@ class DocumentsError extends DocumentsState {
   List<Object?> get props => [message];
 }
 
-// ─── BLoC ───────────────────────────────────────────────────────────────────
+// ─── BLoC (loading only; uploads and deletions are driven by the page, which
+// shows their progress and errors, and then asks for a silent reload) ────────
 class DocumentsBloc extends Bloc<DocumentsEvent, DocumentsState> {
   final DocumentsRepository documentsRepository;
+  int _requestSeq = 0;
 
   DocumentsBloc({required this.documentsRepository}) : super(DocumentsInitial()) {
     on<LoadDocumentsEvent>(_onLoadDocuments);
-    on<UploadDocumentEvent>(_onUpload);
   }
 
   Future<void> _onLoadDocuments(LoadDocumentsEvent event, Emitter<DocumentsState> emit) async {
-    emit(DocumentsLoading());
+    final seq = ++_requestSeq;
+    final previous = state;
+    final kept = event.silent && previous is DocumentsLoaded ? previous : null;
+    if (kept == null) emit(DocumentsLoading());
     try {
-      final folders = await documentsRepository.getFolders();
-      final files = await documentsRepository.getFiles(folderId: event.folderId, search: event.search);
+      final results = await Future.wait([
+        documentsRepository.getFolders(),
+        documentsRepository.getFiles(folderId: event.folderId, search: event.search),
+      ]);
+      if (seq != _requestSeq) return;
       emit(DocumentsLoaded(
-        folders: folders,
-        files: files,
+        folders: results[0] as List<DocumentFolderModel>,
+        files: results[1] as List<DocumentFileModel>,
         currentFolderId: event.folderId,
         currentFolderName: event.folderName,
         searchQuery: event.search ?? '',
       ));
     } catch (e) {
-      emit(DocumentsError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onUpload(UploadDocumentEvent event, Emitter<DocumentsState> emit) async {
-    try {
-      await documentsRepository.uploadFile(folderId: event.folderId, fileName: event.fileName);
-      emit(const DocumentsActionSuccess('Файл успешно загружен'));
-      add(LoadDocumentsEvent(folderId: event.folderId));
-    } catch (e) {
-      emit(DocumentsError(e.toString().replaceAll('Exception: ', '')));
+      if (seq != _requestSeq) return;
+      final message = apiErrorMessage(e, fallback: 'Не удалось загрузить документы');
+      if (kept != null) {
+        emit(DocumentsLoaded(
+          folders: kept.folders,
+          files: kept.files,
+          currentFolderId: kept.currentFolderId,
+          currentFolderName: kept.currentFolderName,
+          searchQuery: kept.searchQuery,
+          refreshError: message,
+        ));
+      } else {
+        emit(DocumentsError(message));
+      }
+    } finally {
+      event.completer?.complete();
     }
   }
 }

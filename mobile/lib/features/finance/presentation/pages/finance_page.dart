@@ -1,16 +1,19 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
-import 'package:path_provider/path_provider.dart';
-import '../../../../core/di/injection.dart';
-import '../../../../core/network/api_client.dart';
+import '../../../../core/router/app_router.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/utils/formatters.dart';
 import '../../../../core/widgets/glass_card.dart';
 import '../../../../core/widgets/loading_shimmer.dart';
 import '../bloc/finance_bloc.dart';
+import '../../data/company_currency.dart';
 import '../../data/models/transaction_model.dart';
+import '../widgets/finance_form_widgets.dart';
+import '../widgets/transaction_detail_sheet.dart';
+import '../widgets/transfer_sheet.dart';
 
 class FinancePage extends StatefulWidget {
   const FinancePage({super.key});
@@ -35,7 +38,10 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
             );
       }
     });
-    context.read<FinanceBloc>().add(const LoadFinanceData());
+    context.read<FinanceBloc>().add(const LoadFinanceData(resetFilters: true));
+    CompanyCurrency.instance.ensureLoaded().then((_) {
+      if (mounted) setState(() {});
+    });
   }
 
   @override
@@ -44,12 +50,66 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
     super.dispose();
   }
 
+  /// Resolves when the server has answered, so the pull-to-refresh indicator
+  /// stays visible for the whole request.
+  Future<void> _refresh() {
+    final done = Completer<void>();
+    context.read<FinanceBloc>().add(RefreshFinanceData(done: done));
+    return done.future;
+  }
+
+  Future<void> _openTransfer() async {
+    final done = await TransferSheet.show(context);
+    if (done != true || !mounted) return;
+    notifyFinanceChanged(context);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Перевод выполнен'), backgroundColor: AppColors.success),
+    );
+  }
+
+  Future<void> _showTransactionDetails(TransactionModel tx) async {
+    final deleted = await TransactionDetailSheet.show(context, tx);
+    if (deleted != true || !mounted) return;
+    notifyFinanceChanged(context);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Операция удалена'), backgroundColor: AppColors.success),
+    );
+  }
+
+  Future<void> _pickDateRange(FinanceLoaded state) async {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final initial = state.startDate != null && state.endDate != null
+        ? DateTimeRange(start: state.startDate!, end: state.endDate!)
+        : null;
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: today,
+      initialDateRange: initial,
+      helpText: 'Период операций',
+      saveText: 'Применить',
+      builder: (context, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: AppColors.isDark
+                ? Theme.of(context).colorScheme
+                : const ColorScheme.light(primary: AppColors.primaryBlue),
+          ),
+          child: child!,
+        );
+      },
+    );
+    if (picked == null || !mounted) return;
+    context.read<FinanceBloc>().add(SetTransactionDateRange(startDate: picked.start, endDate: picked.end));
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           gradient: AppColors.backgroundGradient,
         ),
         child: SafeArea(
@@ -59,27 +119,25 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
               _buildHeader(),
               Expanded(
                 child: BlocConsumer<FinanceBloc, FinanceState>(
+                  listenWhen: (previous, current) =>
+                      current is FinanceLoaded &&
+                      current.notice != null &&
+                      (previous is! FinanceLoaded || previous.noticeId != current.noticeId),
                   listener: (context, state) {
-                    if (state is FinanceActionSuccess) {
+                    if (state is FinanceLoaded && state.notice != null) {
                       ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(state.message),
-                          backgroundColor: AppColors.success,
-                        ),
+                        SnackBar(content: Text(state.notice!), backgroundColor: AppColors.error),
                       );
                     }
                   },
                   builder: (context, state) {
-                    if (state is FinanceLoading) {
-                      return const LoadingShimmer();
-                    }
                     if (state is FinanceError) {
                       return _buildErrorState(state.message);
                     }
                     if (state is FinanceLoaded) {
                       return _buildContent(state);
                     }
-                    return const SizedBox.shrink();
+                    return const LoadingShimmer();
                   },
                 ),
               ),
@@ -105,10 +163,10 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+            icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
             onPressed: () => context.pop(),
           ),
-          const Expanded(
+          Expanded(
             child: Text(
               'Финансы',
               style: TextStyle(
@@ -121,12 +179,12 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
           IconButton(
             icon: const Icon(Icons.account_balance_wallet_outlined, color: AppColors.primaryBlue),
             tooltip: 'Счета',
-            onPressed: () => context.push('/finance/accounts'),
+            onPressed: () => context.push(AppRoutes.financeAccounts),
           ),
           IconButton(
             icon: const Icon(Icons.request_quote_outlined, color: AppColors.secondaryLavender),
             tooltip: 'Долги',
-            onPressed: () => context.push('/finance/debts'),
+            onPressed: () => context.push(AppRoutes.financeDebts),
           ),
         ],
       ),
@@ -135,11 +193,11 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
 
   Widget _buildContent(FinanceLoaded state) {
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<FinanceBloc>().add(const LoadFinanceData());
-      },
+      onRefresh: _refresh,
+      color: AppColors.primaryBlue,
       child: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        physics: const AlwaysScrollableScrollPhysics(),
         children: [
           // Balance Cards Row
           Row(
@@ -167,8 +225,8 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
                       ),
                       const SizedBox(height: 12),
                       Text(
-                        Formatters.formatUzs(state.totalCash),
-                        style: const TextStyle(
+                        money(state.totalCash),
+                        style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
                           color: AppColors.textPrimary,
@@ -204,8 +262,8 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
                       ),
                       const SizedBox(height: 12),
                       Text(
-                        Formatters.formatUzs(state.totalBank),
-                        style: const TextStyle(
+                        money(state.totalBank),
+                        style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
                           color: AppColors.textPrimary,
@@ -225,12 +283,13 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
           Container(
             height: 42,
             decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.6),
+              color: AppColors.cardBackground.withOpacity(0.6),
               borderRadius: BorderRadius.circular(12),
             ),
             child: TabBar(
               controller: _tabController,
               isScrollable: true,
+              tabAlignment: TabAlignment.start,
               indicator: BoxDecoration(
                 borderRadius: BorderRadius.circular(10),
                 color: AppColors.primaryBlue,
@@ -245,70 +304,70 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
 
           // Transactions List Header
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                'История операций',
-                style: AppTextStyles.titleMedium,
+              Expanded(
+                child: Text(
+                  'История операций',
+                  style: AppTextStyles.titleMedium,
+                ),
               ),
-              Text(
-                '${state.transactions.length} записей',
-                style: AppTextStyles.caption,
+              if (!state.isListLoading)
+                Text(
+                  'Всего: ${state.total}',
+                  style: AppTextStyles.caption,
+                ),
+              IconButton(
+                icon: Icon(
+                  Icons.date_range_outlined,
+                  color: state.hasDateFilter ? AppColors.primaryBlue : AppColors.textSecondary,
+                  size: 20,
+                ),
+                tooltip: 'Период',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _pickDateRange(state),
               ),
             ],
           ),
+          if (state.hasDateFilter)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: InputChip(
+                label: Text(
+                  '${Formatters.formatDate(state.startDate)} — ${Formatters.formatDate(state.endDate)}',
+                  style: const TextStyle(fontSize: 12, color: AppColors.primaryBlue, fontWeight: FontWeight.w600),
+                ),
+                backgroundColor: AppColors.primaryBlue.withOpacity(0.08),
+                side: BorderSide(color: AppColors.primaryBlue.withOpacity(0.3)),
+                deleteIconColor: AppColors.primaryBlue,
+                onDeleted: () => context.read<FinanceBloc>().add(const SetTransactionDateRange()),
+                onPressed: () => _pickDateRange(state),
+              ),
+            ),
           const SizedBox(height: 8),
 
-          if (state.transactions.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 40),
-              child: Center(
-                child: Column(
-                  children: [
-                    Icon(Icons.account_balance_wallet_outlined, size: 56, color: AppColors.textTertiary),
-                    const SizedBox(height: 12),
-                    Text(
-                      'Данных пока нет',
-                      style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      'Зарегистрируйте первую финансовую операцию',
-                      style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary),
-                    ),
-                    const SizedBox(height: 16),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        ElevatedButton.icon(
-                          onPressed: () => context.push('/finance/income/add'),
-                          icon: const Icon(Icons.arrow_downward, size: 16),
-                          label: const Text('+ Доход'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: AppColors.success,
-                            foregroundColor: Colors.white,
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        ElevatedButton.icon(
-                          onPressed: () => context.push('/finance/expense/add'),
-                          icon: const Icon(Icons.arrow_upward, size: 16),
-                          label: const Text('+ Расход'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: AppColors.error,
-                            foregroundColor: Colors.white,
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
+          if (state.isListLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 40),
+              child: Center(child: CircularProgressIndicator(color: AppColors.primaryBlue)),
+            )
+          else if (state.transactions.isEmpty)
+            _buildEmptyList(state)
+          else ...[
+            ...state.transactions.map((tx) => _buildTransactionItem(tx)),
+            if (state.isLoadingMore)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 16),
+                child: Center(child: CircularProgressIndicator(color: AppColors.primaryBlue)),
+              )
+            else if (state.hasMore)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: TextButton(
+                  onPressed: () => context.read<FinanceBloc>().add(const LoadMoreTransactions()),
+                  child: Text('Показать ещё (${state.total - state.transactions.length})'),
                 ),
               ),
-            )
-          else
-            ...state.transactions.map((tx) => _buildTransactionItem(tx)),
+          ],
 
           const SizedBox(height: 80),
         ],
@@ -316,13 +375,64 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
     );
   }
 
+  Widget _buildEmptyList(FinanceLoaded state) {
+    final filtered = state.currentFilter != 'all' || state.hasDateFilter;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 40),
+      child: Center(
+        child: Column(
+          children: [
+            Icon(Icons.account_balance_wallet_outlined, size: 56, color: AppColors.textTertiary),
+            const SizedBox(height: 12),
+            Text(
+              filtered ? 'Операций не найдено' : 'Данных пока нет',
+              style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              filtered ? 'Измените тип операции или период' : 'Зарегистрируйте первую финансовую операцию',
+              textAlign: TextAlign.center,
+              style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary),
+            ),
+            if (!filtered) ...[
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: () => context.push(AppRoutes.financeIncomeAdd),
+                    icon: const Icon(Icons.arrow_downward, size: 16),
+                    label: const Text('+ Доход'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.success,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  ElevatedButton.icon(
+                    onPressed: () => context.push(AppRoutes.financeExpenseAdd),
+                    icon: const Icon(Icons.arrow_upward, size: 16),
+                    label: const Text('+ Расход'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.error,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildTransactionItem(TransactionModel tx) {
-    final bool isIncome = tx.type == 'income';
-    final bool isTransfer = tx.type == 'transfer';
-    final Color amountColor = isIncome
-        ? AppColors.success
-        : (isTransfer ? AppColors.info : AppColors.error);
-    final String amountPrefix = isIncome ? '+' : (isTransfer ? '' : '-');
+    final Color amountColor = transactionColor(tx);
+    final String title = tx.description.isNotEmpty ? tx.description : tx.category;
+    final bool hasDocument = tx.documentUrl != null && tx.documentUrl!.isNotEmpty;
 
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
@@ -334,19 +444,8 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
           children: [
             Container(
               padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: isIncome
-                    ? AppColors.iconBgGreen
-                    : (isTransfer ? AppColors.infoLight : AppColors.iconBgRed),
-                shape: BoxShape.circle,
-              ),
-              child: Icon(
-                isIncome
-                    ? Icons.arrow_downward
-                    : (isTransfer ? Icons.swap_horiz : Icons.arrow_upward),
-                color: amountColor,
-                size: 18,
-              ),
+              decoration: BoxDecoration(color: transactionIconBg(tx), shape: BoxShape.circle),
+              child: Icon(transactionIcon(tx), color: amountColor, size: 18),
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -354,8 +453,8 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    tx.description.isNotEmpty ? tx.description : tx.category,
-                    style: const TextStyle(
+                    title,
+                    style: TextStyle(
                       fontWeight: FontWeight.w600,
                       fontSize: 14,
                       color: AppColors.textPrimary,
@@ -371,7 +470,7 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
                         style: AppTextStyles.caption,
                       ),
                       if (tx.accountName != null) ...[
-                        const Text(' • ', style: TextStyle(color: AppColors.textTertiary)),
+                        Text(' • ', style: TextStyle(color: AppColors.textTertiary)),
                         Flexible(
                           child: Text(
                             tx.accountName!,
@@ -380,17 +479,9 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
                           ),
                         ),
                       ],
-                      if (tx.documentUrl != null && tx.documentUrl!.isNotEmpty) ...[
-                        const Text(' • ', style: TextStyle(color: AppColors.textTertiary)),
+                      if (hasDocument) ...[
+                        Text(' • ', style: TextStyle(color: AppColors.textTertiary)),
                         const Icon(Icons.attach_file, size: 12, color: AppColors.primaryBlue),
-                        const SizedBox(width: 2),
-                        Flexible(
-                          child: Text(
-                            tx.documentName ?? 'Документ',
-                            style: const TextStyle(fontSize: 11, color: AppColors.primaryBlue, fontWeight: FontWeight.bold),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
                       ],
                     ],
                   ),
@@ -399,7 +490,7 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
             ),
             const SizedBox(width: 8),
             Text(
-              '$amountPrefix${Formatters.formatUzs(tx.amount)}',
+              transactionAmountText(tx),
               style: TextStyle(
                 fontWeight: FontWeight.bold,
                 fontSize: 14,
@@ -410,230 +501,6 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
         ),
       ),
     );
-  }
-
-  void _showTransactionDetails(TransactionModel tx) {
-    final bool isIncome = tx.type == 'income';
-    final bool isTransfer = tx.type == 'transfer';
-    final Color amountColor = isIncome
-        ? AppColors.success
-        : (isTransfer ? AppColors.info : AppColors.error);
-    final String amountPrefix = isIncome ? '+' : (isTransfer ? '' : '-');
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) => Container(
-        padding: const EdgeInsets.all(24),
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-        ),
-        child: SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Center(
-                child: Container(
-                  width: 40,
-                  height: 4,
-                  margin: const EdgeInsets.only(bottom: 20),
-                  decoration: BoxDecoration(
-                    color: Colors.grey[300],
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-              Row(
-                children: [
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: isIncome
-                          ? AppColors.iconBgGreen
-                          : (isTransfer ? AppColors.infoLight : AppColors.iconBgRed),
-                      shape: BoxShape.circle,
-                    ),
-                    child: Icon(
-                      isIncome
-                          ? Icons.arrow_downward
-                          : (isTransfer ? Icons.swap_horiz : Icons.arrow_upward),
-                      color: amountColor,
-                      size: 24,
-                    ),
-                  ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          isIncome ? 'Поступление средств' : (isTransfer ? 'Внутренний перевод' : 'Расход средств'),
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: AppColors.textPrimary),
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          Formatters.formatDate(tx.date),
-                          style: AppTextStyles.caption,
-                        ),
-                      ],
-                    ),
-                  ),
-                  Text(
-                    '$amountPrefix${Formatters.formatUzs(tx.amount)}',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: amountColor,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 20),
-              const Divider(),
-              const SizedBox(height: 12),
-
-              _buildDetailRow('Категория', tx.category),
-              if (tx.accountName != null)
-                _buildDetailRow('Счет / Касса', tx.accountName!),
-              if (tx.description.isNotEmpty)
-                _buildDetailRow('Описание', tx.description),
-              if (tx.employeeName != null)
-                _buildDetailRow('Сотрудник', tx.employeeName!),
-
-              if (tx.documentUrl != null && tx.documentUrl!.isNotEmpty) ...[
-                const SizedBox(height: 16),
-                const Text(
-                  'Прикрепленный документ:',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
-                ),
-                const SizedBox(height: 8),
-                Container(
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: AppColors.primaryBlue.withOpacity(0.08),
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: AppColors.primaryBlue.withOpacity(0.25)),
-                  ),
-                  child: Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(
-                          color: AppColors.primaryBlue.withOpacity(0.15),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: const Icon(Icons.description, color: AppColors.primaryBlue, size: 24),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              tx.documentName ?? 'Документ транзакции',
-                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            const SizedBox(height: 2),
-                            const Text('Прикреплен к операции', style: TextStyle(fontSize: 11, color: AppColors.textSecondary)),
-                          ],
-                        ),
-                      ),
-                      ElevatedButton(
-                        onPressed: () => _downloadAndOpenDocument(tx.documentUrl!, tx.documentName),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: AppColors.primaryBlue,
-                          foregroundColor: Colors.white,
-                          elevation: 0,
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                        ),
-                        child: const Text('Скачать', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-
-              const SizedBox(height: 20),
-              ElevatedButton(
-                onPressed: () => Navigator.pop(ctx),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppColors.background,
-                  foregroundColor: AppColors.textPrimary,
-                  elevation: 0,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                ),
-                child: const Text('Закрыть', style: TextStyle(fontWeight: FontWeight.w600)),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildDetailRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: const TextStyle(color: AppColors.textSecondary, fontSize: 13)),
-          const SizedBox(width: 16),
-          Flexible(
-            child: Text(
-              value,
-              textAlign: TextAlign.end,
-              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: AppColors.textPrimary),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _downloadAndOpenDocument(String docUrl, String? docName) async {
-    try {
-      final fullUrl = docUrl.startsWith('http') ? docUrl : 'http://45.158.199.215:3000$docUrl';
-      final tempDir = await getTemporaryDirectory();
-      final fileName = docName ?? 'document_${DateTime.now().millisecondsSinceEpoch}';
-      final savePath = '${tempDir.path}/$fileName';
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Загрузка документа с сервера...'),
-          duration: Duration(seconds: 1),
-        ),
-      );
-
-      final apiClient = getIt<ApiClient>();
-      await apiClient.dio.download(fullUrl, savePath);
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            backgroundColor: AppColors.success,
-            content: Text('Документ успешно загружен: $fileName'),
-          ),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            backgroundColor: AppColors.error,
-            content: Text('Ошибка скачивания: $e'),
-          ),
-        );
-      }
-    }
   }
 
   Widget _buildErrorState(String message) {
@@ -673,8 +540,8 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
       backgroundColor: Colors.transparent,
       builder: (ctx) => Container(
         padding: const EdgeInsets.all(20),
-        decoration: const BoxDecoration(
-          color: Colors.white,
+        decoration: BoxDecoration(
+          color: AppColors.cardBackground,
           borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
         ),
         child: SafeArea(
@@ -686,11 +553,11 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
                 height: 4,
                 margin: const EdgeInsets.only(bottom: 20),
                 decoration: BoxDecoration(
-                  color: Colors.grey[300],
+                  color: AppColors.neutral300,
                   borderRadius: BorderRadius.circular(2),
                 ),
               ),
-              const Text(
+              Text(
                 'Выберите тип операции',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
               ),
@@ -701,11 +568,11 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
                   decoration: BoxDecoration(color: AppColors.iconBgGreen, shape: BoxShape.circle),
                   child: const Icon(Icons.arrow_downward, color: AppColors.success),
                 ),
-                title: const Text('Поступление средств', style: TextStyle(fontWeight: FontWeight.w600)),
-                subtitle: const Text('Оплата от клиента, прочий доход'),
+                title: Text('Поступление средств', style: TextStyle(fontWeight: FontWeight.w600, color: AppColors.textPrimary)),
+                subtitle: Text('Оплата от клиента, прочий доход', style: TextStyle(color: AppColors.textSecondary)),
                 onTap: () {
                   Navigator.pop(ctx);
-                  context.push('/finance/income/add');
+                  context.push(AppRoutes.financeIncomeAdd);
                 },
               ),
               const Divider(),
@@ -715,11 +582,25 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
                   decoration: BoxDecoration(color: AppColors.iconBgRed, shape: BoxShape.circle),
                   child: const Icon(Icons.arrow_upward, color: AppColors.error),
                 ),
-                title: const Text('Расход средств', style: TextStyle(fontWeight: FontWeight.w600)),
-                subtitle: const Text('Оплата поставщику, аренда, зарплата'),
+                title: Text('Расход средств', style: TextStyle(fontWeight: FontWeight.w600, color: AppColors.textPrimary)),
+                subtitle: Text('Оплата поставщику, аренда, зарплата', style: TextStyle(color: AppColors.textSecondary)),
                 onTap: () {
                   Navigator.pop(ctx);
-                  context.push('/finance/expense/add');
+                  context.push(AppRoutes.financeExpenseAdd);
+                },
+              ),
+              const Divider(),
+              ListTile(
+                leading: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(color: AppColors.infoLight, shape: BoxShape.circle),
+                  child: const Icon(Icons.swap_horiz, color: AppColors.info),
+                ),
+                title: Text('Перевод между счетами', style: TextStyle(fontWeight: FontWeight.w600, color: AppColors.textPrimary)),
+                subtitle: Text('Из кассы в банк, с карты на счёт', style: TextStyle(color: AppColors.textSecondary)),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _openTransfer();
                 },
               ),
             ],

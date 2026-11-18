@@ -8,39 +8,33 @@ class InventoryRepository {
 
   InventoryRepository({required this.apiClient});
 
-  Future<List<ProductModel>> getProducts({
-    String? search,
-    String? categoryId,
-    int page = 1,
-    int limit = 50,
-  }) async {
-    final query = <String, dynamic>{'page': page, 'limit': limit};
-    if (search != null && search.isNotEmpty) query['search'] = search;
+  /// The server caps the movement history at this many rows.
+  static const int _movementsCap = 200;
+
+  Map<String, dynamic> _data(dynamic body) {
+    return JsonHelpers.toMap(body is Map && body.containsKey('data') ? body['data'] : body);
+  }
+
+  Future<List<ProductModel>> getProducts({String? search, String? categoryId}) async {
+    final query = <String, dynamic>{'limit': 500};
+    if (search != null && search.trim().isNotEmpty) query['search'] = search.trim();
     if (categoryId != null && categoryId.isNotEmpty) query['categoryId'] = categoryId;
 
-    final response = await apiClient.get(
-      ApiEndpoints.products,
-      queryParameters: query,
-    );
+    final response = await apiClient.get(ApiEndpoints.products, queryParameters: query);
+    return JsonHelpers.toList(response.data).map((e) => ProductModel.fromJson(JsonHelpers.toMap(e))).toList();
+  }
 
-    if (response.statusCode == 200) {
-      final list = JsonHelpers.toList(response.data);
-      return list.map((e) => ProductModel.fromJson(JsonHelpers.toMap(e))).toList();
-    }
-    throw Exception('Не удалось загрузить товары');
+  Future<List<ProductCategoryModel>> getCategories() async {
+    final response = await apiClient.get(ApiEndpoints.productCategories);
+    return JsonHelpers.toList(response.data)
+        .map((e) => ProductCategoryModel.fromJson(JsonHelpers.toMap(e)))
+        .where((c) => c.id.isNotEmpty && c.name.isNotEmpty)
+        .toList();
   }
 
   Future<ProductModel> getProductById(String id) async {
     final response = await apiClient.get(ApiEndpoints.product(id));
-    if (response.statusCode == 200) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return ProductModel.fromJson(map);
-    }
-    throw Exception('Не удалось загрузить данные товара');
+    return ProductModel.fromJson(_data(response.data));
   }
 
   Future<List<StockMovementModel>> getStockMovements(String productId) async {
@@ -48,61 +42,38 @@ class InventoryRepository {
       ApiEndpoints.stockMovements,
       queryParameters: {'productId': productId},
     );
-    if (response.statusCode == 200) {
-      final list = JsonHelpers.toList(response.data);
-      return list.map((e) => StockMovementModel.fromJson(JsonHelpers.toMap(e))).toList();
-    }
-    return [];
+    final rows = JsonHelpers.toList(response.data);
+    return StockMovementModel.listForProduct(rows, complete: rows.length < _movementsCap);
   }
 
   Future<ProductModel> createProduct(Map<String, dynamic> data) async {
     final response = await apiClient.post(ApiEndpoints.products, data: data);
-    if (response.statusCode == 200 || response.statusCode == 201) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return ProductModel.fromJson(map);
-    }
-    throw Exception('Не удалось сохранить товар');
+    return ProductModel.fromJson(_data(response.data));
   }
 
   Future<ProductModel> updateProduct(String id, Map<String, dynamic> data) async {
-    final response = await apiClient.patch('${ApiEndpoints.products}/$id', data: data);
-    if (response.statusCode == 200) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return ProductModel.fromJson(map);
-    }
-    throw Exception('Не удалось обновить товар');
+    final response = await apiClient.patch(ApiEndpoints.product(id), data: data);
+    return ProductModel.fromJson(_data(response.data));
   }
 
   Future<void> deleteProduct(String id) async {
-    final response = await apiClient.delete('${ApiEndpoints.products}/$id');
-    if (response.statusCode != 200 && response.statusCode != 204) {
-      throw Exception('Не удалось удалить товар');
-    }
+    await apiClient.delete(ApiEndpoints.product(id));
   }
 
-  Future<void> adjustStock(Map<String, dynamic> data) async {
-    final response = await apiClient.post(ApiEndpoints.adjustStock, data: data);
-    if (response.statusCode != 200 && response.statusCode != 201) {
-      throw Exception('Не удалось выполнить корректировку остатка');
-    }
-  }
-
-  Future<List<String>> getCategories() async {
-    try {
-      final response = await apiClient.get(ApiEndpoints.productCategories);
-      if (response.statusCode == 200) {
-        final list = JsonHelpers.toList(response.data);
-        return list.map((e) => JsonHelpers.extractString(e, fallback: e.toString())).toList();
-      }
-    } catch (_) {}
-    return ['Все', 'Электроника', 'Аксессуары', 'Одежда', 'Оборудование'];
+  /// [type] is 'in' (receive), 'out' (write off) or 'set' (actual counted quantity).
+  /// Returns the product with its new quantity.
+  Future<ProductModel> adjustStock({
+    required String productId,
+    required String type,
+    required double quantity,
+    String? notes,
+  }) async {
+    final response = await apiClient.post(ApiEndpoints.adjustStock, data: {
+      'productId': productId,
+      'type': type,
+      'quantity': quantity,
+      if (notes != null && notes.trim().isNotEmpty) 'notes': notes.trim(),
+    });
+    return ProductModel.fromJson(_data(response.data));
   }
 }

@@ -9,8 +9,7 @@ import '../../../../core/utils/validators.dart';
 import '../../../../core/widgets/app_button.dart';
 import '../../../../core/widgets/app_text_field.dart';
 import '../../../../core/widgets/glass_card.dart';
-import '../../../../core/di/injection.dart';
-import '../../../../core/services/security_service.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import '../bloc/auth_bloc.dart';
 
 class LoginPage extends StatefulWidget {
@@ -24,7 +23,15 @@ class _LoginPageState extends State<LoginPage> {
   final _formKey = GlobalKey<FormState>();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
-  bool _rememberMe = true;
+  String? _version;
+
+  @override
+  void initState() {
+    super.initState();
+    PackageInfo.fromPlatform().then((info) {
+      if (mounted) setState(() => _version = info.version);
+    }).catchError((_) {});
+  }
 
   @override
   void dispose() {
@@ -44,26 +51,96 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
+  void _showForgotPasswordSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => Container(
+        padding: EdgeInsets.only(
+          top: 20,
+          left: 20,
+          right: 20,
+          bottom: MediaQuery.of(ctx).padding.bottom + 20,
+        ),
+        decoration: BoxDecoration(
+          color: AppColors.cardBackground,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: AppColors.neutral300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                const Icon(Icons.lock_reset_rounded, color: AppColors.primaryBlue, size: 24),
+                const SizedBox(width: 10),
+                Text(
+                  'Восстановление пароля',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Пароль сбрасывает администратор вашей организации.',
+              style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textPrimary, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              '1. Попросите администратора открыть «Настройки» → «Сотрудники и роли» и выбрать вашу карточку.\n'
+              '2. Администратор нажимает «Сбросить пароль» и передаёт вам временный пароль.\n'
+              '3. Войдите с временным паролем и смените его в разделе «Настройки» → «Изменить пароль».',
+              style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary, height: 1.45),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'Восстановление по электронной почте не предусмотрено. Если вы единственный владелец организации и не можете войти, обратитесь в службу поддержки Company OS.',
+              style: AppTextStyles.caption.copyWith(color: AppColors.textSecondary, height: 1.4),
+            ),
+            const SizedBox(height: 20),
+            AppButton(label: 'Понятно', onPressed: () => Navigator.pop(ctx)),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return BlocListener<AuthBloc, AuthState>(
-      listener: (context, state) async {
+      // The registration screen sits on top of this one and reports its own result.
+      listenWhen: (previous, current) => ModalRoute.of(context)?.isCurrent ?? true,
+      listener: (context, state) {
         if (state is AuthAuthenticated) {
-          if (mounted) {
-            context.go(AppRoutes.dashboard);
-          }
+          context.go(AppRoutes.dashboard);
         } else if (state is AuthError) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(state.message),
-              backgroundColor: AppColors.error,
-            ),
-          );
+          ScaffoldMessenger.of(context)
+            ..hideCurrentSnackBar()
+            ..showSnackBar(
+              SnackBar(
+                content: Text(state.message),
+                backgroundColor: AppColors.error,
+                behavior: SnackBarBehavior.floating,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            );
         }
       },
       child: Scaffold(
         body: Container(
-          decoration: const BoxDecoration(
+          decoration: BoxDecoration(
             gradient: AppColors.backgroundGradient,
           ),
           child: SafeArea(
@@ -149,49 +226,23 @@ class _LoginPageState extends State<LoginPage> {
                               onSubmitted: (_) => _onLogin(),
                             ),
                             const SizedBox(height: 12),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Row(
-                                  children: [
-                                    SizedBox(
-                                      width: 24,
-                                      height: 24,
-                                      child: Checkbox(
-                                        value: _rememberMe,
-                                        onChanged: (v) =>
-                                            setState(() => _rememberMe = v ?? true),
-                                        shape: RoundedRectangleBorder(
-                                          borderRadius: BorderRadius.circular(4),
-                                        ),
-                                        activeColor: AppColors.primaryBlue,
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Text(
-                                      'Запомнить меня',
-                                      style: AppTextStyles.caption.copyWith(
-                                        color: AppColors.textSecondary,
-                                      ),
-                                    ),
-                                  ],
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: TextButton(
+                                onPressed: _showForgotPasswordSheet,
+                                style: TextButton.styleFrom(
+                                  padding: EdgeInsets.zero,
+                                  minimumSize: Size.zero,
+                                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                                 ),
-                                TextButton(
-                                  onPressed: () {},
-                                  style: TextButton.styleFrom(
-                                    padding: EdgeInsets.zero,
-                                    minimumSize: Size.zero,
-                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                                  ),
-                                  child: Text(
-                                    AppStrings.forgotPassword,
-                                    style: AppTextStyles.caption.copyWith(
-                                      color: AppColors.primaryBlue,
-                                      fontWeight: FontWeight.w600,
-                                    ),
+                                child: Text(
+                                  AppStrings.forgotPassword,
+                                  style: AppTextStyles.caption.copyWith(
+                                    color: AppColors.primaryBlue,
+                                    fontWeight: FontWeight.w600,
                                   ),
                                 ),
-                              ],
+                              ),
                             ),
                             const SizedBox(height: 24),
                             BlocBuilder<AuthBloc, AuthState>(
@@ -229,11 +280,13 @@ class _LoginPageState extends State<LoginPage> {
                         ),
                       ),
                     ),
-                    const SizedBox(height: 24),
-                    Text(
-                      'v1.0.0 • Enterprise Edition',
-                      style: AppTextStyles.captionSmall,
-                    ),
+                    if (_version != null) ...[
+                      const SizedBox(height: 24),
+                      Text(
+                        'v$_version • Enterprise Edition',
+                        style: AppTextStyles.captionSmall,
+                      ),
+                    ],
                   ],
                 ),
               ),

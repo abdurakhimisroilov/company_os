@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import '../constants/app_constants.dart';
+import '../di/injection.dart';
+import '../network/api_client.dart';
+import '../services/security_service.dart';
 
 // Auth & Dashboard
 import '../../features/auth/presentation/pages/splash_page.dart';
@@ -122,35 +123,22 @@ final GlobalKey<NavigatorState> rootNavigatorKey = GlobalKey<NavigatorState>();
 class AppRouter {
   AppRouter._();
 
-  static const FlutterSecureStorage _storage = FlutterSecureStorage();
-
   static final GoRouter router = GoRouter(
     navigatorKey: rootNavigatorKey,
     initialLocation: AppRoutes.splash,
     redirect: (BuildContext context, GoRouterState state) async {
-      final token = await _storage.read(key: AppConstants.accessTokenKey);
+      final token = await getIt<ApiClient>().getAccessToken();
       final isAuth = token != null && token.isNotEmpty;
-      final isGoingToSplash = state.matchedLocation == AppRoutes.splash;
-      final isGoingToLogin = state.matchedLocation == AppRoutes.login;
-      final isGoingToRegister = state.matchedLocation == AppRoutes.register;
-      final isGoingToPinSetup = state.matchedLocation == AppRoutes.pinSetup;
-      final isGoingToPinLock = state.matchedLocation == AppRoutes.pinLock;
+      final location = state.matchedLocation;
+      final isPublic = location == AppRoutes.login || location == AppRoutes.register;
 
-      if (isGoingToSplash) return null;
-      if (!isAuth && !isGoingToLogin && !isGoingToRegister) return AppRoutes.login;
-      if (isAuth && (isGoingToLogin || isGoingToRegister)) {
-        final pinHash = await _storage.read(key: AppConstants.pinHashKey);
-        if (pinHash == null || pinHash.isEmpty) {
-          return AppRoutes.pinSetup;
-        }
-        return AppRoutes.pinLock;
-      }
-      if (isAuth && !isGoingToPinSetup && !isGoingToPinLock) {
-        final pinHash = await _storage.read(key: AppConstants.pinHashKey);
-        if (pinHash == null || pinHash.isEmpty) {
-          return AppRoutes.pinSetup;
-        }
-      }
+      if (location == AppRoutes.splash) return null;
+      if (!isAuth) return isPublic ? null : AppRoutes.login;
+      if (location == AppRoutes.pinSetup || location == AppRoutes.pinLock) return null;
+
+      final hasPin = await getIt<SecurityService>().isPinSet();
+      if (!hasPin) return AppRoutes.pinSetup;
+      if (isPublic) return AppRoutes.pinLock;
       return null;
     },
     routes: [

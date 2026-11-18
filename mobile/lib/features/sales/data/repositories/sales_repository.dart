@@ -8,57 +8,37 @@ class SalesRepository {
 
   SalesRepository({required this.apiClient});
 
-  Future<List<SaleModel>> getSales({String? status, int page = 1, int limit = 50}) async {
-    final query = <String, dynamic>{'page': page, 'limit': limit};
-    if (status != null && status.isNotEmpty && status != 'all') {
-      query['status'] = status;
-    }
-
-    final response = await apiClient.get(
-      ApiEndpoints.sales,
-      queryParameters: query,
-    );
-
-    if (response.statusCode == 200) {
-      final list = JsonHelpers.toList(response.data);
-      return list.map((e) => SaleModel.fromJson(JsonHelpers.toMap(e))).toList();
-    }
-    throw Exception('Не удалось загрузить продажи');
+  SaleModel _sale(dynamic body) {
+    return SaleModel.fromJson(JsonHelpers.toMap(body is Map && body.containsKey('data') ? body['data'] : body));
   }
 
+  /// [status] is 'paid', 'partial', 'unpaid' or 'all'.
+  Future<List<SaleModel>> getSales({String? status}) async {
+    final query = <String, dynamic>{};
+    if (status != null && status.isNotEmpty && status != 'all') query['status'] = status;
+
+    final response = await apiClient.get(ApiEndpoints.sales, queryParameters: query);
+    return JsonHelpers.toList(response.data).map((e) => SaleModel.fromJson(JsonHelpers.toMap(e))).toList();
+  }
+
+  /// Sale with its items and payments.
   Future<SaleModel> getSaleById(String id) async {
     final response = await apiClient.get(ApiEndpoints.sale(id));
-    if (response.statusCode == 200) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return SaleModel.fromJson(map);
-    }
-    throw Exception('Не удалось загрузить данные продажи');
+    return _sale(response.data);
   }
 
+  /// [data]: `{customerId | customerName, items: [{productId, quantity, price}], paidAmount, paymentMethod, discount?}`.
   Future<SaleModel> createSale(Map<String, dynamic> data) async {
     final response = await apiClient.post(ApiEndpoints.sales, data: data);
-    if (response.statusCode == 200 || response.statusCode == 201) {
-      final map = JsonHelpers.toMap(
-        response.data is Map && (response.data as Map).containsKey('data')
-            ? (response.data as Map)['data']
-            : response.data,
-      );
-      return SaleModel.fromJson(map);
-    }
-    throw Exception('Не удалось сохранить продажу');
+    return _sale(response.data);
   }
 
-  Future<void> addPayment(String saleId, double amount, String method) async {
+  /// Registers a payment and returns the updated sale.
+  Future<SaleModel> addPayment(String saleId, double amount, String method) async {
     final response = await apiClient.post(
       ApiEndpoints.salePayment(saleId),
-      data: {'amount': amount, 'method': method},
+      data: {'amount': amount, 'paymentMethod': method},
     );
-    if (response.statusCode != 200 && response.statusCode != 201) {
-      throw Exception('Не удалось провести платёж');
-    }
+    return _sale(response.data);
   }
 }

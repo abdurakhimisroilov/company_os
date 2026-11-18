@@ -33,7 +33,8 @@ class CompanyModel {
     return CompanyModel(
       id: JsonHelpers.toStr(json['id']),
       name: JsonHelpers.toStr(json['name'], 'Компания'),
-      taxId: JsonHelpers.extractOptionalString(json['tax_id'] ?? json['taxId']),
+      // The server may send a purely numeric tax id as a number.
+      taxId: _optional(json['tax_id'] ?? json['taxId']),
       currency: JsonHelpers.toStr(json['currency'], 'UZS'),
       logoUrl: JsonHelpers.extractOptionalString(json['logo_url'] ?? json['logoUrl']),
       description: JsonHelpers.extractOptionalString(json['description']),
@@ -42,9 +43,20 @@ class CompanyModel {
       email: JsonHelpers.extractOptionalString(json['email']),
       isCurrent: JsonHelpers.toBool(json['is_current'] ?? json['isCurrent'], false),
       userRole: JsonHelpers.extractOptionalString(json['user_role'] ?? json['userRole']),
-      createdAt: JsonHelpers.toDateTime(json['created_at'] ?? json['createdAt']),
+      createdAt: JsonHelpers.toOptionalDateTime(json['created_at'] ?? json['createdAt']),
     );
   }
+
+  static String? _optional(dynamic value) {
+    final text = JsonHelpers.toStr(value).trim();
+    return text.isEmpty ? null : text;
+  }
+
+  /// Owner of the organization: the only role allowed to delete it.
+  bool get isOwner => (userRole ?? '').toUpperCase() == 'OWNER';
+
+  /// Roles allowed to edit the organization's details.
+  bool get canEdit => const {'OWNER', 'SUPER_ADMIN', 'ADMIN'}.contains((userRole ?? '').toUpperCase());
 
   Map<String, dynamic> toJson() {
     return {

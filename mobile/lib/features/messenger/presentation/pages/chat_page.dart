@@ -1,12 +1,23 @@
+import 'dart:async';
+import 'dart:io';
+import 'package:dio/dio.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:go_router/go_router.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:intl/intl.dart';
+import '../../../../core/di/injection.dart';
+import '../../../../core/network/api_client.dart';
+import '../../../../core/network/api_error.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
+import '../../../../core/utils/attachment_opener.dart';
 import '../../../../core/utils/formatters.dart';
 import '../../../../core/widgets/loading_shimmer.dart';
-import '../bloc/messenger_bloc.dart';
+import '../bloc/chat_cubit.dart';
 import '../../data/models/chat_model.dart';
+import '../../data/repositories/messenger_repository.dart';
 
 class ChatPage extends StatefulWidget {
   final String roomId;
@@ -18,59 +29,99 @@ class ChatPage extends StatefulWidget {
   State<ChatPage> createState() => _ChatPageState();
 }
 
-class _ChatPageState extends State<ChatPage> {
+class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
+  /// There is no live socket in the app: the open room is re-read on a timer.
+  static const _pollInterval = Duration(seconds: 4);
+  static const _imageExtensions = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic', 'bmp'];
+
   final _messageController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final _repository = getIt<MessengerRepository>();
+  late final ChatCubit _cubit;
+  Timer? _pollTimer;
+
   String? _replyToText;
+  bool _sending = false;
+  String? _uploadingName;
+  double _uploadProgress = 0;
+  CancelToken? _uploadCancel;
 
   @override
   void initState() {
     super.initState();
-    context.read<MessengerBloc>().add(LoadMessagesEvent(widget.roomId));
+    _cubit = ChatCubit(repository: _repository, roomId: widget.roomId)..load();
+    WidgetsBinding.instance.addObserver(this);
+    _startPolling();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _pollTimer?.cancel();
+    _uploadCancel?.cancel();
     _messageController.dispose();
     _scrollController.dispose();
+    _cubit.close();
     super.dispose();
   }
 
-  void _sendMessage() {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _cubit.poll();
+      _startPolling();
+    } else {
+      _pollTimer?.cancel();
+      _pollTimer = null;
+    }
+  }
+
+  void _startPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(_pollInterval, (_) => _cubit.poll());
+  }
+
+  void _showError(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text), backgroundColor: AppColors.error));
+  }
+
+  void _scrollToBottom() {
+    // The list is reversed: offset 0 is the newest message.
+    if (_scrollController.hasClients) {
+      _scrollController.animateTo(0, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
+    }
+  }
+
+  Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
-    if (text.isEmpty) return;
+    if (text.isEmpty || _sending) return;
 
-    context.read<MessengerBloc>().add(
-          SendMessageEvent(
-            roomId: widget.roomId,
-            text: text,
-            replyTo: _replyToText,
-          ),
-        );
-
-    _messageController.clear();
-    setState(() => _replyToText = null);
-
-    Future.delayed(const Duration(milliseconds: 100), () {
-      if (_scrollController.hasClients) {
-        _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
-      }
-    });
+    setState(() => _sending = true);
+    try {
+      await _cubit.send(text, replyTo: _replyToText);
+      if (!mounted) return;
+      _messageController.clear();
+      setState(() => _replyToText = null);
+      _scrollToBottom();
+    } catch (e) {
+      // The draft stays in the field so it can be sent again.
+      _showError(apiErrorMessage(e, fallback: 'Не удалось отправить сообщение'));
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
   }
 
   void _showAttachMenu() {
+    if (_uploadingName != null) return;
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
       builder: (ctx) => Container(
         padding: const EdgeInsets.all(20),
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        decoration: BoxDecoration(
+          color: AppColors.cardBackground,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
         ),
         child: SafeArea(
           child: Row(
@@ -78,24 +129,104 @@ class _ChatPageState extends State<ChatPage> {
             children: [
               _attachOption(Icons.image, 'Фото', AppColors.primaryBlue, () {
                 Navigator.pop(ctx);
-                _messageController.text = '[Изображение]';
-                _sendMessage();
+                _pickPhoto(ImageSource.gallery);
+              }),
+              _attachOption(Icons.photo_camera, 'Камера', AppColors.success, () {
+                Navigator.pop(ctx);
+                _pickPhoto(ImageSource.camera);
               }),
               _attachOption(Icons.insert_drive_file, 'Документ', AppColors.secondaryLavender, () {
                 Navigator.pop(ctx);
-                _messageController.text = '[Документ.pdf]';
-                _sendMessage();
-              }),
-              _attachOption(Icons.mic, 'Голос', AppColors.success, () {
-                Navigator.pop(ctx);
-                _messageController.text = '[Голосовое сообщение 0:15]';
-                _sendMessage();
+                _pickDocument();
               }),
             ],
           ),
         ),
       ),
     );
+  }
+
+  Future<void> _pickDocument() async {
+    try {
+      final result = await FilePicker.platform.pickFiles();
+      final picked = result?.files.single;
+      if (picked?.path == null) return;
+      await _sendAttachment(picked!.path!, picked.name);
+    } on PlatformException {
+      _showError('Не удалось открыть выбор файла');
+    }
+  }
+
+  Future<void> _pickPhoto(ImageSource source) async {
+    try {
+      final photo = await ImagePicker().pickImage(source: source, imageQuality: 85, maxWidth: 2400);
+      if (photo == null) return;
+      var name = photo.name;
+      // Camera shots and re-encoded gallery picks come with a generated temp name.
+      if (source == ImageSource.camera || name.startsWith('image_picker') || name.isEmpty) {
+        final ext = name.contains('.') ? name.split('.').last.toLowerCase() : 'jpg';
+        name = 'Фото ${DateFormat('dd.MM.yyyy HH-mm-ss').format(DateTime.now())}.$ext';
+      }
+      await _sendAttachment(photo.path, name);
+    } on PlatformException catch (e) {
+      final denied = e.code.contains('denied');
+      if (source == ImageSource.camera) {
+        _showError(denied ? 'Нет доступа к камере. Разрешите доступ в настройках устройства' : 'Камера недоступна на этом устройстве');
+      } else {
+        _showError(denied ? 'Нет доступа к фото. Разрешите доступ в настройках устройства' : 'Не удалось открыть галерею');
+      }
+    }
+  }
+
+  /// Uploads the file first, then sends a message that points to it.
+  Future<void> _sendAttachment(String path, String name) async {
+    if (!mounted || _uploadingName != null) return;
+    final size = await File(path).length();
+    if (!mounted) return;
+    if (size > MessengerRepository.maxFileBytes) {
+      _showError('Файл слишком большой (максимум 25 МБ)');
+      return;
+    }
+
+    final cancel = CancelToken();
+    setState(() {
+      _uploadingName = name;
+      _uploadProgress = 0;
+      _uploadCancel = cancel;
+    });
+    try {
+      final url = await _repository.uploadAttachment(
+        path,
+        fileName: name,
+        cancelToken: cancel,
+        onProgress: (p) {
+          if (mounted) setState(() => _uploadProgress = p);
+        },
+      );
+      final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+      await _cubit.send(
+        name,
+        replyTo: _replyToText,
+        attachmentUrl: url,
+        attachmentType: _imageExtensions.contains(ext) ? 'image' : 'file',
+      );
+      if (!mounted) return;
+      setState(() => _replyToText = null);
+      _scrollToBottom();
+    } catch (e) {
+      if (e is DioException && e.type == DioExceptionType.cancel) {
+        _showError('Загрузка отменена');
+      } else {
+        _showError('Файл не отправлен: ${apiErrorMessage(e, fallback: 'ошибка загрузки')}');
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _uploadingName = null;
+          _uploadCancel = null;
+        });
+      }
+    }
   }
 
   Widget _attachOption(IconData icon, String label, Color color, VoidCallback onTap) {
@@ -107,9 +238,9 @@ class _ChatPageState extends State<ChatPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            CircleAvatar(radius: 26, backgroundColor: color.withOpacity(0.15), child: Icon(icon, color: color, size: 28)),
+            CircleAvatar(radius: 26, backgroundColor: color.withValues(alpha: 0.15), child: Icon(icon, color: color, size: 28)),
             const SizedBox(height: 8),
-            Text(label, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+            Text(label, style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: AppColors.textPrimary)),
           ],
         ),
       ),
@@ -118,68 +249,72 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   Widget build(BuildContext context) {
-    final title = widget.roomName ?? 'Чат';
+    final title = (widget.roomName ?? '').isNotEmpty ? widget.roomName! : 'Чат';
 
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
-        backgroundColor: Colors.white.withOpacity(0.9),
+        backgroundColor: AppColors.cardBackground.withValues(alpha: 0.9),
         elevation: 0.5,
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
-          onPressed: () => context.pop(),
+          icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+          onPressed: () => Navigator.of(context).pop(),
         ),
         title: Row(
           children: [
             CircleAvatar(
               radius: 18,
-              backgroundColor: AppColors.iconBgBlue,
-              child: const Icon(Icons.person, color: AppColors.primaryBlue, size: 20),
+              backgroundColor: AppColors.iconBgPurple,
+              child: const Icon(Icons.groups, color: AppColors.secondaryLavender, size: 20),
             ),
             const SizedBox(width: 10),
             Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  Row(
-                    children: [
-                      Container(width: 8, height: 8, decoration: const BoxDecoration(color: AppColors.success, shape: BoxShape.circle)),
-                      const SizedBox(width: 4),
-                      Text('В сети', style: AppTextStyles.caption.copyWith(color: AppColors.success, fontSize: 11)),
-                    ],
-                  ),
-                ],
+              child: Text(
+                title,
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
               ),
             ),
           ],
         ),
       ),
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: Column(
           children: [
             Expanded(
-              child: BlocBuilder<MessengerBloc, MessengerState>(
+              child: BlocBuilder<ChatCubit, ChatState>(
+                bloc: _cubit,
                 builder: (context, state) {
-                  if (state is MessengerLoading) {
-                    return const LoadingShimmer();
-                  }
-                  if (state is MessagesLoaded && state.roomId == widget.roomId) {
-                    return _buildMessagesList(state.messages);
-                  }
-                  return _buildMessagesList(const []);
+                  final messages = state.messages;
+                  if (messages != null) return _buildMessagesList(messages);
+                  if (state.error != null) return _buildError(state.error!);
+                  return const LoadingShimmer();
                 },
               ),
             ),
             _buildInputArea(),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildError(String message) {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(Icons.error_outline, size: 48, color: AppColors.error),
+          const SizedBox(height: 12),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Text(message, textAlign: TextAlign.center, style: AppTextStyles.bodyMedium),
+          ),
+          const SizedBox(height: 16),
+          ElevatedButton(onPressed: _cubit.load, child: const Text('Повторить')),
+        ],
       ),
     );
   }
@@ -191,14 +326,13 @@ class _ChatPageState extends State<ChatPage> {
       );
     }
 
+    // Reversed so the newest message stays at the bottom as history grows.
     return ListView.builder(
       controller: _scrollController,
+      reverse: true,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       itemCount: messages.length,
-      itemBuilder: (context, index) {
-        final msg = messages[index];
-        return _buildMessageBubble(msg);
-      },
+      itemBuilder: (context, index) => _buildMessageBubble(messages[messages.length - 1 - index]),
     );
   }
 
@@ -207,95 +341,147 @@ class _ChatPageState extends State<ChatPage> {
 
     return Align(
       alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          color: isMine ? AppColors.primaryBlue : Colors.white.withOpacity(0.9),
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(16),
-            topRight: const Radius.circular(16),
-            bottomLeft: Radius.circular(isMine ? 16 : 4),
-            bottomRight: Radius.circular(isMine ? 4 : 16),
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.04),
-              blurRadius: 8,
-              offset: const Offset(0, 2),
+      child: GestureDetector(
+        onLongPress: () {
+          HapticFeedback.selectionClick();
+          setState(() => _replyToText = msg.hasAttachment ? msg.attachmentName : msg.content);
+        },
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 4),
+          constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: isMine ? AppColors.primaryBlue : AppColors.cardBackground.withValues(alpha: 0.9),
+            borderRadius: BorderRadius.only(
+              topLeft: const Radius.circular(16),
+              topRight: const Radius.circular(16),
+              bottomLeft: Radius.circular(isMine ? 16 : 4),
+              bottomRight: Radius.circular(isMine ? 4 : 16),
             ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: isMine ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-          children: [
-            if (!isMine)
-              Text(
-                msg.senderName,
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: AppColors.primaryBlue),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.04),
+                blurRadius: 8,
+                offset: const Offset(0, 2),
               ),
-            if (msg.replyToContent != null) ...[
-              Container(
-                margin: const EdgeInsets.symmetric(vertical: 4),
-                padding: const EdgeInsets.all(6),
-                decoration: BoxDecoration(
-                  color: isMine ? Colors.white.withOpacity(0.2) : Colors.grey[100],
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border(left: BorderSide(color: isMine ? Colors.white : AppColors.primaryBlue, width: 3)),
+            ],
+          ),
+          child: Column(
+            crossAxisAlignment: isMine ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+            children: [
+              if (!isMine && msg.senderName.isNotEmpty)
+                Text(
+                  msg.senderName,
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: AppColors.primaryBlue),
                 ),
-                child: Text(
-                  msg.replyToContent!,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: isMine ? Colors.white70 : AppColors.textSecondary,
+              if (msg.replyToContent != null) ...[
+                Container(
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  padding: const EdgeInsets.all(6),
+                  decoration: BoxDecoration(
+                    color: isMine ? Colors.white.withValues(alpha: 0.2) : AppColors.neutral100,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border(left: BorderSide(color: isMine ? Colors.white : AppColors.primaryBlue, width: 3)),
                   ),
+                  child: Text(
+                    msg.replyToContent!,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: isMine ? Colors.white70 : AppColors.textSecondary,
+                    ),
+                  ),
+                ),
+              ],
+              if (msg.hasAttachment)
+                _buildAttachment(msg)
+              else
+                Text(
+                  msg.content,
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: isMine ? Colors.white : AppColors.textPrimary,
+                  ),
+                ),
+              const SizedBox(height: 4),
+              Text(
+                Formatters.formatTime(msg.timestamp),
+                style: TextStyle(
+                  fontSize: 10,
+                  color: isMine ? Colors.white70 : AppColors.textTertiary,
                 ),
               ),
             ],
-            Text(
-              msg.content,
-              style: TextStyle(
-                fontSize: 14,
-                color: isMine ? Colors.white : AppColors.textPrimary,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  Formatters.formatTime(msg.timestamp),
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: isMine ? Colors.white70 : AppColors.textTertiary,
-                  ),
-                ),
-                if (isMine) ...[
-                  const SizedBox(width: 4),
-                  Icon(
-                    msg.isRead ? Icons.done_all : Icons.done,
-                    size: 14,
-                    color: msg.isRead ? Colors.lightBlueAccent : Colors.white70,
-                  ),
-                ],
-              ],
-            ),
-          ],
+          ),
         ),
       ),
     );
   }
 
+  Widget _buildAttachment(MessageModel msg) {
+    final isMine = msg.isMine;
+    final textColor = isMine ? Colors.white : AppColors.textPrimary;
+
+    final fileTile = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(msg.isImage ? Icons.image : Icons.insert_drive_file, color: isMine ? Colors.white : AppColors.primaryBlue, size: 22),
+        const SizedBox(width: 8),
+        Flexible(
+          child: Text(
+            msg.attachmentName,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: textColor, decoration: TextDecoration.underline, decorationColor: textColor),
+          ),
+        ),
+      ],
+    );
+
+    return InkWell(
+      onTap: () => openServerFile(context, msg.attachmentUrl!, fileName: msg.attachmentName),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: msg.isImage
+            ? ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Image.network(
+                  getIt<ApiClient>().resolveFileUrl(msg.attachmentUrl!),
+                  width: 200,
+                  height: 200,
+                  cacheWidth: 600,
+                  fit: BoxFit.cover,
+                  loadingBuilder: (_, child, progress) => progress == null
+                      ? child
+                      : SizedBox(
+                          width: 200,
+                          height: 200,
+                          child: Center(
+                            child: SizedBox(
+                              width: 22,
+                              height: 22,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: isMine ? Colors.white : AppColors.primaryBlue),
+                            ),
+                          ),
+                        ),
+                  // A preview that cannot be decoded still opens as a file.
+                  errorBuilder: (_, __, ___) => fileTile,
+                ),
+              )
+            : fileTile,
+      ),
+    );
+  }
+
   Widget _buildInputArea() {
+    final uploading = _uploadingName != null;
     return Container(
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: AppColors.cardBackground,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.05),
+            color: Colors.black.withValues(alpha: 0.05),
             blurRadius: 10,
             offset: const Offset(0, -2),
           ),
@@ -305,6 +491,40 @@ class _ChatPageState extends State<ChatPage> {
         top: false,
         child: Column(
           children: [
+            if (uploading)
+              Container(
+                padding: const EdgeInsets.fromLTRB(16, 8, 8, 4),
+                color: AppColors.background,
+                child: Column(
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _uploadProgress >= 1
+                                ? 'Отправка «$_uploadingName»…'
+                                : 'Загрузка «$_uploadingName»… ${(_uploadProgress * 100).round()}%',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: AppTextStyles.caption,
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close, size: 16),
+                          tooltip: 'Отменить загрузку',
+                          onPressed: () => _uploadCancel?.cancel(),
+                        ),
+                      ],
+                    ),
+                    LinearProgressIndicator(
+                      value: _uploadProgress,
+                      minHeight: 3,
+                      backgroundColor: AppColors.neutral200,
+                      valueColor: const AlwaysStoppedAnimation<Color>(AppColors.primaryBlue),
+                    ),
+                  ],
+                ),
+              ),
             if (_replyToText != null)
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
@@ -334,11 +554,14 @@ class _ChatPageState extends State<ChatPage> {
                 children: [
                   IconButton(
                     icon: const Icon(Icons.add_circle_outline, color: AppColors.primaryBlue),
-                    onPressed: _showAttachMenu,
+                    onPressed: uploading ? null : _showAttachMenu,
                   ),
                   Expanded(
                     child: TextField(
                       controller: _messageController,
+                      minLines: 1,
+                      maxLines: 5,
+                      textCapitalization: TextCapitalization.sentences,
                       decoration: InputDecoration(
                         hintText: 'Сообщение...',
                         hintStyle: TextStyle(color: AppColors.textTertiary, fontSize: 14),
@@ -356,8 +579,10 @@ class _ChatPageState extends State<ChatPage> {
                       shape: BoxShape.circle,
                     ),
                     child: IconButton(
-                      icon: const Icon(Icons.send, color: Colors.white, size: 20),
-                      onPressed: _sendMessage,
+                      icon: _sending
+                          ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                          : const Icon(Icons.send, color: Colors.white, size: 20),
+                      onPressed: _sending ? null : _sendMessage,
                     ),
                   ),
                 ],

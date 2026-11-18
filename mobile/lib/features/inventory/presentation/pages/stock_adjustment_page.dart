@@ -1,17 +1,22 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:go_router/go_router.dart';
+import '../../../../core/di/injection.dart';
+import '../../../../core/network/api_error.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/widgets/app_button.dart';
 import '../../../../core/widgets/glass_card.dart';
 import '../bloc/inventory_bloc.dart';
 import '../../data/models/product_model.dart';
+import '../../data/repositories/inventory_repository.dart';
+import '../widgets/product_picker_sheet.dart';
 
+/// Manual stock change. Opened for a fixed [product] from its card,
+/// or without one from the list, where the user picks the product first.
 class StockAdjustmentPage extends StatefulWidget {
-  final String? initialProductId;
+  final ProductModel? product;
 
-  const StockAdjustmentPage({super.key, this.initialProductId});
+  const StockAdjustmentPage({super.key, this.product});
 
   @override
   State<StockAdjustmentPage> createState() => _StockAdjustmentPageState();
@@ -22,13 +27,14 @@ class _StockAdjustmentPageState extends State<StockAdjustmentPage> {
   final _qtyController = TextEditingController();
   final _reasonController = TextEditingController();
 
-  String _adjustmentType = 'adjustment'; // 'in', 'out', 'adjustment'
-  String? _selectedProductId;
+  String _adjustmentType = 'in'; // 'in', 'out', 'set'
+  ProductModel? _product;
+  bool _saving = false;
 
   @override
   void initState() {
     super.initState();
-    _selectedProductId = widget.initialProductId;
+    _product = widget.product;
   }
 
   @override
@@ -38,25 +44,98 @@ class _StockAdjustmentPageState extends State<StockAdjustmentPage> {
     super.dispose();
   }
 
-  void _submitAdjustment() {
-    if (!_formKey.currentState!.validate()) return;
-    if (_selectedProductId == null || _selectedProductId!.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Выберите товар'), backgroundColor: AppColors.error),
-      );
+  Future<void> _pickProduct() async {
+    final picked = await showProductPicker(context);
+    if (picked != null && mounted) setState(() => _product = picked);
+  }
+
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), backgroundColor: AppColors.error),
+    );
+  }
+
+  String? _validateQuantity(String? v) {
+    final qty = parseAmount(v ?? '');
+    if (qty == null) return 'Укажите количество';
+    if (qty < 0) return 'Не может быть меньше 0';
+    if (_adjustmentType != 'set' && qty == 0) return 'Количество должно быть больше 0';
+    return null;
+  }
+
+  Future<void> _submitAdjustment() async {
+    if (_saving) return;
+    final product = _product;
+    if (product == null) {
+      _showError('Выберите товар');
       return;
     }
+    if (!_formKey.currentState!.validate()) return;
 
-    final qty = double.tryParse(_qtyController.text) ?? 0.0;
-    final data = {
-      'productId': _selectedProductId,
-      'type': _adjustmentType,
-      'quantity': qty,
-      'notes': _reasonController.text.trim(),
-    };
+    setState(() => _saving = true);
+    try {
+      final updated = await getIt<InventoryRepository>().adjustStock(
+        productId: product.id,
+        type: _adjustmentType,
+        quantity: parseAmount(_qtyController.text) ?? 0,
+        notes: _reasonController.text,
+      );
+      if (!mounted) return;
+      context.read<InventoryBloc>().add(const RefreshProductsEvent());
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Остаток обновлён: ${formatQty(updated.currentStock)} ${updated.unit}'),
+          backgroundColor: AppColors.success,
+        ),
+      );
+      Navigator.of(context).pop(true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      _showError(apiErrorMessage(e, fallback: 'Не удалось выполнить корректировку остатка'));
+    }
+  }
 
-    context.read<InventoryBloc>().add(AdjustStockEvent(data));
-    context.pop();
+  Widget _buildProductField() {
+    final product = _product;
+    final fixed = widget.product != null;
+    return InkWell(
+      borderRadius: BorderRadius.circular(14),
+      onTap: fixed || _saving ? null : _pickProduct,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: AppColors.cardBackground,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: AppColors.cardBorder),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: product == null
+                  ? Text('Выберите товар', style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textTertiary))
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          product.name,
+                          style: TextStyle(fontWeight: FontWeight.w600, color: AppColors.textPrimary),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          'Арт: ${product.sku}  •  Остаток: ${formatQty(product.currentStock)} ${product.unit}',
+                          style: AppTextStyles.caption,
+                        ),
+                      ],
+                    ),
+            ),
+            if (!fixed) Icon(Icons.keyboard_arrow_down, color: AppColors.textSecondary),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -68,12 +147,12 @@ class _StockAdjustmentPageState extends State<StockAdjustmentPage> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
-          onPressed: () => context.pop(),
+          icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+          onPressed: () => Navigator.of(context).pop(),
         ),
       ),
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(16.0),
           child: Form(
@@ -89,48 +168,7 @@ class _StockAdjustmentPageState extends State<StockAdjustmentPage> {
                     children: [
                       Text('Товар для корректировки', style: AppTextStyles.labelMedium),
                       const SizedBox(height: 8),
-                      BlocBuilder<InventoryBloc, InventoryState>(
-                        builder: (context, state) {
-                          List<ProductModel> products = [];
-                          if (state is InventoryLoaded) {
-                            products = state.products;
-                          }
-                          if (products.isEmpty) {
-                            return TextFormField(
-                              initialValue: _selectedProductId,
-                              decoration: InputDecoration(
-                                hintText: 'ID или артикул товара',
-                                filled: true,
-                                fillColor: Colors.white,
-                                border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
-                              ),
-                              onChanged: (v) => _selectedProductId = v,
-                              validator: (v) => (v == null || v.isEmpty) ? 'Укажите товар' : null,
-                            );
-                          }
-                          return Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 14),
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(14),
-                              border: Border.all(color: AppColors.cardBorder),
-                            ),
-                            child: DropdownButtonHideUnderline(
-                              child: DropdownButton<String>(
-                                value: _selectedProductId ?? (products.isNotEmpty ? products.first.id : null),
-                                isExpanded: true,
-                                items: products.map((p) {
-                                  return DropdownMenuItem(
-                                    value: p.id,
-                                    child: Text('${p.name} (Остаток: ${p.currentStock.toStringAsFixed(0)})'),
-                                  );
-                                }).toList(),
-                                onChanged: (v) => setState(() => _selectedProductId = v),
-                              ),
-                            ),
-                          );
-                        },
-                      ),
+                      _buildProductField(),
                       const SizedBox(height: 20),
 
                       Text('Тип операции', style: AppTextStyles.labelMedium),
@@ -141,24 +179,27 @@ class _StockAdjustmentPageState extends State<StockAdjustmentPage> {
                           const SizedBox(width: 8),
                           _buildTypeRadio('out', 'Списание', AppColors.error),
                           const SizedBox(width: 8),
-                          _buildTypeRadio('adjustment', 'Коррекция', AppColors.primaryBlue),
+                          _buildTypeRadio('set', 'Коррекция', AppColors.primaryBlue),
                         ],
                       ),
                       const SizedBox(height: 20),
 
-                      Text('Количество', style: AppTextStyles.labelMedium),
+                      Text(
+                        _adjustmentType == 'set' ? 'Фактический остаток на складе' : 'Количество',
+                        style: AppTextStyles.labelMedium,
+                      ),
                       const SizedBox(height: 8),
                       TextFormField(
                         controller: _qtyController,
-                        keyboardType: TextInputType.number,
+                        keyboardType: const TextInputType.numberWithOptions(decimal: true),
                         style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
                         decoration: InputDecoration(
                           hintText: '0',
                           filled: true,
-                          fillColor: Colors.white,
+                          fillColor: AppColors.cardBackground,
                           border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
                         ),
-                        validator: (v) => (v == null || v.isEmpty) ? 'Укажите количество' : null,
+                        validator: _validateQuantity,
                       ),
                       const SizedBox(height: 20),
 
@@ -170,10 +211,10 @@ class _StockAdjustmentPageState extends State<StockAdjustmentPage> {
                         decoration: InputDecoration(
                           hintText: 'Инвентаризация, брак, пересчёт...',
                           filled: true,
-                          fillColor: Colors.white,
+                          fillColor: AppColors.cardBackground,
                           border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
                         ),
-                        validator: (v) => (v == null || v.isEmpty) ? 'Укажите причину' : null,
+                        validator: (v) => (v == null || v.trim().isEmpty) ? 'Укажите причину' : null,
                       ),
                     ],
                   ),
@@ -181,6 +222,7 @@ class _StockAdjustmentPageState extends State<StockAdjustmentPage> {
                 const SizedBox(height: 24),
                 AppButton(
                   label: 'Применить корректировку',
+                  isLoading: _saving,
                   onPressed: _submitAdjustment,
                 ),
               ],
@@ -195,11 +237,11 @@ class _StockAdjustmentPageState extends State<StockAdjustmentPage> {
     final isSelected = _adjustmentType == type;
     return Expanded(
       child: GestureDetector(
-        onTap: () => setState(() => _adjustmentType = type),
+        onTap: _saving ? null : () => setState(() => _adjustmentType = type),
         child: Container(
           padding: const EdgeInsets.symmetric(vertical: 10),
           decoration: BoxDecoration(
-            color: isSelected ? color.withOpacity(0.15) : Colors.white,
+            color: isSelected ? color.withOpacity(0.15) : AppColors.cardBackground,
             borderRadius: BorderRadius.circular(12),
             border: Border.all(color: isSelected ? color : AppColors.cardBorder, width: isSelected ? 2 : 1),
           ),

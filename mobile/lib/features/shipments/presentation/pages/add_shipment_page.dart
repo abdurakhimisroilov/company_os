@@ -1,13 +1,30 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
-import 'package:go_router/go_router.dart';
+import 'package:intl/intl.dart';
+import '../../../../core/di/injection.dart';
+import '../../../../core/network/api_error.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/utils/formatters.dart';
 import '../../../../core/widgets/app_button.dart';
 import '../../../../core/widgets/glass_card.dart';
+import '../../../inventory/data/models/product_model.dart';
+import '../../../inventory/presentation/bloc/inventory_bloc.dart';
+import '../../../inventory/presentation/widgets/product_picker_sheet.dart';
+import '../../../suppliers/presentation/bloc/suppliers_bloc.dart';
+import '../../data/repositories/shipments_repository.dart';
 import '../bloc/shipments_bloc.dart';
-import '../../data/models/shipment_model.dart';
+import '../widgets/supplier_picker_sheet.dart';
+
+class _ShipmentLine {
+  final ProductModel product;
+  final double quantity;
+  final double unitPrice;
+
+  const _ShipmentLine({required this.product, required this.quantity, required this.unitPrice});
+
+  double get total => (quantity * unitPrice * 100).round() / 100;
+}
 
 class AddShipmentPage extends StatefulWidget {
   const AddShipmentPage({super.key});
@@ -18,29 +35,31 @@ class AddShipmentPage extends StatefulWidget {
 
 class _AddShipmentPageState extends State<AddShipmentPage> {
   int _currentStep = 0;
+  bool _saving = false;
 
-  // Step 1: Info
-  final _supplierController = TextEditingController();
+  // Step 1: Info. Supplier is an existing record (id) or the name of a new one.
+  String? _supplierId;
+  String? _supplierName;
   final _invoiceController = TextEditingController();
-  final _employeeController = TextEditingController();
   DateTime _expectedDate = DateTime.now().add(const Duration(days: 3));
 
+  /// True: the goods are already here and go to stock on save.
+  /// False: the shipment is saved as expected and received later from its card.
+  bool _receiveNow = false;
+
   // Step 2: Items
-  final List<ShipmentItemModel> _items = [];
-  final _productNameController = TextEditingController();
+  final List<_ShipmentLine> _items = [];
+  ProductModel? _selectedProduct;
   final _qtyController = TextEditingController();
   final _priceController = TextEditingController();
 
   // Step 3: Costs
-  final _transportCostController = TextEditingController(text: '0');
-  final _customsCostController = TextEditingController(text: '0');
+  final _transportCostController = TextEditingController();
+  final _customsCostController = TextEditingController();
 
   @override
   void dispose() {
-    _supplierController.dispose();
     _invoiceController.dispose();
-    _employeeController.dispose();
-    _productNameController.dispose();
     _qtyController.dispose();
     _priceController.dispose();
     _transportCostController.dispose();
@@ -48,65 +67,178 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
     super.dispose();
   }
 
-  void _addItem() {
-    final name = _productNameController.text.trim();
-    final qty = double.tryParse(_qtyController.text) ?? 0;
-    final price = double.tryParse(_priceController.text.replaceAll(' ', '')) ?? 0;
+  void _showError(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), backgroundColor: AppColors.error),
+    );
+  }
 
-    if (name.isEmpty || qty <= 0 || price <= 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Заполните название, количество и цену'), backgroundColor: AppColors.error),
-      );
+  Future<void> _pickSupplier() async {
+    final result = await showSupplierPicker(context);
+    if (result == null || !mounted) return;
+    setState(() {
+      _supplierId = result.item?.id;
+      _supplierName = result.item?.name ?? result.newName;
+    });
+  }
+
+  Future<void> _pickProduct() async {
+    final product = await showProductPicker(context, showSellingPrice: false);
+    if (product == null || !mounted) return;
+    setState(() {
+      _selectedProduct = product;
+      _priceController.text = formatQty(product.purchasePrice);
+    });
+  }
+
+  void _addItem() {
+    final product = _selectedProduct;
+    if (product == null) {
+      _showError('Выберите товар');
+      return;
+    }
+    final qty = parseAmount(_qtyController.text);
+    final price = parseAmount(_priceController.text);
+    if (qty == null || qty <= 0) {
+      _showError('Укажите количество больше 0');
+      return;
+    }
+    if (price == null || price < 0) {
+      _showError('Укажите цену за единицу');
       return;
     }
 
     setState(() {
-      _items.add(ShipmentItemModel(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
-        productId: 'prod_${_items.length + 1}',
-        productName: name,
-        quantity: qty,
-        unitPrice: price,
-        totalPrice: qty * price,
-      ));
-      _productNameController.clear();
+      final sameIndex = _items.indexWhere((it) => it.product.id == product.id && it.unitPrice == price);
+      if (sameIndex >= 0) {
+        final existing = _items[sameIndex];
+        _items[sameIndex] = _ShipmentLine(product: product, quantity: existing.quantity + qty, unitPrice: price);
+      } else {
+        _items.add(_ShipmentLine(product: product, quantity: qty, unitPrice: price));
+      }
+      _selectedProduct = null;
       _qtyController.clear();
       _priceController.clear();
     });
   }
 
-  double get _itemsTotal => _items.fold(0.0, (sum, it) => sum + it.totalPrice);
-  double get _transportCost => double.tryParse(_transportCostController.text.replaceAll(' ', '')) ?? 0.0;
-  double get _customsCost => double.tryParse(_customsCostController.text.replaceAll(' ', '')) ?? 0.0;
+  double get _itemsTotal => _items.fold(0.0, (sum, it) => sum + it.total);
+  double get _transportCost => parseAmount(_transportCostController.text) ?? 0.0;
+  double get _customsCost => parseAmount(_customsCostController.text) ?? 0.0;
   double get _grandTotal => _itemsTotal + _transportCost + _customsCost;
 
-  void _finishShipment() {
-    if (_supplierController.text.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Укажите поставщика в шаге 1'), backgroundColor: AppColors.error),
-      );
-      return;
+  bool _costIsValid(TextEditingController controller) {
+    final text = controller.text.trim();
+    if (text.isEmpty) return true;
+    final value = parseAmount(text);
+    return value != null && value >= 0;
+  }
+
+  /// Checks the step the user is leaving; false keeps them on it.
+  bool _validateStep(int step) {
+    if (step == 0 && _supplierName == null) {
+      _showError('Выберите поставщика');
+      return false;
     }
-    if (_items.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Добавьте хотя бы один товар в шаге 2'), backgroundColor: AppColors.error),
-      );
-      return;
+    if (step == 1 && _items.isEmpty) {
+      _showError('Добавьте хотя бы один товар');
+      return false;
+    }
+    if (step == 2 && (!_costIsValid(_transportCostController) || !_costIsValid(_customsCostController))) {
+      _showError('Укажите корректную сумму расходов');
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _finishShipment() async {
+    if (_saving) return;
+    for (var step = 0; step < 3; step++) {
+      if (!_validateStep(step)) {
+        setState(() => _currentStep = step);
+        return;
+      }
     }
 
-    final data = {
-      'supplierName': _supplierController.text.trim(),
-      'invoiceNumber': _invoiceController.text.trim(),
-      'responsibleEmployee': _employeeController.text.trim(),
-      'expectedDate': _expectedDate.toIso8601String(),
-      'items': _items.map((it) => it.toJson()).toList(),
-      'additionalCosts': _transportCost + _customsCost,
-      'totalCost': _grandTotal,
-      'status': 'pending',
+    final invoice = _invoiceController.text.trim();
+    final additionalCosts = _transportCost + _customsCost;
+    final data = <String, dynamic>{
+      if (_supplierId != null) 'supplierId': _supplierId else 'supplierName': _supplierName,
+      if (invoice.isNotEmpty) 'invoiceNumber': invoice,
+      'items': _items
+          .map((it) => {'productId': it.product.id, 'quantity': it.quantity, 'unitPrice': it.unitPrice})
+          .toList(),
+      if (additionalCosts > 0) 'additionalCosts': additionalCosts,
+      if (!_receiveNow) ...{
+        'status': 'pending',
+        'expectedDate': DateFormat('yyyy-MM-dd').format(_expectedDate),
+      },
     };
 
-    context.read<ShipmentsBloc>().add(CreateShipmentEvent(data));
-    context.pop();
+    setState(() => _saving = true);
+    try {
+      await getIt<ShipmentsRepository>().createShipment(data);
+      if (!mounted) return;
+      context.read<ShipmentsBloc>().add(const RefreshShipmentsEvent());
+      // A new supplier may have been created; received goods change stock and the supplier's balance.
+      context.read<SuppliersBloc>().add(const LoadSuppliersEvent());
+      if (_receiveNow) context.read<InventoryBloc>().add(const RefreshProductsEvent());
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(_receiveNow ? 'Поставка принята на склад' : 'Поставка успешно создана'),
+          backgroundColor: AppColors.success,
+        ),
+      );
+      Navigator.of(context).pop(true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      _showError(apiErrorMessage(e, fallback: 'Не удалось создать поставку'));
+    }
+  }
+
+  Widget _pickerField({
+    required String placeholder,
+    required VoidCallback onTap,
+    String? title,
+    String? subtitle,
+  }) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: _saving ? null : onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: AppColors.cardBackground,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: AppColors.cardBorder),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: title == null
+                  ? Text(placeholder, style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textTertiary))
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          style: TextStyle(fontWeight: FontWeight.w600, color: AppColors.textPrimary),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        if (subtitle != null) ...[
+                          const SizedBox(height: 2),
+                          Text(subtitle, style: AppTextStyles.caption),
+                        ],
+                      ],
+                    ),
+            ),
+            Icon(Icons.keyboard_arrow_down, color: AppColors.textSecondary),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -118,31 +250,45 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
-          onPressed: () => context.pop(),
+          icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+          onPressed: () => Navigator.of(context).pop(),
         ),
       ),
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: Theme(
           data: Theme.of(context).copyWith(
-            colorScheme: const ColorScheme.light(primary: AppColors.primaryBlue),
+            colorScheme: AppColors.isDark
+                ? Theme.of(context).colorScheme.copyWith(primary: AppColors.primaryBlue)
+                : const ColorScheme.light(primary: AppColors.primaryBlue),
           ),
           child: Stepper(
             currentStep: _currentStep,
             type: StepperType.horizontal,
+            onStepTapped: _saving
+                ? null
+                : (step) {
+                    // Going forward must not skip the checks of the steps in between.
+                    for (var i = _currentStep; i < step; i++) {
+                      if (!_validateStep(i)) return;
+                    }
+                    setState(() => _currentStep = step);
+                  },
             onStepContinue: () {
+              if (_saving) return;
               if (_currentStep < 3) {
+                if (!_validateStep(_currentStep)) return;
                 setState(() => _currentStep += 1);
               } else {
                 _finishShipment();
               }
             },
             onStepCancel: () {
+              if (_saving) return;
               if (_currentStep > 0) {
                 setState(() => _currentStep -= 1);
               } else {
-                context.pop();
+                Navigator.of(context).pop();
               }
             },
             controlsBuilder: (context, details) {
@@ -153,13 +299,14 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
                     Expanded(
                       child: AppButton(
                         label: _currentStep == 3 ? 'Подтвердить поставку' : 'Далее',
+                        isLoading: _saving,
                         onPressed: details.onStepContinue,
                       ),
                     ),
                     if (_currentStep > 0) ...[
                       const SizedBox(width: 12),
                       OutlinedButton(
-                        onPressed: details.onStepCancel,
+                        onPressed: _saving ? null : details.onStepCancel,
                         style: OutlinedButton.styleFrom(
                           padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
@@ -208,41 +355,54 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
         children: [
           Text('Поставщик *', style: AppTextStyles.labelMedium),
           const SizedBox(height: 6),
-          TextField(
-            controller: _supplierController,
-            decoration: _inputDeco('ООО "ТоргСнаб"'),
+          _pickerField(
+            placeholder: 'Выберите или введите поставщика',
+            title: _supplierName,
+            subtitle: _supplierName != null && _supplierId == null ? 'Новый поставщик' : null,
+            onTap: _pickSupplier,
           ),
           const SizedBox(height: 14),
           Text('Номер накладной / инвойса', style: AppTextStyles.labelMedium),
           const SizedBox(height: 6),
           TextField(
             controller: _invoiceController,
-            decoration: _inputDeco('INV-2026-091'),
+            decoration: _inputDeco('Если не указать, номер присвоится автоматически'),
           ),
-          const SizedBox(height: 14),
-          Text('Ответственный сотрудник', style: AppTextStyles.labelMedium),
-          const SizedBox(height: 6),
-          TextField(
-            controller: _employeeController,
-            decoration: _inputDeco('ФИО кладовщика / менеджера'),
+          const SizedBox(height: 8),
+          SwitchListTile(
+            title: const Text('Товар уже получен', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+            subtitle: Text(
+              _receiveNow
+                  ? 'Товары сразу будут оприходованы на склад'
+                  : 'Поставка сохранится как ожидаемая, приёмка — из её карточки',
+              style: AppTextStyles.caption,
+            ),
+            value: _receiveNow,
+            contentPadding: EdgeInsets.zero,
+            activeThumbColor: AppColors.primaryBlue,
+            onChanged: _saving ? null : (v) => setState(() => _receiveNow = v),
           ),
-          const SizedBox(height: 14),
+          if (!_receiveNow) ...[
+          const SizedBox(height: 8),
           Text('Ожидаемая дата прибытия', style: AppTextStyles.labelMedium),
           const SizedBox(height: 6),
           InkWell(
-            onTap: () async {
+            onTap: _saving
+                ? null
+                : () async {
+              final today = DateTime.now();
               final d = await showDatePicker(
                 context: context,
                 initialDate: _expectedDate,
-                firstDate: DateTime.now(),
-                lastDate: DateTime(2030),
+                firstDate: DateTime(today.year, today.month, today.day),
+                lastDate: DateTime(today.year + 5, 12, 31),
               );
-              if (d != null) setState(() => _expectedDate = d);
+              if (d != null && mounted) setState(() => _expectedDate = d);
             },
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: AppColors.cardBackground,
                 borderRadius: BorderRadius.circular(12),
                 border: Border.all(color: AppColors.cardBorder),
               ),
@@ -255,6 +415,7 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
               ),
             ),
           ),
+          ],
         ],
       ),
     );
@@ -271,9 +432,13 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
             children: [
               Text('Добавить товар в накладную', style: AppTextStyles.titleMedium),
               const SizedBox(height: 10),
-              TextField(
-                controller: _productNameController,
-                decoration: _inputDeco('Название товара или артикул'),
+              _pickerField(
+                placeholder: 'Выберите товар',
+                title: _selectedProduct?.name,
+                subtitle: _selectedProduct == null
+                    ? null
+                    : 'Арт: ${_selectedProduct!.sku}  •  Остаток: ${formatQty(_selectedProduct!.currentStock)} ${_selectedProduct!.unit}',
+                onTap: _pickProduct,
               ),
               const SizedBox(height: 10),
               Row(
@@ -281,7 +446,7 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
                   Expanded(
                     child: TextField(
                       controller: _qtyController,
-                      keyboardType: TextInputType.number,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
                       decoration: _inputDeco('Кол-во'),
                     ),
                   ),
@@ -289,7 +454,7 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
                   Expanded(
                     child: TextField(
                       controller: _priceController,
-                      keyboardType: TextInputType.number,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
                       decoration: _inputDeco('Цена за ед.'),
                     ),
                   ),
@@ -297,7 +462,7 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
               ),
               const SizedBox(height: 12),
               ElevatedButton.icon(
-                onPressed: _addItem,
+                onPressed: _saving ? null : _addItem,
                 icon: const Icon(Icons.add),
                 label: const Text('Добавить позицию'),
                 style: ElevatedButton.styleFrom(
@@ -322,15 +487,15 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(it.productName, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                          Text('${it.quantity.toStringAsFixed(0)} шт × ${Formatters.formatUzs(it.unitPrice)}', style: AppTextStyles.caption),
+                          Text(it.product.name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                          Text('${formatQty(it.quantity)} ${it.product.unit} × ${Formatters.formatUzs(it.unitPrice)}', style: AppTextStyles.caption),
                         ],
                       ),
                     ),
-                    Text(Formatters.formatUzs(it.totalPrice), style: const TextStyle(fontWeight: FontWeight.bold)),
+                    Text(Formatters.formatUzs(it.total), style: const TextStyle(fontWeight: FontWeight.bold)),
                     IconButton(
                       icon: const Icon(Icons.delete_outline, color: AppColors.error, size: 20),
-                      onPressed: () => setState(() => _items.remove(it)),
+                      onPressed: _saving ? null : () => setState(() => _items.remove(it)),
                     ),
                   ],
                 ),
@@ -349,20 +514,20 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
         children: [
           Text('Дополнительные накладные расходы', style: AppTextStyles.titleMedium),
           const SizedBox(height: 14),
-          Text('Транспортные расходы / Доставка (UZS)', style: AppTextStyles.labelMedium),
+          Text('Транспортные расходы / Доставка', style: AppTextStyles.labelMedium),
           const SizedBox(height: 6),
           TextField(
             controller: _transportCostController,
-            keyboardType: TextInputType.number,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
             decoration: _inputDeco('0 сум'),
             onChanged: (_) => setState(() {}),
           ),
           const SizedBox(height: 14),
-          Text('Таможенные пошлины и сборы (UZS)', style: AppTextStyles.labelMedium),
+          Text('Таможенные пошлины и сборы', style: AppTextStyles.labelMedium),
           const SizedBox(height: 6),
           TextField(
             controller: _customsCostController,
-            keyboardType: TextInputType.number,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
             decoration: _inputDeco('0 сум'),
             onChanged: (_) => setState(() {}),
           ),
@@ -380,10 +545,13 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
         children: [
           Text('Сводка поставки', style: AppTextStyles.titleMedium),
           const Divider(height: 20),
-          _summaryRow('Поставщик:', _supplierController.text.isNotEmpty ? _supplierController.text : 'Не указан'),
-          _summaryRow('Инвойс:', _invoiceController.text.isNotEmpty ? _invoiceController.text : 'б/н'),
-          _summaryRow('Дата прибытия:', Formatters.formatDate(_expectedDate)),
-          _summaryRow('Позиций:', '${_items.length} шт (${_items.fold(0, (s, i) => s + i.quantity.toInt())} ед.)'),
+          _summaryRow('Поставщик:', _supplierName ?? 'Не указан'),
+          _summaryRow('Инвойс:', _invoiceController.text.trim().isNotEmpty ? _invoiceController.text.trim() : 'Автоматически'),
+          if (_receiveNow)
+            _summaryRow('Приёмка:', 'Сразу на склад')
+          else
+            _summaryRow('Дата прибытия:', Formatters.formatDate(_expectedDate)),
+          _summaryRow('Позиций:', '${_items.length}'),
           _summaryRow('Сумма товаров:', Formatters.formatUzs(_itemsTotal)),
           _summaryRow('Доп. расходы:', Formatters.formatUzs(_transportCost + _customsCost)),
           const Divider(height: 20),
@@ -409,7 +577,10 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           Text(label, style: AppTextStyles.caption),
-          Text(value, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+          const SizedBox(width: 12),
+          Flexible(
+            child: Text(value, textAlign: TextAlign.right, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+          ),
         ],
       ),
     );
@@ -419,7 +590,7 @@ class _AddShipmentPageState extends State<AddShipmentPage> {
     return InputDecoration(
       hintText: hint,
       filled: true,
-      fillColor: Colors.white,
+      fillColor: AppColors.cardBackground,
       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: AppColors.cardBorder)),
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
     );

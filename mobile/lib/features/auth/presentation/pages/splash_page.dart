@@ -20,6 +20,7 @@ class _SplashPageState extends State<SplashPage> with SingleTickerProviderStateM
   late AnimationController _animController;
   late Animation<double> _scaleAnimation;
   late Animation<double> _fadeAnimation;
+  late Future<void> _logoShown;
 
   @override
   void initState() {
@@ -37,13 +38,12 @@ class _SplashPageState extends State<SplashPage> with SingleTickerProviderStateM
       CurvedAnimation(parent: _animController, curve: Curves.easeIn),
     );
 
-    _animController.forward();
+    _logoShown = _animController.forward().orCancel.catchError((_) {});
 
-    // Check auth status after brief splash animation
-    Future.delayed(const Duration(milliseconds: 1500), () {
-      if (mounted) {
-        context.read<AuthBloc>().add(CheckAuthStatus());
-      }
+    // The session check starts at once; the logo animation only has to finish
+    // before the app moves on.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) context.read<AuthBloc>().add(CheckAuthStatus());
     });
   }
 
@@ -60,6 +60,7 @@ class _SplashPageState extends State<SplashPage> with SingleTickerProviderStateM
         if (state is AuthAuthenticated) {
           final security = getIt<SecurityService>();
           final isPin = await security.isPinSet();
+          await _logoShown;
           if (context.mounted) {
             if (!isPin) {
               context.go(AppRoutes.pinSetup);
@@ -68,12 +69,13 @@ class _SplashPageState extends State<SplashPage> with SingleTickerProviderStateM
             }
           }
         } else if (state is AuthUnauthenticated || state is AuthError) {
-          context.go(AppRoutes.login);
+          await _logoShown;
+          if (context.mounted) context.go(AppRoutes.login);
         }
       },
       child: Scaffold(
         body: Container(
-          decoration: const BoxDecoration(
+          decoration: BoxDecoration(
             gradient: AppColors.backgroundGradient,
           ),
           child: Center(

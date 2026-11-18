@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/network/api_error.dart';
 import '../../data/models/task_model.dart';
 import '../../data/repositories/tasks_repository.dart';
 
@@ -11,40 +13,26 @@ abstract class TasksEvent extends Equatable {
 }
 
 class LoadTasksEvent extends TasksEvent {
-  final String filter; // 'all', 'my', 'created'
-  const LoadTasksEvent({this.filter = 'all'});
+  /// 'all', 'my' (assigned to the current user) or 'created' (set by the current user).
+  final String filter;
+
+  /// Needed for the 'created' filter.
+  final String currentUserId;
+
+  /// Keeps an already loaded list on screen while the request runs.
+  final bool silent;
+
+  /// Completed when the request settles (used by pull-to-refresh).
+  final Completer<void>? completer;
+
+  const LoadTasksEvent({this.filter = 'all', this.currentUserId = '', this.silent = false, this.completer});
   @override
-  List<Object?> get props => [filter];
+  List<Object?> get props => [filter, currentUserId, silent, completer];
 }
 
-class LoadTaskDetailEvent extends TasksEvent {
-  final String id;
-  const LoadTaskDetailEvent(this.id);
-  @override
-  List<Object?> get props => [id];
-}
-
-class CreateTaskEvent extends TasksEvent {
-  final Map<String, dynamic> data;
-  const CreateTaskEvent(this.data);
-  @override
-  List<Object?> get props => [data];
-}
-
-class UpdateTaskStatusEvent extends TasksEvent {
-  final String taskId;
-  final String status;
-  const UpdateTaskStatusEvent({required this.taskId, required this.status});
-  @override
-  List<Object?> get props => [taskId, status];
-}
-
-class AddTaskCommentEvent extends TasksEvent {
-  final String taskId;
-  final String comment;
-  const AddTaskCommentEvent({required this.taskId, required this.comment});
-  @override
-  List<Object?> get props => [taskId, comment];
+/// Repeats the last list request without hiding the list (after create/update/delete).
+class RefreshTasksEvent extends TasksEvent {
+  const RefreshTasksEvent();
 }
 
 // ─── States ─────────────────────────────────────────────────────────────────
@@ -61,23 +49,13 @@ class TasksLoading extends TasksState {}
 class TasksLoaded extends TasksState {
   final List<TaskModel> tasks;
   final String currentFilter;
-  const TasksLoaded({required this.tasks, this.currentFilter = 'all'});
-  @override
-  List<Object?> get props => [tasks, currentFilter];
-}
 
-class TaskDetailLoaded extends TasksState {
-  final TaskModel task;
-  const TaskDetailLoaded(this.task);
-  @override
-  List<Object?> get props => [task];
-}
+  /// Set when a background refresh failed; the previous list stays visible.
+  final String? refreshError;
 
-class TasksActionSuccess extends TasksState {
-  final String message;
-  const TasksActionSuccess(this.message);
+  const TasksLoaded({required this.tasks, this.currentFilter = 'all', this.refreshError});
   @override
-  List<Object?> get props => [message];
+  List<Object?> get props => [tasks, currentFilter, refreshError];
 }
 
 class TasksError extends TasksState {
@@ -87,66 +65,44 @@ class TasksError extends TasksState {
   List<Object?> get props => [message];
 }
 
-// ─── BLoC ───────────────────────────────────────────────────────────────────
+// ─── BLoC (task list only; the task card has its own TaskDetailCubit) ───────
 class TasksBloc extends Bloc<TasksEvent, TasksState> {
   final TasksRepository tasksRepository;
+  String _filter = 'all';
+  String _currentUserId = '';
+  int _requestSeq = 0;
 
   TasksBloc({required this.tasksRepository}) : super(TasksInitial()) {
     on<LoadTasksEvent>(_onLoadTasks);
-    on<LoadTaskDetailEvent>(_onLoadDetail);
-    on<CreateTaskEvent>(_onCreateTask);
-    on<UpdateTaskStatusEvent>(_onUpdateStatus);
-    on<AddTaskCommentEvent>(_onAddComment);
+    on<RefreshTasksEvent>(
+      (event, emit) => _onLoadTasks(LoadTasksEvent(filter: _filter, currentUserId: _currentUserId, silent: true), emit),
+    );
   }
 
   Future<void> _onLoadTasks(LoadTasksEvent event, Emitter<TasksState> emit) async {
-    emit(TasksLoading());
+    _filter = event.filter;
+    if (event.currentUserId.isNotEmpty) _currentUserId = event.currentUserId;
+    final seq = ++_requestSeq;
+    final previous = state;
+    final kept = event.silent && previous is TasksLoaded ? previous : null;
+    if (kept == null) emit(TasksLoading());
     try {
-      final tasks = await tasksRepository.getTasks(filter: event.filter);
-      emit(TasksLoaded(tasks: tasks, currentFilter: event.filter));
+      final tasks = await tasksRepository.getTasks(
+        mine: event.filter == 'my',
+        createdByMe: event.filter == 'created',
+      );
+      if (seq == _requestSeq) emit(TasksLoaded(tasks: tasks, currentFilter: event.filter));
     } catch (e) {
-      emit(TasksError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onLoadDetail(LoadTaskDetailEvent event, Emitter<TasksState> emit) async {
-    emit(TasksLoading());
-    try {
-      final task = await tasksRepository.getTaskById(event.id);
-      emit(TaskDetailLoaded(task));
-    } catch (e) {
-      emit(TasksError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onCreateTask(CreateTaskEvent event, Emitter<TasksState> emit) async {
-    emit(TasksLoading());
-    try {
-      await tasksRepository.createTask(event.data);
-      emit(const TasksActionSuccess('Задача успешно создана'));
-      add(const LoadTasksEvent());
-    } catch (e) {
-      emit(TasksError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onUpdateStatus(UpdateTaskStatusEvent event, Emitter<TasksState> emit) async {
-    try {
-      await tasksRepository.updateTaskStatus(event.taskId, event.status);
-      emit(const TasksActionSuccess('Статус задачи изменен'));
-      add(LoadTaskDetailEvent(event.taskId));
-    } catch (e) {
-      emit(TasksError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onAddComment(AddTaskCommentEvent event, Emitter<TasksState> emit) async {
-    try {
-      await tasksRepository.addComment(event.taskId, event.comment);
-      emit(const TasksActionSuccess('Комментарий добавлен'));
-      add(LoadTaskDetailEvent(event.taskId));
-    } catch (e) {
-      emit(TasksError(e.toString().replaceAll('Exception: ', '')));
+      if (seq == _requestSeq) {
+        final message = apiErrorMessage(e, fallback: 'Не удалось загрузить задания');
+        if (kept != null) {
+          emit(TasksLoaded(tasks: kept.tasks, currentFilter: kept.currentFilter, refreshError: message));
+        } else {
+          emit(TasksError(message));
+        }
+      }
+    } finally {
+      event.completer?.complete();
     }
   }
 }

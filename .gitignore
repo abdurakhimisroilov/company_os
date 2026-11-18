@@ -37,3 +37,10 @@ backend/.env
 .idea/
 .vscode/
 *.iml
+
+# Uploaded user files and local server data
+backend/uploads/
+backend/updates/
+
+# macOS
+.DS_Store

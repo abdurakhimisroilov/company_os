@@ -1,10 +1,13 @@
 import 'dart:io';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import '../network/api_client.dart';
 import '../network/api_endpoints.dart';
+import '../network/api_error.dart';
 import '../theme/app_colors.dart';
 import '../widgets/glass_card.dart';
 
@@ -40,7 +43,7 @@ class AppUpdateInfo {
       minSupportedVersion: json['minSupportedVersion'] is int
           ? json['minSupportedVersion'] as int
           : int.tryParse(json['minSupportedVersion']?.toString() ?? '1') ?? 1,
-      downloadUrl: json['downloadUrl']?.toString() ?? '',
+      downloadUrl: (json['downloadUrl']?.toString() ?? '').trim(),
       fileSize: json['fileSize'] is int
           ? json['fileSize'] as int
           : int.tryParse(json['fileSize']?.toString() ?? '0') ?? 0,
@@ -61,57 +64,34 @@ class AppUpdateService {
   static const MethodChannel _channel = MethodChannel('com.companyos.app/updater');
   static bool _hasAutoCheckedThisSession = false;
 
-  static const int currentCodeConstant = 3;
-  static const String currentNameConstant = '1.0.2';
-
   AppUpdateService({required this.apiClient});
 
-  /// Получить текущую установленную версию приложения из Android PackageManager
+  /// Installing an APK from our own server exists only on Android. On iOS
+  /// (and everywhere else) updates come from the store, so nothing here runs.
+  static bool get isSupported => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  /// Version of the installed build, as the platform reports it.
   Future<Map<String, dynamic>> getCurrentVersion() async {
-    try {
-      final res = await _channel.invokeMethod<Map<dynamic, dynamic>>('getAppVersion');
-      if (res != null) {
-        final nativeCode = (res['versionCode'] is int)
-            ? res['versionCode'] as int
-            : int.tryParse(res['versionCode']?.toString() ?? '0') ?? 0;
-        final nativeName = res['versionName']?.toString();
-
-        final effectiveCode = nativeCode > currentCodeConstant ? nativeCode : currentCodeConstant;
-        final effectiveName = (nativeName != null && nativeName != '1.0.0') ? nativeName : currentNameConstant;
-
-        return {
-          'versionName': effectiveName,
-          'versionCode': effectiveCode,
-        };
-      }
-    } catch (e) {
-      debugPrint('[AppUpdateService] Native getAppVersion error: $e');
-    }
-    return {'versionName': currentNameConstant, 'versionCode': currentCodeConstant};
+    final info = await PackageInfo.fromPlatform();
+    return {
+      'versionName': info.version,
+      'versionCode': int.tryParse(info.buildNumber) ?? 0,
+    };
   }
 
-  /// Проверить наличие обновления на сервере
+  /// Newer version published on the server, or null when this build is current.
+  /// Throws when the server could not be asked, so a failed check is never
+  /// reported as "up to date".
   Future<AppUpdateInfo?> checkForUpdate() async {
-    try {
-      final response = await apiClient.dio.get(ApiEndpoints.appVersion);
-      if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
-        final updateInfo = AppUpdateInfo.fromJson(response.data as Map<String, dynamic>);
-        final current = await getCurrentVersion();
-        final currentCode = current['versionCode'] as int;
-        final currentName = current['versionName'] as String;
-
-        // Если версия на сервере совпадает с текущей или меньше — обновление НЕ требуется
-        if (updateInfo.versionCode <= currentCode || updateInfo.versionName == currentName) {
-          debugPrint('[AppUpdateService] Already up to date: local v$currentName ($currentCode) >= remote v${updateInfo.versionName} (${updateInfo.versionCode})');
-          return null;
-        }
-
-        return updateInfo;
-      }
-    } catch (e) {
-      debugPrint('[AppUpdateService] checkForUpdate error: $e');
-    }
-    return null;
+    if (!isSupported) return null;
+    final response = await apiClient.get(ApiEndpoints.appVersion);
+    final data = response.data;
+    if (data is! Map) throw Exception('Сервер вернул некорректный ответ');
+    final updateInfo = AppUpdateInfo.fromJson(Map<String, dynamic>.from(data));
+    final current = await getCurrentVersion();
+    final currentCode = current['versionCode'] as int;
+    if (updateInfo.versionCode <= currentCode) return null;
+    return updateInfo;
   }
 
   /// Скачать и запустить установку APK
@@ -120,6 +100,7 @@ class AppUpdateService {
     required void Function(int received, int total) onProgress,
     CancelToken? cancelToken,
   }) async {
+    if (!isSupported) return;
     final tempDir = await getTemporaryDirectory();
     final filePath = '${tempDir.path}/company_os_latest.apk';
 
@@ -131,20 +112,35 @@ class AppUpdateService {
       } catch (_) {}
     }
 
-    // Скачивание через Dio
     await apiClient.dio.download(
       downloadUrl,
       filePath,
       onReceiveProgress: onProgress,
       cancelToken: cancelToken,
-      options: Options(
-        responseType: ResponseType.bytes,
-        followRedirects: true,
-      ),
+      options: Options(followRedirects: true, receiveTimeout: const Duration(minutes: 10)),
     );
 
     // Запуск нативной установки Android
     await _channel.invokeMethod('installApk', {'filePath': filePath});
+  }
+
+  void _showMessage(BuildContext context, String text, {required Color color, required IconData icon}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        backgroundColor: color,
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        content: Row(
+          children: [
+            Icon(icon, color: Colors.white),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(text, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   /// Показать диалоговое окно обновления
@@ -153,14 +149,30 @@ class AppUpdateService {
     AppUpdateInfo? updateInfo,
     bool isManualCheck = false,
   }) async {
-    // Для автопроверки: показывать диалог максимум один раз за сессию
-    if (!isManualCheck && _hasAutoCheckedThisSession) {
-      return;
+    if (!isSupported) return;
+
+    // Для автопроверки: один запрос за сессию
+    if (!isManualCheck) {
+      if (_hasAutoCheckedThisSession) return;
+      _hasAutoCheckedThisSession = true;
     }
 
     AppUpdateInfo? info = updateInfo;
     if (info == null) {
-      info = await checkForUpdate();
+      try {
+        info = await checkForUpdate();
+      } catch (e) {
+        debugPrint('[AppUpdateService] checkForUpdate error: $e');
+        if (isManualCheck && context.mounted) {
+          _showMessage(
+            context,
+            'Не удалось проверить обновления: ${apiErrorMessage(e)}',
+            color: AppColors.error,
+            icon: Icons.error_outline,
+          );
+        }
+        return;
+      }
     }
 
     if (!context.mounted) return;
@@ -169,37 +181,35 @@ class AppUpdateService {
       if (isManualCheck) {
         final current = await getCurrentVersion();
         if (!context.mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            backgroundColor: AppColors.success,
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            content: Row(
-              children: [
-                const Icon(Icons.check_circle_outline, color: Colors.white),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    'У вас установлена последняя версия (${current['versionName']})',
-                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
-                  ),
-                ),
-              ],
-            ),
-          ),
+        _showMessage(
+          context,
+          'У вас установлена последняя версия (${current['versionName']})',
+          color: AppColors.success,
+          icon: Icons.check_circle_outline,
         );
       }
       return;
     }
 
-    // Отмечаем, что автопроверка показана в этой сессии
-    _hasAutoCheckedThisSession = true;
+    // Версия объявлена, но файл установки на сервер ещё не выложен.
+    if (info.downloadUrl.isEmpty) {
+      if (isManualCheck) {
+        _showMessage(
+          context,
+          'Версия ${info.versionName} уже выпущена, но файл обновления ещё не размещён на сервере. Попробуйте позже',
+          color: AppColors.warning,
+          icon: Icons.info_outline,
+        );
+      }
+      return;
+    }
 
+    final found = info;
     await showDialog(
       context: context,
-      barrierDismissible: !info.forceUpdate,
+      barrierDismissible: !found.forceUpdate,
       builder: (dialogCtx) => _AppUpdateDialog(
-        updateInfo: info!,
+        updateInfo: found,
         updateService: this,
       ),
     );
@@ -234,7 +244,7 @@ class _AppUpdateDialogState extends State<_AppUpdateDialog> {
   }
 
   String _formatBytes(int bytes) {
-    if (bytes <= 0) return '0 MB';
+    if (bytes <= 0) return '0 МБ';
     final mb = bytes / (1024 * 1024);
     return '${mb.toStringAsFixed(1)} МБ';
   }
@@ -271,7 +281,9 @@ class _AppUpdateDialogState extends State<_AppUpdateDialog> {
       if (mounted) {
         setState(() {
           _isDownloading = false;
-          _errorMessage = 'Ошибка загрузки: $e';
+          _errorMessage = e is DioException && e.type == DioExceptionType.cancel
+              ? null
+              : 'Не удалось загрузить обновление: ${apiErrorMessage(e)}';
         });
       }
     }
@@ -324,7 +336,7 @@ class _AppUpdateDialogState extends State<_AppUpdateDialog> {
                     children: [
                       Text(
                         widget.updateInfo.title,
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 18,
                           fontWeight: FontWeight.bold,
                           color: AppColors.textPrimary,
@@ -352,7 +364,7 @@ class _AppUpdateDialogState extends State<_AppUpdateDialog> {
                             const SizedBox(width: 8),
                             Text(
                               _formatBytes(widget.updateInfo.fileSize),
-                              style: const TextStyle(
+                              style: TextStyle(
                                 fontSize: 12,
                                 color: AppColors.textSecondary,
                               ),
@@ -369,7 +381,7 @@ class _AppUpdateDialogState extends State<_AppUpdateDialog> {
 
             // Список изменений
             if (widget.updateInfo.changelog.isNotEmpty) ...[
-              const Text(
+              Text(
                 'Что нового в этой версии:',
                 style: TextStyle(
                   fontSize: 14,
@@ -402,7 +414,7 @@ class _AppUpdateDialogState extends State<_AppUpdateDialog> {
                       Expanded(
                         child: Text(
                           widget.updateInfo.changelog[i],
-                          style: const TextStyle(
+                          style: TextStyle(
                             fontSize: 13,
                             color: AppColors.textPrimary,
                             height: 1.35,
@@ -434,7 +446,7 @@ class _AppUpdateDialogState extends State<_AppUpdateDialog> {
                       ),
                       Text(
                         '${_formatBytes(_receivedBytes)} / ${_formatBytes(_totalBytes)}',
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 12,
                           color: AppColors.textSecondary,
                         ),
@@ -452,7 +464,7 @@ class _AppUpdateDialogState extends State<_AppUpdateDialog> {
                     ),
                   ),
                   const SizedBox(height: 6),
-                  const Text(
+                  Text(
                     'По завершении откроется окно установки',
                     style: TextStyle(fontSize: 11, color: AppColors.textTertiary),
                   ),
@@ -481,7 +493,7 @@ class _AppUpdateDialogState extends State<_AppUpdateDialog> {
                         padding: const EdgeInsets.symmetric(vertical: 14),
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                       ),
-                      child: const Text(
+                      child: Text(
                         'Позже',
                         style: TextStyle(
                           color: AppColors.textSecondary,

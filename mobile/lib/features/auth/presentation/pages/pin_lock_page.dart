@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:go_router/go_router.dart';
 import '../../../../core/constants/app_strings.dart';
 import '../../../../core/router/app_router.dart';
@@ -9,6 +10,7 @@ import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/di/injection.dart';
 import '../../../../core/services/security_service.dart';
 import '../bloc/auth_bloc.dart';
+import 'biometric_kind.dart';
 
 class PinLockPage extends StatefulWidget {
   const PinLockPage({super.key});
@@ -27,6 +29,14 @@ class _PinLockPageState extends State<PinLockPage> {
   Timer? _lockoutTimer;
   bool _isBiometricEnabled = false;
   bool _isCheckingBiometrics = false;
+  bool _isVerifying = false;
+  IconData _biometricIcon = Icons.fingerprint_rounded;
+
+  // After this many lockouts in a row the PIN is no longer accepted and the
+  // user has to sign in with the password again.
+  static const int _maxLockoutRounds = 3;
+  static const String _lockoutRoundsKey = 'user_pin_lockout_rounds';
+  static const FlutterSecureStorage _storage = FlutterSecureStorage();
 
   @override
   void initState() {
@@ -42,17 +52,19 @@ class _PinLockPageState extends State<PinLockPage> {
 
   Future<void> _checkInitialState() async {
     final lockoutRemaining = await _securityService.getLockoutSecondsRemaining();
+    if (!mounted) return;
     if (lockoutRemaining > 0) {
       _startLockoutCountdown(lockoutRemaining);
       return;
     }
 
     final bioEnabled = await _securityService.isBiometricEnabled();
-    if (mounted) {
-      setState(() {
-        _isBiometricEnabled = bioEnabled;
-      });
-    }
+    final icon = bioEnabled ? await biometricIcon() : _biometricIcon;
+    if (!mounted) return;
+    setState(() {
+      _isBiometricEnabled = bioEnabled;
+      _biometricIcon = icon;
+    });
 
     // Auto-prompt biometrics if enabled
     if (bioEnabled) {
@@ -93,18 +105,19 @@ class _PinLockPageState extends State<PinLockPage> {
     _isCheckingBiometrics = true;
 
     final success = await _securityService.authenticateWithBiometrics(
-      reason: 'Войдите в COMPANY OS с помощью отпечатка пальца',
+      reason: 'Войдите в COMPANY OS с помощью биометрии',
     );
 
     _isCheckingBiometrics = false;
 
-    if (success && mounted) {
-      context.go(AppRoutes.dashboard);
+    if (success) {
+      await _storage.delete(key: _lockoutRoundsKey);
+      if (mounted) context.go(AppRoutes.dashboard);
     }
   }
 
   void _onDigitPress(String digit) {
-    if (_isLockedOut) return;
+    if (_isLockedOut || _isVerifying) return;
 
     if (_pin.length < 4) {
       setState(() {
@@ -129,23 +142,37 @@ class _PinLockPageState extends State<PinLockPage> {
   }
 
   Future<void> _verifyPin() async {
+    _isVerifying = true;
     final result = await _securityService.verifyPin(_pin);
+    _isVerifying = false;
 
     if (result.isSuccess) {
-      if (mounted) {
-        context.go(AppRoutes.dashboard);
-      }
-    } else {
-      if (!mounted) return;
+      await _storage.delete(key: _lockoutRoundsKey);
+      if (mounted) context.go(AppRoutes.dashboard);
+      return;
+    }
+    if (!mounted) return;
 
-      setState(() {
-        _pin = '';
-        _errorMessage = result.message;
-      });
+    setState(() {
+      _pin = '';
+      _errorMessage = result.message;
+    });
 
-      if (result.isLockedOut) {
-        _startLockoutCountdown(result.lockoutSecondsRemaining);
+    if (result.isLockedOut) {
+      final rounds = (int.tryParse(await _storage.read(key: _lockoutRoundsKey) ?? '') ?? 0) + 1;
+      if (rounds >= _maxLockoutRounds) {
+        await _storage.delete(key: _lockoutRoundsKey);
+        if (!mounted) return;
+        setState(() {
+          _isLockedOut = true;
+          _errorMessage = 'PIN-код введён неверно слишком много раз. Войдите по паролю';
+        });
+        // Signing out clears the PIN; the app then opens the login screen.
+        context.read<AuthBloc>().add(LogoutRequested());
+        return;
       }
+      await _storage.write(key: _lockoutRoundsKey, value: rounds.toString());
+      if (mounted) _startLockoutCountdown(result.lockoutSecondsRemaining);
     }
   }
 
@@ -155,7 +182,7 @@ class _PinLockPageState extends State<PinLockPage> {
       builder: (ctx) => AlertDialog(
         title: const Text('Войти по паролю'),
         content: const Text(
-          'Вы будете перенаправлены на экран входа с логином и паролем.',
+          'Вы выйдете из учётной записи на этом устройстве. PIN-код будет сброшен, для входа потребуются электронная почта и пароль.',
         ),
         actions: [
           TextButton(
@@ -165,8 +192,8 @@ class _PinLockPageState extends State<PinLockPage> {
           ElevatedButton(
             onPressed: () {
               Navigator.pop(ctx);
+              // The app opens the login screen itself once the session is closed.
               context.read<AuthBloc>().add(LogoutRequested());
-              context.go(AppRoutes.login);
             },
             style: ElevatedButton.styleFrom(
               backgroundColor: AppColors.primaryBlue,
@@ -184,7 +211,7 @@ class _PinLockPageState extends State<PinLockPage> {
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           gradient: AppColors.backgroundGradient,
         ),
         child: SafeArea(
@@ -225,7 +252,7 @@ class _PinLockPageState extends State<PinLockPage> {
               const SizedBox(height: 6),
               Text(
                 _isBiometricEnabled
-                    ? 'Войдите с помощью отпечатка пальца или PIN'
+                    ? 'Войдите с помощью биометрии или PIN-кода'
                     : 'Введите PIN-код для входа',
                 style: AppTextStyles.bodyMedium.copyWith(
                   color: AppColors.textSecondary,
@@ -349,7 +376,7 @@ class _PinLockPageState extends State<PinLockPage> {
               // Biometric or empty
               if (_isBiometricEnabled)
                 _buildActionKey(
-                  icon: Icons.fingerprint_rounded,
+                  icon: _biometricIcon,
                   iconColor: AppColors.primaryBlue,
                   onTap: _authenticateBiometric,
                 )
@@ -376,8 +403,8 @@ class _PinLockPageState extends State<PinLockPage> {
         height: 72,
         decoration: BoxDecoration(
           color: _isLockedOut
-              ? Colors.white.withOpacity(0.4)
-              : Colors.white.withOpacity(0.85),
+              ? AppColors.cardBackground.withOpacity(0.4)
+              : AppColors.cardBackground.withOpacity(0.85),
           shape: BoxShape.circle,
           border: Border.all(color: AppColors.cardBorder),
           boxShadow: [
@@ -414,7 +441,7 @@ class _PinLockPageState extends State<PinLockPage> {
         width: 72,
         height: 72,
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.5),
+          color: AppColors.cardBackground.withOpacity(0.5),
           shape: BoxShape.circle,
         ),
         child: Center(

@@ -1,13 +1,18 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
+import '../../../../core/di/injection.dart';
+import '../../../../core/network/api_error.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/utils/formatters.dart';
 import '../../../../core/widgets/app_button.dart';
 import '../../../../core/widgets/glass_card.dart';
-import '../bloc/finance_bloc.dart';
+import '../../data/company_currency.dart';
+import '../../data/models/transaction_model.dart';
+import '../../data/repositories/finance_repository.dart';
 import '../widgets/attachment_picker_card.dart';
+import '../widgets/finance_form_widgets.dart';
+import '../widgets/party_picker_field.dart';
 
 class AddIncomePage extends StatefulWidget {
   const AddIncomePage({super.key});
@@ -17,6 +22,7 @@ class AddIncomePage extends StatefulWidget {
 }
 
 class _AddIncomePageState extends State<AddIncomePage> {
+  final _repository = getIt<FinanceRepository>();
   final _formKey = GlobalKey<FormState>();
   final _amountController = TextEditingController();
   final _descriptionController = TextEditingController();
@@ -24,15 +30,23 @@ class _AddIncomePageState extends State<AddIncomePage> {
 
   String _paymentMethod = 'cash'; // 'cash', 'bank', 'card'
   DateTime _selectedDate = DateTime.now();
+  PartyRef? _customer;
+  List<AccountModel>? _accounts;
+  String? _accountsError;
+  String? _accountId;
   String? _documentUrl;
   String? _documentName;
   bool _isLoading = false;
+  bool _isUploading = false;
 
-  final List<Map<String, String>> _methods = [
-    {'id': 'cash', 'label': 'Наличные', 'icon': 'payments'},
-    {'id': 'bank', 'label': 'Банк', 'icon': 'account_balance'},
-    {'id': 'card', 'label': 'Карта', 'icon': 'credit_card'},
-  ];
+  @override
+  void initState() {
+    super.initState();
+    _loadAccounts();
+    CompanyCurrency.instance.ensureLoaded().then((_) {
+      if (mounted) setState(() {});
+    });
+  }
 
   @override
   void dispose() {
@@ -42,54 +56,100 @@ class _AddIncomePageState extends State<AddIncomePage> {
     super.dispose();
   }
 
+  Future<void> _loadAccounts() async {
+    setState(() {
+      _accounts = null;
+      _accountsError = null;
+    });
+    try {
+      final accounts = await _repository.getAccounts();
+      if (!mounted) return;
+      setState(() => _accounts = accounts);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _accountsError = apiErrorMessage(e, fallback: 'Не удалось загрузить счета'));
+    }
+  }
+
   Future<void> _selectDate() async {
+    final now = DateTime.now();
     final picked = await showDatePicker(
       context: context,
       initialDate: _selectedDate,
       firstDate: DateTime(2020),
-      lastDate: DateTime(2030),
+      lastDate: DateTime(now.year, now.month, now.day),
       builder: (context, child) {
         return Theme(
           data: Theme.of(context).copyWith(
-            colorScheme: const ColorScheme.light(
-              primary: AppColors.primaryBlue,
-            ),
+            colorScheme: AppColors.isDark
+                ? Theme.of(context).colorScheme
+                : const ColorScheme.light(
+                    primary: AppColors.primaryBlue,
+                  ),
           ),
           child: child!,
         );
       },
     );
-    if (picked != null) {
+    if (picked != null && mounted) {
       setState(() => _selectedDate = picked);
     }
   }
 
-  void _saveIncome() {
+  Future<void> _saveIncome() async {
+    if (_isLoading) return;
     if (!_formKey.currentState!.validate()) return;
+    final messenger = ScaffoldMessenger.of(context);
 
-    final amount = double.tryParse(_amountController.text.replaceAll(' ', '')) ?? 0.0;
+    final amount = parseAmount(_amountController.text);
     if (amount <= 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
+      messenger.showSnackBar(
         const SnackBar(content: Text('Введите корректную сумму'), backgroundColor: AppColors.error),
       );
       return;
     }
 
-    final data = {
+    if (_isUploading) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Дождитесь окончания загрузки документа')),
+      );
+      return;
+    }
+
+    final customerName = _customerController.text.trim();
+    final data = <String, dynamic>{
       'amount': amount,
-      'type': 'income',
       'paymentMethod': _paymentMethod,
       'description': _descriptionController.text.trim(),
-      'customerName': _customerController.text.trim(),
-      'date': _selectedDate.toIso8601String(),
-      'category': 'Поступление от клиента',
-      'hasAttachment': _documentUrl != null,
-      'documentUrl': _documentUrl,
-      'documentName': _documentName,
+      'customerName': customerName,
+      'date': FinanceRepository.dayParam(_selectedDate),
+      'category': _customer != null ? 'Поступление от клиента' : 'Поступление',
+      if (_customer != null) 'customerId': _customer!.id,
+      if (_accountId != null) 'accountId': _accountId,
+      if (_documentUrl != null) 'documentUrl': _documentUrl,
+      if (_documentUrl != null && _documentName != null) 'documentName': _documentName,
     };
 
-    context.read<FinanceBloc>().add(CreateIncomeEvent(data));
-    context.pop();
+    FocusScope.of(context).unfocus();
+    setState(() => _isLoading = true);
+    try {
+      await _repository.createIncome(data);
+      if (!mounted) return;
+      notifyFinanceChanged(context);
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Поступление добавлено'), backgroundColor: AppColors.success),
+      );
+      context.pop();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isLoading = false);
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(apiErrorMessage(e, fallback: 'Не удалось сохранить поступление')),
+          backgroundColor: AppColors.error,
+        ),
+      );
+    }
   }
 
   @override
@@ -101,12 +161,12 @@ class _AddIncomePageState extends State<AddIncomePage> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+          icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
           onPressed: () => context.pop(),
         ),
       ),
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(16.0),
           child: Form(
@@ -120,81 +180,67 @@ class _AddIncomePageState extends State<AddIncomePage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('Сумма поступления (UZS)', style: AppTextStyles.labelMedium),
+                      Text('Сумма поступления${currencySuffix()}', style: AppTextStyles.labelMedium),
                       const SizedBox(height: 8),
                       TextFormField(
                         controller: _amountController,
-                        keyboardType: TextInputType.number,
+                        keyboardType: const TextInputType.numberWithOptions(decimal: true),
                         style: const TextStyle(
                           fontSize: 24,
                           fontWeight: FontWeight.bold,
                           color: AppColors.success,
                         ),
                         decoration: InputDecoration(
-                          hintText: '0 сум',
+                          hintText: '0',
                           hintStyle: TextStyle(color: AppColors.textTertiary, fontSize: 24),
                           filled: true,
-                          fillColor: Colors.white,
+                          fillColor: AppColors.cardBackground,
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(14),
                             borderSide: BorderSide(color: AppColors.cardBorder),
                           ),
                           contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                         ),
-                        validator: (val) => (val == null || val.isEmpty) ? 'Обязательное поле' : null,
+                        validator: (val) {
+                          if (val == null || val.trim().isEmpty) return 'Обязательное поле';
+                          return parseAmount(val) > 0 ? null : 'Введите сумму больше нуля';
+                        },
                       ),
                       const SizedBox(height: 20),
 
                       Text('Способ оплаты', style: AppTextStyles.labelMedium),
                       const SizedBox(height: 10),
-                      Row(
-                        children: _methods.map((m) {
-                          final isSelected = _paymentMethod == m['id'];
-                          return Expanded(
-                            child: GestureDetector(
-                              onTap: () => setState(() => _paymentMethod = m['id']!),
-                              child: Container(
-                                margin: const EdgeInsets.symmetric(horizontal: 4),
-                                padding: const EdgeInsets.symmetric(vertical: 12),
-                                decoration: BoxDecoration(
-                                  color: isSelected ? AppColors.primaryBlue : Colors.white,
-                                  borderRadius: BorderRadius.circular(12),
-                                  border: Border.all(
-                                    color: isSelected ? AppColors.primaryBlue : AppColors.cardBorder,
-                                  ),
-                                ),
-                                child: Center(
-                                  child: Text(
-                                    m['label']!,
-                                    style: TextStyle(
-                                      color: isSelected ? Colors.white : AppColors.textPrimary,
-                                      fontWeight: FontWeight.w600,
-                                      fontSize: 13,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          );
-                        }).toList(),
+                      PaymentMethodSelector(
+                        value: _paymentMethod,
+                        onChanged: (v) => setState(() => _paymentMethod = v),
+                      ),
+                      const SizedBox(height: 20),
+
+                      Text('Счёт зачисления', style: AppTextStyles.labelMedium),
+                      const SizedBox(height: 8),
+                      AccountDropdown(
+                        accounts: _accounts,
+                        error: _accountsError,
+                        onRetry: _loadAccounts,
+                        value: _accountId,
+                        autoLabel: 'Автоматически, по способу оплаты',
+                        onChanged: (id) => setState(() => _accountId = id),
                       ),
                       const SizedBox(height: 20),
 
                       Text('Клиент / Источник', style: AppTextStyles.labelMedium),
                       const SizedBox(height: 8),
-                      TextFormField(
+                      PartyPickerField(
                         controller: _customerController,
-                        decoration: InputDecoration(
-                          hintText: 'Выберите или введите клиента',
-                          prefixIcon: const Icon(Icons.person_outline, color: AppColors.primaryBlue),
-                          filled: true,
-                          fillColor: Colors.white,
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide: BorderSide(color: AppColors.cardBorder),
-                          ),
-                        ),
-                        validator: (val) => (val == null || val.isEmpty) ? 'Укажите клиента' : null,
+                        selected: _customer,
+                        onChanged: (party) => setState(() => _customer = party),
+                        loader: _repository.getCustomers,
+                        hint: 'Выберите клиента или введите плательщика',
+                        sheetTitle: 'Выбрать клиента',
+                        emptyText: 'В базе пока нет клиентов.\nВведите плательщика вручную.',
+                        linkedHelper: 'Клиент из базы: оплата уменьшит его задолженность',
+                        freeHelper: 'Разовый плательщик — без привязки к клиенту из базы',
+                        validator: (val) => (val == null || val.trim().isEmpty) ? 'Укажите клиента или источник' : null,
                       ),
                       const SizedBox(height: 20),
 
@@ -206,7 +252,7 @@ class _AddIncomePageState extends State<AddIncomePage> {
                         child: Container(
                           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                           decoration: BoxDecoration(
-                            color: Colors.white,
+                            color: AppColors.cardBackground,
                             borderRadius: BorderRadius.circular(14),
                             border: Border.all(color: AppColors.cardBorder),
                           ),
@@ -215,7 +261,7 @@ class _AddIncomePageState extends State<AddIncomePage> {
                             children: [
                               Text(
                                 Formatters.formatDate(_selectedDate),
-                                style: const TextStyle(fontWeight: FontWeight.w500, fontSize: 15),
+                                style: TextStyle(fontWeight: FontWeight.w500, fontSize: 15, color: AppColors.textPrimary),
                               ),
                               const Icon(Icons.calendar_today, color: AppColors.primaryBlue, size: 20),
                             ],
@@ -232,7 +278,7 @@ class _AddIncomePageState extends State<AddIncomePage> {
                         decoration: InputDecoration(
                           hintText: 'Комментарий к платежу...',
                           filled: true,
-                          fillColor: Colors.white,
+                          fillColor: AppColors.cardBackground,
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(14),
                             borderSide: BorderSide(color: AppColors.cardBorder),
@@ -252,6 +298,7 @@ class _AddIncomePageState extends State<AddIncomePage> {
                             _documentName = att?['name'];
                           });
                         },
+                        onUploadingChanged: (v) => setState(() => _isUploading = v),
                       ),
                     ],
                   ),

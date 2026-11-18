@@ -10,52 +10,16 @@ class DashboardRepository {
 
   Future<DashboardStatsModel> fetchDashboardStats({String period = 'month'}) => getStats(period: period);
 
+  /// `period`: today | week | month | year. Throws when the server cannot be
+  /// reached or answers with an error, so the screen never shows invented numbers.
   Future<DashboardStatsModel> getStats({String period = 'month'}) async {
-    try {
-      final response = await apiClient.get(
-        ApiEndpoints.dashboardStats,
-        queryParameters: {'period': period},
-      );
-
-      if (response.statusCode == 200) {
-        final map = JsonHelpers.toMap(
-          response.data is Map && (response.data as Map).containsKey('data')
-              ? (response.data as Map)['data']
-              : response.data,
-        );
-        return DashboardStatsModel.fromJson(map);
-      }
-    } catch (e) {
-      // Return empty non-fabricated initial state if server is momentarily unreachable
-      return DashboardStatsModel(
-        totalBalance: 0.0,
-        balanceChangePercent: 0.0,
-        income: 0.0,
-        expenses: 0.0,
-        sales: 0.0,
-        stockBalance: 0.0,
-        totalProducts: 0,
-        activeDeals: 0,
-        pendingTasks: 0,
-        customerDebts: 0.0,
-        supplierDebts: 0.0,
-        period: period,
-      );
-    }
-
-    return DashboardStatsModel(
-      totalBalance: 0.0,
-      balanceChangePercent: 0.0,
-      income: 0.0,
-      expenses: 0.0,
-      sales: 0.0,
-      stockBalance: 0.0,
-      totalProducts: 0,
-      activeDeals: 0,
-      pendingTasks: 0,
-      customerDebts: 0.0,
-      supplierDebts: 0.0,
-      period: period,
+    final response = await apiClient.get(
+      ApiEndpoints.dashboardStats,
+      queryParameters: {'period': period},
     );
+    final body = response.data;
+    if (body is! Map) throw Exception('Сервер вернул некорректный ответ');
+    final map = JsonHelpers.toMap(body.containsKey('data') ? body['data'] : body);
+    return DashboardStatsModel.fromJson(map);
   }
 }

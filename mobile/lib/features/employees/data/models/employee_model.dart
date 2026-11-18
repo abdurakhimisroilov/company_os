@@ -9,7 +9,12 @@ class EmployeeRoleInfo {
   final String description;
   final IconData icon;
   final Color color;
-  final Color bgColor;
+  final Color _bgColorLight;
+
+  /// Soft tint behind the role icon/badge. In dark mode the pastel tint is
+  /// replaced by a translucent version of the role colour.
+  Color get bgColor =>
+      AppColors.isDark ? color.withOpacity(0.18) : _bgColorLight;
 
   const EmployeeRoleInfo({
     required this.id,
@@ -18,8 +23,8 @@ class EmployeeRoleInfo {
     required this.description,
     required this.icon,
     required this.color,
-    required this.bgColor,
-  });
+    required Color bgColor,
+  }) : _bgColorLight = bgColor;
 
   static const List<EmployeeRoleInfo> allRoles = [
     EmployeeRoleInfo(
@@ -90,6 +95,41 @@ class EmployeeRoleInfo {
   }
 }
 
+class DepartmentModel {
+  final String id;
+  final String name;
+  final int employeesCount;
+
+  const DepartmentModel({required this.id, required this.name, this.employeesCount = 0});
+
+  factory DepartmentModel.fromJson(Map<String, dynamic> json) {
+    return DepartmentModel(
+      id: JsonHelpers.toStr(json['id']),
+      name: JsonHelpers.toStr(json['name']),
+      employeesCount: JsonHelpers.toInt(json['employeesCount'] ?? json['employees_count']),
+    );
+  }
+}
+
+/// A task recently assigned to the employee, as listed on the profile.
+class EmployeeActivity {
+  final String id;
+  final String title;
+  final String status;
+  final DateTime? date;
+
+  const EmployeeActivity({required this.id, required this.title, required this.status, this.date});
+
+  factory EmployeeActivity.fromJson(Map<String, dynamic> json) {
+    return EmployeeActivity(
+      id: JsonHelpers.toStr(json['id']),
+      title: JsonHelpers.toStr(json['title']),
+      status: JsonHelpers.toStr(json['status']).toLowerCase(),
+      date: JsonHelpers.toOptionalDateTime(json['date'])?.toLocal(),
+    );
+  }
+}
+
 class EmployeeModel {
   final String id;
   final String fullName;
@@ -102,7 +142,7 @@ class EmployeeModel {
   final String position;
   final bool isActive;
   final int activeTasksCount;
-  final List<String> recentActivity;
+  final List<EmployeeActivity> recentActivity;
 
   const EmployeeModel({
     required this.id,
@@ -128,7 +168,8 @@ class EmployeeModel {
 
   factory EmployeeModel.fromJson(Map<String, dynamic> json) {
     final activity = JsonHelpers.toList(json['recentActivity'])
-        .map((e) => e.toString())
+        .whereType<Map>()
+        .map((e) => EmployeeActivity.fromJson(JsonHelpers.toMap(e)))
         .toList();
 
     return EmployeeModel(
@@ -136,18 +177,17 @@ class EmployeeModel {
       fullName: JsonHelpers.toStr(json['fullName'] ?? json['full_name'] ?? json['name'], 'Сотрудник'),
       email: JsonHelpers.toStr(json['email']),
       phone: JsonHelpers.toStr(json['phone']),
-      photoUrl: JsonHelpers.extractOptionalString(json['photoUrl'] ?? json['avatarUrl'] ?? json['avatar']),
+      photoUrl: JsonHelpers.extractOptionalString(json['avatarUrl'] ?? json['avatar_url'] ?? json['photoUrl']),
       role: JsonHelpers.toStr(json['role'], 'EMPLOYEE').toUpperCase(),
       departmentId: JsonHelpers.extractOptionalString(json['departmentId'] ?? json['department_id']),
       departmentName: JsonHelpers.extractOptionalString(
             json['department'],
             preferredKeys: ['name', 'title'],
           ) ??
-          JsonHelpers.extractOptionalString(json['departmentName'] ?? json['department_name']) ??
-          'Общий',
-      position: JsonHelpers.toStr(json['position'], 'Специалист'),
+          JsonHelpers.extractOptionalString(json['departmentName'] ?? json['department_name']),
+      position: JsonHelpers.toStr(json['position']),
       isActive: JsonHelpers.toBool(json['isActive'] ?? json['is_active'], true),
-      activeTasksCount: JsonHelpers.toInt(json['activeTasksCount'] ?? json['tasks_count']),
+      activeTasksCount: JsonHelpers.toInt(json['activeTasksCount'] ?? json['active_tasks_count']),
       recentActivity: activity,
     );
   }
@@ -176,7 +216,7 @@ class EmployeeModel {
     String? position,
     bool? isActive,
     int? activeTasksCount,
-    List<String>? recentActivity,
+    List<EmployeeActivity>? recentActivity,
   }) {
     return EmployeeModel(
       id: id ?? this.id,

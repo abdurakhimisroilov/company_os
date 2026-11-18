@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:dio/dio.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../../../../core/constants/app_constants.dart';
 import '../../../../core/network/api_client.dart';
@@ -12,49 +13,28 @@ class AuthRepository {
 
   AuthRepository({required this.apiClient});
 
-  Future<UserModel> login({required String email, required String password}) async {
-    try {
-      final response = await apiClient.post(
-        ApiEndpoints.login,
-        data: {
-          'email': email.trim(),
-          'password': password,
-        },
-      );
-
-      final data = JsonHelpers.toMap(response.data);
-      final accessToken = JsonHelpers.toStr(data['accessToken'] ?? data['token']);
-      final refreshToken = JsonHelpers.toStr(data['refreshToken'] ?? data['refreshToken']);
-      final userJson = JsonHelpers.toMap(data['user'] ?? data);
-
-      if (accessToken.isNotEmpty) {
-        await apiClient.saveTokens(
-          accessToken: accessToken,
-          refreshToken: refreshToken.isNotEmpty ? refreshToken : accessToken,
-        );
-      }
-
-      await _storage.write(
-        key: AppConstants.userDataKey,
-        value: jsonEncode(userJson),
-      );
-
-      return UserModel.fromJson(userJson);
-    } catch (_) {
-      final demoUser = UserModel(
-        id: '7d878ac2-9033-48da-a102-97d8ea4c0c1f',
-        email: email.trim().isNotEmpty ? email.trim() : 'admin@company.uz',
-        fullName: 'Руководитель',
-        role: 'SUPER_ADMIN',
-      );
-      try {
-        await _storage.write(
-          key: AppConstants.userDataKey,
-          value: jsonEncode(demoUser.toJson()),
-        );
-      } catch (_) {}
-      return demoUser;
+  Future<UserModel> _storeSession(dynamic responseData) async {
+    final data = JsonHelpers.toMap(responseData);
+    final accessToken = JsonHelpers.toStr(data['accessToken']);
+    final refreshToken = JsonHelpers.toStr(data['refreshToken']);
+    if (accessToken.isEmpty || refreshToken.isEmpty) {
+      throw Exception('Сервер вернул некорректный ответ. Попробуйте ещё раз');
     }
+    await apiClient.saveTokens(accessToken: accessToken, refreshToken: refreshToken);
+    return _cacheUser(JsonHelpers.toMap(data['user']));
+  }
+
+  Future<UserModel> _cacheUser(Map<String, dynamic> userJson) async {
+    await _storage.write(key: AppConstants.userDataKey, value: jsonEncode(userJson));
+    return UserModel.fromJson(userJson);
+  }
+
+  Future<UserModel> login({required String email, required String password}) async {
+    final response = await apiClient.post(
+      ApiEndpoints.login,
+      data: {'email': email.trim(), 'password': password},
+    );
+    return _storeSession(response.data);
   }
 
   Future<UserModel> register({
@@ -62,88 +42,73 @@ class AuthRepository {
     required String password,
     required String fullName,
     String? phone,
+    String? companyName,
   }) async {
-    try {
-      final response = await apiClient.post(
-        ApiEndpoints.register,
-        data: {
-          'email': email.trim(),
-          'password': password,
-          'fullName': fullName.trim(),
-          if (phone != null && phone.isNotEmpty) 'phone': phone.trim(),
-        },
-      );
+    final response = await apiClient.post(
+      ApiEndpoints.register,
+      data: {
+        'email': email.trim(),
+        'password': password,
+        'fullName': fullName.trim(),
+        if (phone != null && phone.trim().isNotEmpty) 'phone': phone.trim(),
+        if (companyName != null && companyName.trim().isNotEmpty) 'companyName': companyName.trim(),
+      },
+    );
+    return _storeSession(response.data);
+  }
 
-      final data = JsonHelpers.toMap(response.data);
-      final accessToken = JsonHelpers.toStr(data['accessToken'] ?? data['token']);
-      final refreshToken = JsonHelpers.toStr(data['refreshToken'] ?? data['refreshToken']);
-      final userJson = JsonHelpers.toMap(data['user'] ?? data);
-
-      if (accessToken.isNotEmpty) {
-        await apiClient.saveTokens(
-          accessToken: accessToken,
-          refreshToken: refreshToken.isNotEmpty ? refreshToken : accessToken,
-        );
-      }
-
-      await _storage.write(
-        key: AppConstants.userDataKey,
-        value: jsonEncode(userJson),
-      );
-
-      return UserModel.fromJson(userJson);
-    } catch (_) {
-      final demoUser = UserModel(
-        id: '7d878ac2-9033-48da-a102-97d8ea4c0c1f',
-        email: email.trim().isNotEmpty ? email.trim() : 'admin@company.uz',
-        fullName: fullName.trim().isNotEmpty ? fullName.trim() : 'Руководитель',
-        role: 'SUPER_ADMIN',
-      );
+  /// Ends the session on this device first, then tells the server.
+  Future<void> logout() async {
+    final token = await apiClient.getAccessToken();
+    await apiClient.clearTokens();
+    if (token != null && token.isNotEmpty) {
       try {
-        await _storage.write(
-          key: AppConstants.userDataKey,
-          value: jsonEncode(demoUser.toJson()),
+        await apiClient.dio.post(
+          ApiEndpoints.logout,
+          options: Options(headers: {'Authorization': 'Bearer $token'}, sendTimeout: const Duration(seconds: 5), receiveTimeout: const Duration(seconds: 5)),
         );
       } catch (_) {}
-      return demoUser;
     }
   }
 
-  Future<void> logout() async {
-    try {
-      await apiClient.post(ApiEndpoints.logout);
-    } catch (_) {}
-    await apiClient.clearTokens();
-    try {
-      await _storage.delete(key: AppConstants.userDataKey);
-    } catch (_) {}
-  }
-
-  Future<UserModel?> getCurrentUser() async {
+  Future<UserModel?> getCachedUser() async {
     try {
       final userString = await _storage.read(key: AppConstants.userDataKey);
-      if (userString != null && userString.isNotEmpty) {
-        final decoded = jsonDecode(userString);
-        final json = JsonHelpers.toMap(decoded);
-        return UserModel.fromJson(json);
-      }
-      final response = await apiClient.get(ApiEndpoints.me);
-      if (response.statusCode == 200) {
-        final userJson = JsonHelpers.toMap(
-          response.data is Map && (response.data as Map).containsKey('user')
-              ? (response.data as Map)['user']
-              : response.data,
-        );
-        await _storage.write(
-          key: AppConstants.userDataKey,
-          value: jsonEncode(userJson),
-        );
-        return UserModel.fromJson(userJson);
-      }
-      return null;
+      if (userString == null || userString.isEmpty) return null;
+      return UserModel.fromJson(JsonHelpers.toMap(jsonDecode(userString)));
     } catch (_) {
       return null;
     }
+  }
+
+  /// Profile as the server has it now; also proves the session is still valid.
+  Future<UserModel> fetchCurrentUser() async {
+    final response = await apiClient.get(ApiEndpoints.me);
+    return _cacheUser(JsonHelpers.toMap(response.data));
+  }
+
+  Future<UserModel> updateProfile(Map<String, dynamic> fields) async {
+    final response = await apiClient.patch('/auth/profile', data: fields);
+    return _cacheUser(JsonHelpers.toMap(response.data));
+  }
+
+  Future<void> changePassword({required String currentPassword, required String newPassword}) async {
+    final response = await apiClient.post(
+      '/auth/change-password',
+      data: {'currentPassword': currentPassword, 'newPassword': newPassword},
+    );
+    final data = JsonHelpers.toMap(response.data);
+    final accessToken = JsonHelpers.toStr(data['accessToken']);
+    final refreshToken = JsonHelpers.toStr(data['refreshToken']);
+    if (accessToken.isNotEmpty && refreshToken.isNotEmpty) {
+      await apiClient.saveTokens(accessToken: accessToken, refreshToken: refreshToken);
+    }
+  }
+
+  /// Permanently deletes the account on the server, then clears this device.
+  Future<void> deleteAccount({required String password}) async {
+    await apiClient.delete('/auth/account', data: {'password': password});
+    await apiClient.clearTokens();
   }
 
   Future<bool> isAuthenticated() async {

@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/network/api_error.dart';
 import '../../data/models/sale_model.dart';
 import '../../data/repositories/sales_repository.dart';
 
@@ -10,34 +13,20 @@ abstract class SalesEvent extends Equatable {
   List<Object?> get props => [];
 }
 
+/// Loads the list for a payment status: 'all', 'paid', 'partial', 'unpaid'.
 class LoadSalesEvent extends SalesEvent {
-  final String? status;
-  const LoadSalesEvent({this.status});
+  final String status;
+  const LoadSalesEvent({this.status = 'all'});
   @override
   List<Object?> get props => [status];
 }
 
-class LoadSaleDetailEvent extends SalesEvent {
-  final String id;
-  const LoadSaleDetailEvent(this.id);
+/// Reloads the list with the current filter without hiding what is on screen.
+class RefreshSalesEvent extends SalesEvent {
+  final Completer<String?>? completer;
+  const RefreshSalesEvent({this.completer});
   @override
-  List<Object?> get props => [id];
-}
-
-class CreateSaleEvent extends SalesEvent {
-  final Map<String, dynamic> data;
-  const CreateSaleEvent(this.data);
-  @override
-  List<Object?> get props => [data];
-}
-
-class AddSalePaymentEvent extends SalesEvent {
-  final String saleId;
-  final double amount;
-  final String method;
-  const AddSalePaymentEvent({required this.saleId, required this.amount, required this.method});
-  @override
-  List<Object?> get props => [saleId, amount, method];
+  List<Object?> get props => [completer];
 }
 
 // ─── States ─────────────────────────────────────────────────────────────────
@@ -54,23 +43,13 @@ class SalesLoading extends SalesState {}
 class SalesLoaded extends SalesState {
   final List<SaleModel> sales;
   final String currentFilter;
-  const SalesLoaded({required this.sales, this.currentFilter = 'all'});
-  @override
-  List<Object?> get props => [sales, currentFilter];
-}
 
-class SaleDetailLoaded extends SalesState {
-  final SaleModel sale;
-  const SaleDetailLoaded(this.sale);
-  @override
-  List<Object?> get props => [sale];
-}
+  /// A request for another filter is in flight; [sales] are still the previous result.
+  final bool isLoading;
 
-class SalesActionSuccess extends SalesState {
-  final String message;
-  const SalesActionSuccess(this.message);
+  const SalesLoaded({required this.sales, this.currentFilter = 'all', this.isLoading = false});
   @override
-  List<Object?> get props => [message];
+  List<Object?> get props => [sales, currentFilter, isLoading];
 }
 
 class SalesError extends SalesState {
@@ -81,55 +60,61 @@ class SalesError extends SalesState {
 }
 
 // ─── BLoC ───────────────────────────────────────────────────────────────────
+/// Holds the sales LIST only. Sale detail and the new-sale form talk to the
+/// repository themselves and ask this bloc to refresh afterwards.
 class SalesBloc extends Bloc<SalesEvent, SalesState> {
   final SalesRepository salesRepository;
 
+  String _status = 'all';
+  int _requestSeq = 0;
+
   SalesBloc({required this.salesRepository}) : super(SalesInitial()) {
     on<LoadSalesEvent>(_onLoadSales);
-    on<LoadSaleDetailEvent>(_onLoadDetail);
-    on<CreateSaleEvent>(_onCreateSale);
-    on<AddSalePaymentEvent>(_onAddPayment);
+    on<RefreshSalesEvent>(_onRefreshSales);
+  }
+
+  /// Reloads with the current filter; completes with an error text or null.
+  Future<String?> refresh() {
+    final completer = Completer<String?>();
+    add(RefreshSalesEvent(completer: completer));
+    return completer.future;
   }
 
   Future<void> _onLoadSales(LoadSalesEvent event, Emitter<SalesState> emit) async {
-    emit(SalesLoading());
-    try {
-      final sales = await salesRepository.getSales(status: event.status);
-      emit(SalesLoaded(sales: sales, currentFilter: event.status ?? 'all'));
-    } catch (e) {
-      emit(SalesError(e.toString().replaceAll('Exception: ', '')));
+    _status = event.status;
+    final current = state;
+    if (current is SalesLoaded) {
+      emit(SalesLoaded(sales: current.sales, currentFilter: _status, isLoading: true));
+    } else {
+      emit(SalesLoading());
     }
+    await _fetch(emit, silent: false);
   }
 
-  Future<void> _onLoadDetail(LoadSaleDetailEvent event, Emitter<SalesState> emit) async {
-    emit(SalesLoading());
-    try {
-      final sale = await salesRepository.getSaleById(event.id);
-      emit(SaleDetailLoaded(sale));
-    } catch (e) {
-      emit(SalesError(e.toString().replaceAll('Exception: ', '')));
-    }
+  Future<void> _onRefreshSales(RefreshSalesEvent event, Emitter<SalesState> emit) async {
+    if (state is! SalesLoaded) emit(SalesLoading());
+    final error = await _fetch(emit, silent: state is SalesLoaded);
+    event.completer?.complete(error);
   }
 
-  Future<void> _onCreateSale(CreateSaleEvent event, Emitter<SalesState> emit) async {
-    emit(SalesLoading());
+  Future<String?> _fetch(Emitter<SalesState> emit, {required bool silent}) async {
+    final seq = ++_requestSeq;
     try {
-      await salesRepository.createSale(event.data);
-      emit(const SalesActionSuccess('Продажа успешно оформлена'));
-      add(const LoadSalesEvent());
+      final sales = await salesRepository.getSales(status: _status);
+      if (seq != _requestSeq) return null;
+      emit(SalesLoaded(sales: sales, currentFilter: _status));
+      return null;
     } catch (e) {
-      emit(SalesError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onAddPayment(AddSalePaymentEvent event, Emitter<SalesState> emit) async {
-    emit(SalesLoading());
-    try {
-      await salesRepository.addPayment(event.saleId, event.amount, event.method);
-      emit(const SalesActionSuccess('Оплата успешно принята'));
-      add(LoadSaleDetailEvent(event.saleId));
-    } catch (e) {
-      emit(SalesError(e.toString().replaceAll('Exception: ', '')));
+      final message = apiErrorMessage(e, fallback: 'Не удалось загрузить продажи');
+      if (seq != _requestSeq) return message;
+      final current = state;
+      if (silent && current is SalesLoaded) {
+        // Keep the list the user is looking at; the caller reports the failure.
+        if (current.isLoading) emit(SalesLoaded(sales: current.sales, currentFilter: current.currentFilter));
+        return message;
+      }
+      emit(SalesError(message));
+      return message;
     }
   }
 }

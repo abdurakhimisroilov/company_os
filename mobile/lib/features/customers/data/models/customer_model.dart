@@ -2,13 +2,15 @@ import '../../../../core/utils/json_helpers.dart';
 
 class CustomerSaleHistoryModel {
   final String id;
+  final String saleNumber;
   final double amount;
   final double paidAmount;
-  final DateTime date;
-  final String status;
+  final DateTime? date;
+  final String status; // paid | partial | unpaid
 
   const CustomerSaleHistoryModel({
     required this.id,
+    required this.saleNumber,
     required this.amount,
     required this.paidAmount,
     required this.date,
@@ -18,10 +20,11 @@ class CustomerSaleHistoryModel {
   factory CustomerSaleHistoryModel.fromJson(Map<String, dynamic> json) {
     return CustomerSaleHistoryModel(
       id: JsonHelpers.toStr(json['id']),
-      amount: JsonHelpers.toDouble(json['amount'] ?? json['totalAmount']),
-      paidAmount: JsonHelpers.toDouble(json['paidAmount']),
-      date: JsonHelpers.toDateTime(json['date'] ?? json['createdAt']),
-      status: JsonHelpers.toStr(json['status'], 'paid'),
+      saleNumber: JsonHelpers.toStr(json['sale_number'] ?? json['saleNumber']),
+      amount: JsonHelpers.toDouble(json['amount'] ?? json['total_amount'] ?? json['totalAmount'] ?? json['grand_total']),
+      paidAmount: JsonHelpers.toDouble(json['paid_amount'] ?? json['paidAmount']),
+      date: JsonHelpers.toOptionalDateTime(json['created_at'] ?? json['date'] ?? json['createdAt'])?.toLocal(),
+      status: JsonHelpers.toStr(json['status']).toLowerCase(),
     );
   }
 }
@@ -32,6 +35,8 @@ class CustomerModel {
   final String phone;
   final String email;
   final String address;
+  final String inn;
+  final String notes;
   final double totalPurchases;
   final double debtAmount;
   final List<CustomerSaleHistoryModel> purchaseHistory;
@@ -42,34 +47,29 @@ class CustomerModel {
     required this.phone,
     required this.email,
     this.address = '',
+    this.inn = '',
+    this.notes = '',
     this.totalPurchases = 0.0,
     this.debtAmount = 0.0,
     this.purchaseHistory = const [],
   });
 
   factory CustomerModel.fromJson(Map<String, dynamic> json) {
-    final historyList = JsonHelpers.toList(json['purchaseHistory'] ?? json['sales'])
+    final historyList = JsonHelpers.toList(json['sales'] ?? json['purchaseHistory'])
         .map((e) => CustomerSaleHistoryModel.fromJson(JsonHelpers.toMap(e)))
         .toList();
 
     return CustomerModel(
       id: JsonHelpers.toStr(json['id']),
-      name: JsonHelpers.extractString(json['name'], fallback: 'Без имени'),
+      name: JsonHelpers.toStr(json['name']),
       phone: JsonHelpers.toStr(json['phone']),
       email: JsonHelpers.toStr(json['email']),
       address: JsonHelpers.toStr(json['address']),
-      totalPurchases: JsonHelpers.toDouble(json['totalPurchases'] ?? json['totalSales']),
-      debtAmount: JsonHelpers.toDouble(json['debtAmount'] ?? json['debt'] ?? json['balance']),
+      inn: JsonHelpers.toStr(json['inn']),
+      notes: JsonHelpers.toStr(json['notes']),
+      totalPurchases: JsonHelpers.toDouble(json['totalPurchases'] ?? json['total_purchases'] ?? json['totalSales']),
+      debtAmount: JsonHelpers.toDouble(json['balance'] ?? json['debtAmount'] ?? json['debt']),
       purchaseHistory: historyList,
     );
-  }
-
-  Map<String, dynamic> toJson() {
-    return {
-      'name': name,
-      'phone': phone,
-      'email': email,
-      'address': address,
-    };
   }
 }

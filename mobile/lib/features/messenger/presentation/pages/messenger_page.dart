@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
@@ -16,26 +17,33 @@ class MessengerPage extends StatefulWidget {
   State<MessengerPage> createState() => _MessengerPageState();
 }
 
-class _MessengerPageState extends State<MessengerPage> with SingleTickerProviderStateMixin {
-  late TabController _tabController;
+class _MessengerPageState extends State<MessengerPage> {
   final _searchController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
-    context.read<MessengerBloc>().add(const LoadChatRoomsEvent());
+    // Coming back to the screen keeps the loaded list visible while it refreshes.
+    final bloc = context.read<MessengerBloc>();
+    bloc.add(LoadChatRoomsEvent(silent: bloc.state is ChatRoomsLoaded));
   }
 
   @override
   void dispose() {
-    _tabController.dispose();
     _searchController.dispose();
     super.dispose();
   }
 
-  void _onSearch(String query) {
-    context.read<MessengerBloc>().add(LoadChatRoomsEvent(search: query));
+  Future<void> _refresh() {
+    final completer = Completer<void>();
+    context.read<MessengerBloc>().add(LoadChatRoomsEvent(silent: true, completer: completer));
+    return completer.future;
+  }
+
+  Future<void> _openRoom(ChatRoomModel room) async {
+    await context.push('/messenger/chat/${room.id}?name=${Uri.encodeComponent(room.title)}');
+    // Last message and unread counter changed while the chat was open.
+    if (mounted) context.read<MessengerBloc>().add(const LoadChatRoomsEvent(silent: true));
   }
 
   @override
@@ -43,36 +51,36 @@ class _MessengerPageState extends State<MessengerPage> with SingleTickerProvider
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SafeArea(
           bottom: false,
           child: Column(
             children: [
               _buildHeader(),
               _buildSearchBar(),
-              _buildTabs(),
+              const SizedBox(height: 4),
               Expanded(
-                child: BlocBuilder<MessengerBloc, MessengerState>(
-                  builder: (context, state) {
-                    if (state is MessengerLoading) {
-                      return const LoadingShimmer();
+                child: BlocConsumer<MessengerBloc, MessengerState>(
+                  listener: (context, state) {
+                    if (state is ChatRoomsLoaded && state.refreshError != null) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text(state.refreshError!), backgroundColor: AppColors.error),
+                      );
                     }
+                  },
+                  builder: (context, state) {
                     if (state is MessengerError) {
                       return _buildErrorState(state.message);
                     }
                     if (state is ChatRoomsLoaded) {
-                      final direct = state.rooms.where((r) => r.type == 'direct').toList();
-                      final groups = state.rooms.where((r) => r.type != 'direct').toList();
-
-                      return TabBarView(
-                        controller: _tabController,
-                        children: [
-                          _buildChatList(direct.isNotEmpty ? direct : state.rooms),
-                          _buildChatList(groups.isNotEmpty ? groups : state.rooms),
-                        ],
-                      );
+                      // The server has no room search, so the loaded list is filtered here.
+                      final query = _searchController.text.trim().toLowerCase();
+                      final rooms = query.isEmpty
+                          ? state.rooms
+                          : state.rooms.where((r) => r.title.toLowerCase().contains(query)).toList();
+                      return _buildChatList(rooms, searching: query.isNotEmpty);
                     }
-                    return const SizedBox.shrink();
+                    return const LoadingShimmer();
                   },
                 ),
               ),
@@ -89,10 +97,10 @@ class _MessengerPageState extends State<MessengerPage> with SingleTickerProvider
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+            icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
             onPressed: () => context.pop(),
           ),
-          const Expanded(
+          Expanded(
             child: Text(
               'Мессенджер',
               style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
@@ -108,15 +116,15 @@ class _MessengerPageState extends State<MessengerPage> with SingleTickerProvider
       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
       child: Container(
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.9),
+          color: AppColors.cardBackground.withValues(alpha: 0.9),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: AppColors.cardBorder),
         ),
         child: TextField(
           controller: _searchController,
-          onSubmitted: _onSearch,
+          onChanged: (_) => setState(() {}),
           decoration: InputDecoration(
-            hintText: 'Поиск чатов и сообщений...',
+            hintText: 'Поиск чатов...',
             hintStyle: TextStyle(color: AppColors.textTertiary, fontSize: 14),
             prefixIcon: const Icon(Icons.search, color: AppColors.primaryBlue),
             border: InputBorder.none,
@@ -127,43 +135,28 @@ class _MessengerPageState extends State<MessengerPage> with SingleTickerProvider
     );
   }
 
-  Widget _buildTabs() {
-    return Container(
-      height: 38,
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.6),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: TabBar(
-        controller: _tabController,
-        indicator: BoxDecoration(
-          borderRadius: BorderRadius.circular(8),
-          color: AppColors.primaryBlue,
-        ),
-        labelColor: Colors.white,
-        unselectedLabelColor: AppColors.textSecondary,
-        labelStyle: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-        tabs: const [
-          Tab(text: 'Личные'),
-          Tab(text: 'Группы и отделы'),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildChatList(List<ChatRoomModel> rooms) {
+  Widget _buildChatList(List<ChatRoomModel> rooms, {bool searching = false}) {
     if (rooms.isEmpty) {
-      return Center(
-        child: Text('Нет активных диалогов', style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary)),
+      return RefreshIndicator(
+        onRefresh: _refresh,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.symmetric(vertical: 80, horizontal: 24),
+          children: [
+            Text(
+              searching ? 'Чаты не найдены' : 'Нет активных диалогов',
+              textAlign: TextAlign.center,
+              style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary),
+            ),
+          ],
+        ),
       );
     }
 
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<MessengerBloc>().add(LoadChatRoomsEvent(search: _searchController.text.trim()));
-      },
+      onRefresh: _refresh,
       child: ListView.builder(
+        physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(16),
         itemCount: rooms.length,
         itemBuilder: (context, index) {
@@ -171,36 +164,18 @@ class _MessengerPageState extends State<MessengerPage> with SingleTickerProvider
           return Container(
             margin: const EdgeInsets.only(bottom: 10),
             child: GlassCard(
-              onTap: () => context.push('/messenger/chat/${room.id}?name=${Uri.encodeComponent(room.title)}'),
+              onTap: () => _openRoom(room),
               padding: const EdgeInsets.all(14),
               borderRadius: 16,
               child: Row(
                 children: [
-                  Stack(
-                    children: [
-                      CircleAvatar(
-                        radius: 24,
-                        backgroundColor: room.isGroup ? AppColors.iconBgPurple : AppColors.iconBgBlue,
-                        child: Icon(
-                          room.isGroup ? Icons.groups : Icons.person,
-                          color: room.isGroup ? AppColors.secondaryLavender : AppColors.primaryBlue,
-                        ),
-                      ),
-                      if (room.isOnline)
-                        Positioned(
-                          right: 0,
-                          bottom: 0,
-                          child: Container(
-                            width: 12,
-                            height: 12,
-                            decoration: BoxDecoration(
-                              color: AppColors.success,
-                              shape: BoxShape.circle,
-                              border: Border.all(color: Colors.white, width: 2),
-                            ),
-                          ),
-                        ),
-                    ],
+                  CircleAvatar(
+                    radius: 24,
+                    backgroundColor: room.isGroup ? AppColors.iconBgPurple : AppColors.iconBgBlue,
+                    child: Icon(
+                      room.isGroup ? Icons.groups : Icons.person,
+                      color: room.isGroup ? AppColors.secondaryLavender : AppColors.primaryBlue,
+                    ),
                   ),
                   const SizedBox(width: 12),
                   Expanded(
@@ -208,15 +183,19 @@ class _MessengerPageState extends State<MessengerPage> with SingleTickerProvider
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            Text(
-                              room.title,
-                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
+                            Expanded(
+                              child: Text(
+                                room.title,
+                                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
                             ),
-                            Text(Formatters.formatTime(room.lastMessageTime), style: AppTextStyles.caption),
+                            if (room.lastMessage.isNotEmpty) ...[
+                              const SizedBox(width: 8),
+                              Text(_formatWhen(room.lastMessageTime), style: AppTextStyles.caption),
+                            ],
                           ],
                         ),
                         const SizedBox(height: 4),
@@ -256,6 +235,13 @@ class _MessengerPageState extends State<MessengerPage> with SingleTickerProvider
     );
   }
 
+  /// Time for today's messages, date for older ones.
+  String _formatWhen(DateTime time) {
+    final now = DateTime.now();
+    final sameDay = time.year == now.year && time.month == now.month && time.day == now.day;
+    return sameDay ? Formatters.formatTime(time) : Formatters.formatRelativeDate(time);
+  }
+
   Widget _buildErrorState(String message) {
     return Center(
       child: Column(
@@ -263,7 +249,10 @@ class _MessengerPageState extends State<MessengerPage> with SingleTickerProvider
         children: [
           const Icon(Icons.error_outline, size: 48, color: AppColors.error),
           const SizedBox(height: 12),
-          Text(message, style: AppTextStyles.bodyMedium),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Text(message, textAlign: TextAlign.center, style: AppTextStyles.bodyMedium),
+          ),
           const SizedBox(height: 16),
           ElevatedButton(
             onPressed: () => context.read<MessengerBloc>().add(const LoadChatRoomsEvent()),

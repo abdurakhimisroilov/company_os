@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/network/api_error.dart';
 import '../../data/models/deal_model.dart';
 import '../../data/repositories/deals_repository.dart';
 
@@ -10,41 +13,14 @@ abstract class DealsEvent extends Equatable {
   List<Object?> get props => [];
 }
 
+/// Loads every deal of the organization. A list already on screen stays there
+/// until the new one arrives. [completer] finishes with null on success or
+/// with the error text, so the caller can wait for the request.
 class LoadDealsEvent extends DealsEvent {
-  final String? status;
-  const LoadDealsEvent({this.status});
+  final Completer<String?>? completer;
+  const LoadDealsEvent({this.completer});
   @override
-  List<Object?> get props => [status];
-}
-
-class LoadDealDetailEvent extends DealsEvent {
-  final String id;
-  const LoadDealDetailEvent(this.id);
-  @override
-  List<Object?> get props => [id];
-}
-
-class CreateDealEvent extends DealsEvent {
-  final Map<String, dynamic> data;
-  const CreateDealEvent(this.data);
-  @override
-  List<Object?> get props => [data];
-}
-
-class UpdateDealStatusEvent extends DealsEvent {
-  final String dealId;
-  final String status;
-  const UpdateDealStatusEvent({required this.dealId, required this.status});
-  @override
-  List<Object?> get props => [dealId, status];
-}
-
-class AddDealCommentEvent extends DealsEvent {
-  final String dealId;
-  final String comment;
-  const AddDealCommentEvent({required this.dealId, required this.comment});
-  @override
-  List<Object?> get props => [dealId, comment];
+  List<Object?> get props => [completer];
 }
 
 // ─── States ─────────────────────────────────────────────────────────────────
@@ -60,24 +36,9 @@ class DealsLoading extends DealsState {}
 
 class DealsLoaded extends DealsState {
   final List<DealModel> deals;
-  final String currentFilter;
-  const DealsLoaded({required this.deals, this.currentFilter = 'all'});
+  const DealsLoaded({required this.deals});
   @override
-  List<Object?> get props => [deals, currentFilter];
-}
-
-class DealDetailLoaded extends DealsState {
-  final DealModel deal;
-  const DealDetailLoaded(this.deal);
-  @override
-  List<Object?> get props => [deal];
-}
-
-class DealsActionSuccess extends DealsState {
-  final String message;
-  const DealsActionSuccess(this.message);
-  @override
-  List<Object?> get props => [message];
+  List<Object?> get props => [deals];
 }
 
 class DealsError extends DealsState {
@@ -88,65 +49,27 @@ class DealsError extends DealsState {
 }
 
 // ─── BLoC ───────────────────────────────────────────────────────────────────
+/// Holds the deal list only. The deal card and the deal form talk to the
+/// repository themselves and then ask this bloc to reload.
 class DealsBloc extends Bloc<DealsEvent, DealsState> {
   final DealsRepository dealsRepository;
+  int _requestId = 0;
 
   DealsBloc({required this.dealsRepository}) : super(DealsInitial()) {
     on<LoadDealsEvent>(_onLoadDeals);
-    on<LoadDealDetailEvent>(_onLoadDetail);
-    on<CreateDealEvent>(_onCreateDeal);
-    on<UpdateDealStatusEvent>(_onUpdateStatus);
-    on<AddDealCommentEvent>(_onAddComment);
   }
 
   Future<void> _onLoadDeals(LoadDealsEvent event, Emitter<DealsState> emit) async {
-    emit(DealsLoading());
+    final requestId = ++_requestId;
+    if (state is! DealsLoaded) emit(DealsLoading());
     try {
-      final deals = await dealsRepository.getDeals(status: event.status);
-      emit(DealsLoaded(deals: deals, currentFilter: event.status ?? 'all'));
+      final deals = await dealsRepository.getDeals();
+      if (requestId == _requestId) emit(DealsLoaded(deals: deals));
+      event.completer?.complete(null);
     } catch (e) {
-      emit(DealsError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onLoadDetail(LoadDealDetailEvent event, Emitter<DealsState> emit) async {
-    emit(DealsLoading());
-    try {
-      final deal = await dealsRepository.getDealById(event.id);
-      emit(DealDetailLoaded(deal));
-    } catch (e) {
-      emit(DealsError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onCreateDeal(CreateDealEvent event, Emitter<DealsState> emit) async {
-    emit(DealsLoading());
-    try {
-      await dealsRepository.createDeal(event.data);
-      emit(const DealsActionSuccess('Сделка успешно создана'));
-      add(const LoadDealsEvent());
-    } catch (e) {
-      emit(DealsError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onUpdateStatus(UpdateDealStatusEvent event, Emitter<DealsState> emit) async {
-    try {
-      await dealsRepository.updateDealStatus(event.dealId, event.status);
-      emit(const DealsActionSuccess('Статус сделки обновлён'));
-      add(LoadDealDetailEvent(event.dealId));
-    } catch (e) {
-      emit(DealsError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onAddComment(AddDealCommentEvent event, Emitter<DealsState> emit) async {
-    try {
-      await dealsRepository.addComment(event.dealId, event.comment);
-      emit(const DealsActionSuccess('Комментарий добавлен'));
-      add(LoadDealDetailEvent(event.dealId));
-    } catch (e) {
-      emit(DealsError(e.toString().replaceAll('Exception: ', '')));
+      final message = apiErrorMessage(e, fallback: 'Не удалось загрузить сделки');
+      if (requestId == _requestId && state is! DealsLoaded) emit(DealsError(message));
+      event.completer?.complete(message);
     }
   }
 }

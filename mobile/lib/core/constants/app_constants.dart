@@ -2,9 +2,20 @@ class AppConstants {
   AppConstants._();
 
   // ─── API ───────────────────────────────────────────────────────────────────
-  static const String defaultHost = '45.158.199.215:3000';
-  static const String apiBaseUrl = 'http://45.158.199.215:3000/api/v1';
-  static const String wsBaseUrl = 'ws://45.158.199.215:3000';
+  // Override per build: --dart-define=API_BASE_URL=https://api.example.com/api/v1
+  static const String apiBaseUrl = String.fromEnvironment(
+    'API_BASE_URL',
+    defaultValue: 'http://45.158.199.215:3000/api/v1',
+  );
+
+  /// Scheme + host + port of the API, used to resolve relative `/uploads/...` links.
+  static String get serverOrigin {
+    final uri = Uri.parse(apiBaseUrl);
+    return uri.hasPort ? '${uri.scheme}://${uri.host}:${uri.port}' : '${uri.scheme}://${uri.host}';
+  }
+
+  static String get defaultHost => Uri.parse(apiBaseUrl).authority;
+  static String get wsBaseUrl => serverOrigin.replaceFirst('http', 'ws');
   static const String apiVersion = 'v1';
 
   // ─── Timeouts ──────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
 import '../../../../core/constants/app_strings.dart';
+import '../../../../core/router/app_router.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/utils/validators.dart';
@@ -24,6 +25,7 @@ class _RegisterPageState extends State<RegisterPage> {
   final _passwordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
   final _phoneController = TextEditingController();
+  final _companyController = TextEditingController();
 
   @override
   void dispose() {
@@ -32,41 +34,33 @@ class _RegisterPageState extends State<RegisterPage> {
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     _phoneController.dispose();
+    _companyController.dispose();
     super.dispose();
   }
 
   void _onRegister() {
-    if (_formKey.currentState?.validate() ?? false) {
-      if (_passwordController.text != _confirmPasswordController.text) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Пароли не совпадают'),
-            backgroundColor: AppColors.error,
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+    FocusScope.of(context).unfocus();
+    context.read<AuthBloc>().add(
+          RegisterRequested(
+            fullName: _nameController.text.trim(),
+            email: _emailController.text.trim(),
+            password: _passwordController.text,
+            phone: _phoneController.text.trim().isNotEmpty ? _phoneController.text.trim() : null,
+            companyName: _companyController.text.trim().isNotEmpty ? _companyController.text.trim() : null,
           ),
         );
-        return;
-      }
-
-      context.read<AuthBloc>().add(
-            RegisterRequested(
-              fullName: _nameController.text.trim(),
-              email: _emailController.text.trim(),
-              password: _passwordController.text,
-              phone: _phoneController.text.trim().isNotEmpty
-                  ? _phoneController.text.trim()
-                  : null,
-            ),
-          );
-    }
   }
 
   @override
   Widget build(BuildContext context) {
     return BlocListener<AuthBloc, AuthState>(
+      listenWhen: (previous, current) => ModalRoute.of(context)?.isCurrent ?? true,
       listener: (context, state) {
         if (state is AuthAuthenticated) {
-          context.go('/dashboard');
+          context.go(AppRoutes.dashboard);
         } else if (state is AuthError) {
+          ScaffoldMessenger.of(context).hideCurrentSnackBar();
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text(state.message),
@@ -81,7 +75,7 @@ class _RegisterPageState extends State<RegisterPage> {
       },
       child: Scaffold(
         body: Container(
-          decoration: const BoxDecoration(
+          decoration: BoxDecoration(
             gradient: AppColors.backgroundGradient,
           ),
           child: SafeArea(
@@ -175,6 +169,15 @@ class _RegisterPageState extends State<RegisterPage> {
                             ),
                             const SizedBox(height: 14),
                             AppTextField(
+                              controller: _companyController,
+                              label: 'Название организации (необязательно)',
+                              hint: 'ООО «Моя компания»',
+                              prefixIcon: Icons.apartment_rounded,
+                              textCapitalization: TextCapitalization.sentences,
+                              textInputAction: TextInputAction.next,
+                            ),
+                            const SizedBox(height: 14),
+                            AppTextField(
                               controller: _passwordController,
                               label: AppStrings.password,
                               hint: 'Минимум 6 символов',
@@ -194,6 +197,9 @@ class _RegisterPageState extends State<RegisterPage> {
                               validator: (v) {
                                 if (v == null || v.isEmpty) {
                                   return 'Повторите пароль';
+                                }
+                                if (v != _passwordController.text) {
+                                  return AppStrings.passwordsDoNotMatch;
                                 }
                                 return null;
                               },
@@ -220,7 +226,7 @@ class _RegisterPageState extends State<RegisterPage> {
                                   ),
                                 ),
                                 GestureDetector(
-                                  onTap: () => context.go('/login'),
+                                  onTap: () => context.canPop() ? context.pop() : context.go(AppRoutes.login),
                                   child: Text(
                                     'Войти',
                                     style: AppTextStyles.caption.copyWith(

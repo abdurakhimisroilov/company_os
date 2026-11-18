@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
@@ -8,6 +10,7 @@ import '../../../../core/widgets/glass_card.dart';
 import '../../../../core/widgets/loading_shimmer.dart';
 import '../bloc/suppliers_bloc.dart';
 import '../../data/models/supplier_model.dart';
+import '../widgets/supplier_form_sheet.dart';
 
 class SuppliersPage extends StatefulWidget {
   const SuppliersPage({super.key});
@@ -18,108 +21,56 @@ class SuppliersPage extends StatefulWidget {
 
 class _SuppliersPageState extends State<SuppliersPage> {
   final _searchController = TextEditingController();
+  Timer? _debounce;
 
   @override
   void initState() {
     super.initState();
-    context.read<SuppliersBloc>().add(const LoadSuppliersEvent());
+    context.read<SuppliersBloc>().add(const LoadSuppliersEvent(search: ''));
   }
 
   @override
   void dispose() {
+    _debounce?.cancel();
     _searchController.dispose();
     super.dispose();
   }
 
-  void _onSearch(String query) {
-    context.read<SuppliersBloc>().add(LoadSuppliersEvent(search: query));
+  void _onSearchChanged(String query) {
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 400), () {
+      if (mounted) _reload(search: query);
+    });
+    setState(() {});
   }
 
-  void _showAddSupplierDialog() {
-    final nameController = TextEditingController();
-    final contactController = TextEditingController();
-    final phoneController = TextEditingController();
-    final emailController = TextEditingController();
+  /// Reloads the list and finishes when the server has answered.
+  Future<void> _reload({String? search}) async {
+    final completer = Completer<String?>();
+    context.read<SuppliersBloc>().add(
+          LoadSuppliersEvent(search: search ?? _searchController.text, completer: completer),
+        );
+    final error = await completer.future;
+    if (!mounted || error == null) return;
+    if (context.read<SuppliersBloc>().state is SuppliersLoaded) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error), backgroundColor: AppColors.error),
+      );
+    }
+  }
 
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) => Container(
-        padding: EdgeInsets.only(
-          bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
-          top: 20,
-          left: 20,
-          right: 20,
-        ),
-        decoration: const BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Text('Новый поставщик', style: AppTextStyles.titleMedium),
-            const SizedBox(height: 14),
-            TextField(
-              controller: nameController,
-              decoration: InputDecoration(
-                labelText: 'Название компании',
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: contactController,
-              decoration: InputDecoration(
-                labelText: 'Контактное лицо',
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: phoneController,
-              keyboardType: TextInputType.phone,
-              decoration: InputDecoration(
-                labelText: 'Номер телефона',
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: emailController,
-              keyboardType: TextInputType.emailAddress,
-              decoration: InputDecoration(
-                labelText: 'Email',
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-              ),
-            ),
-            const SizedBox(height: 20),
-            ElevatedButton(
-              onPressed: () {
-                if (nameController.text.trim().isNotEmpty) {
-                  Navigator.pop(ctx);
-                  context.read<SuppliersBloc>().add(CreateSupplierEvent({
-                        'name': nameController.text.trim(),
-                        'contactPerson': contactController.text.trim(),
-                        'phone': phoneController.text.trim(),
-                        'email': emailController.text.trim(),
-                      }));
-                }
-              },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.primaryBlue,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 14),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-              ),
-              child: const Text('Добавить'),
-            ),
-          ],
-        ),
-      ),
+  Future<void> _showAddSupplierDialog() async {
+    final created = await showSupplierFormSheet(context);
+    if (created == null || !mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Поставщик успешно добавлен'), backgroundColor: AppColors.success),
     );
+    await _reload();
+  }
+
+  Future<void> _openSupplier(SupplierModel s) async {
+    await context.push('/suppliers/${s.id}');
+    if (mounted) await _reload();
   }
 
   @override
@@ -127,7 +78,7 @@ class _SuppliersPageState extends State<SuppliersPage> {
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SafeArea(
           bottom: false,
           child: Column(
@@ -135,25 +86,15 @@ class _SuppliersPageState extends State<SuppliersPage> {
               _buildHeader(),
               _buildSearchBar(),
               Expanded(
-                child: BlocConsumer<SuppliersBloc, SuppliersState>(
-                  listener: (context, state) {
-                    if (state is SuppliersActionSuccess) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(state.message), backgroundColor: AppColors.success),
-                      );
-                    }
-                  },
+                child: BlocBuilder<SuppliersBloc, SuppliersState>(
                   builder: (context, state) {
-                    if (state is SuppliersLoading) {
-                      return const LoadingShimmer();
+                    if (state is SuppliersLoaded) {
+                      return _buildList(state.suppliers, state.search);
                     }
                     if (state is SuppliersError) {
                       return _buildErrorState(state.message);
                     }
-                    if (state is SuppliersLoaded) {
-                      return _buildList(state.suppliers);
-                    }
-                    return const SizedBox.shrink();
+                    return const LoadingShimmer();
                   },
                 ),
               ),
@@ -176,10 +117,10 @@ class _SuppliersPageState extends State<SuppliersPage> {
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+            icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
             onPressed: () => context.pop(),
           ),
-          const Expanded(
+          Expanded(
             child: Text(
               'Поставщики',
               style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
@@ -195,17 +136,33 @@ class _SuppliersPageState extends State<SuppliersPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
       child: Container(
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.9),
+          color: AppColors.cardBackground.withOpacity(0.9),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: AppColors.cardBorder),
         ),
         child: TextField(
           controller: _searchController,
-          onSubmitted: _onSearch,
+          onChanged: _onSearchChanged,
+          onSubmitted: (q) {
+            _debounce?.cancel();
+            _reload(search: q);
+          },
+          textInputAction: TextInputAction.search,
           decoration: InputDecoration(
             hintText: 'Поиск поставщика...',
             hintStyle: TextStyle(color: AppColors.textTertiary, fontSize: 14),
             prefixIcon: const Icon(Icons.search, color: AppColors.primaryBlue),
+            suffixIcon: _searchController.text.isEmpty
+                ? null
+                : IconButton(
+                    icon: Icon(Icons.close, size: 18, color: AppColors.textSecondary),
+                    onPressed: () {
+                      _debounce?.cancel();
+                      _searchController.clear();
+                      setState(() {});
+                      _reload(search: '');
+                    },
+                  ),
             border: InputBorder.none,
             contentPadding: const EdgeInsets.symmetric(vertical: 14),
           ),
@@ -214,13 +171,13 @@ class _SuppliersPageState extends State<SuppliersPage> {
     );
   }
 
-  Widget _buildList(List<SupplierModel> suppliers) {
+  Widget _buildList(List<SupplierModel> suppliers, String search) {
+    final searching = search.isNotEmpty;
     if (suppliers.isEmpty) {
       return RefreshIndicator(
-        onRefresh: () async {
-          context.read<SuppliersBloc>().add(LoadSuppliersEvent(search: _searchController.text.trim()));
-        },
+        onRefresh: _reload,
         child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.symmetric(vertical: 60),
           children: [
             Center(
@@ -228,10 +185,14 @@ class _SuppliersPageState extends State<SuppliersPage> {
                 children: [
                   Icon(Icons.inventory_outlined, size: 56, color: AppColors.textTertiary),
                   const SizedBox(height: 12),
-                  Text('Данных пока нет', style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary)),
+                  Text(searching ? 'Ничего не найдено' : 'Данных пока нет', style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary)),
                   const SizedBox(height: 6),
-                  Text('Добавьте поставщика товаров и услуг', style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary)),
+                  Text(
+                    searching ? 'Измените запрос и попробуйте снова' : 'Добавьте поставщика товаров и услуг',
+                    style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary),
+                  ),
                   const SizedBox(height: 16),
+                  if (!searching)
                   ElevatedButton.icon(
                     onPressed: _showAddSupplierDialog,
                     icon: const Icon(Icons.add, size: 18),
@@ -252,18 +213,17 @@ class _SuppliersPageState extends State<SuppliersPage> {
     }
 
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<SuppliersBloc>().add(LoadSuppliersEvent(search: _searchController.text.trim()));
-      },
+      onRefresh: _reload,
       child: ListView.builder(
-        padding: const EdgeInsets.all(16),
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
         itemCount: suppliers.length,
         itemBuilder: (context, index) {
           final s = suppliers[index];
           return Container(
             margin: const EdgeInsets.only(bottom: 12),
             child: GlassCard(
-              onTap: () => context.push('/suppliers/${s.id}'),
+              onTap: () => _openSupplier(s),
               padding: const EdgeInsets.all(16),
               borderRadius: 16,
               child: Row(
@@ -283,13 +243,14 @@ class _SuppliersPageState extends State<SuppliersPage> {
                       children: [
                         Text(
                           s.name,
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15, color: AppColors.textPrimary),
                         ),
                         const SizedBox(height: 4),
-                        Text(
-                          s.contactPerson.isNotEmpty ? s.contactPerson : s.phone,
-                          style: AppTextStyles.caption,
-                        ),
+                        if (s.contactPerson.isNotEmpty || s.phone.isNotEmpty)
+                          Text(
+                            s.contactPerson.isNotEmpty ? s.contactPerson : s.phone,
+                            style: AppTextStyles.caption,
+                          ),
                       ],
                     ),
                   ),
@@ -302,6 +263,13 @@ class _SuppliersPageState extends State<SuppliersPage> {
                         Formatters.formatUzs(s.totalPurchases),
                         style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppColors.primaryBlue),
                       ),
+                      if (s.payableBalance > 0) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          'Долг: ${Formatters.formatUzs(s.payableBalance)}',
+                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: AppColors.error),
+                        ),
+                      ],
                     ],
                   ),
                 ],
@@ -315,18 +283,21 @@ class _SuppliersPageState extends State<SuppliersPage> {
 
   Widget _buildErrorState(String message) {
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.error_outline, size: 48, color: AppColors.error),
-          const SizedBox(height: 12),
-          Text(message, style: AppTextStyles.bodyMedium),
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: () => context.read<SuppliersBloc>().add(const LoadSuppliersEvent()),
-            child: const Text('Повторить'),
-          ),
-        ],
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.error_outline, size: 48, color: AppColors.error),
+            const SizedBox(height: 12),
+            Text(message, style: AppTextStyles.bodyMedium, textAlign: TextAlign.center),
+            const SizedBox(height: 16),
+            ElevatedButton(
+              onPressed: _reload,
+              child: const Text('Повторить'),
+            ),
+          ],
+        ),
       ),
     );
   }

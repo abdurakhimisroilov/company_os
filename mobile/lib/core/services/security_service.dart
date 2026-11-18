@@ -37,12 +37,17 @@ class SecurityService {
 
   // ─── PIN METHODS ────────────────────────────────────────────────────────────
 
+  bool? _pinSet;
+
   Future<bool> isPinSet() async {
+    final known = _pinSet;
+    if (known != null) return known;
     final hash = await _storage.read(key: AppConstants.pinHashKey);
-    return hash != null && hash.isNotEmpty;
+    return _pinSet = hash != null && hash.isNotEmpty;
   }
 
   Future<void> savePin(String pin) async {
+    _pinSet = true;
     final random = Random.secure();
     final saltBytes = List<int>.generate(16, (_) => random.nextInt(256));
     final salt = base64UrlEncode(saltBytes);
@@ -145,6 +150,7 @@ class SecurityService {
   }
 
   Future<void> clearPin() async {
+    _pinSet = false;
     await _storage.delete(key: AppConstants.pinHashKey);
     await _storage.delete(key: AppConstants.pinSaltKey);
     await resetLockout();

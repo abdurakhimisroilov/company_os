@@ -22,7 +22,10 @@ class _DefaultShimmerContent extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
+    // The placeholder is taller than short screens; let it run off the bottom
+    // instead of overflowing.
+    return SingleChildScrollView(
+      physics: const NeverScrollableScrollPhysics(),
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -77,7 +80,7 @@ class _ShimmerBox extends StatelessWidget {
       height: height,
       width: width,
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: AppColors.cardBackground,
         borderRadius: BorderRadius.circular(borderRadius),
       ),
     );
@@ -96,7 +99,7 @@ class ShimmerMetricCard extends StatelessWidget {
       child: Container(
         height: 100,
         decoration: BoxDecoration(
-          color: Colors.white,
+          color: AppColors.cardBackground,
           borderRadius: BorderRadius.circular(16),
         ),
       ),
@@ -117,7 +120,7 @@ class ShimmerListItem extends StatelessWidget {
         height: height,
         margin: const EdgeInsets.only(bottom: 10),
         decoration: BoxDecoration(
-          color: Colors.white,
+          color: AppColors.cardBackground,
           borderRadius: BorderRadius.circular(16),
         ),
       ),

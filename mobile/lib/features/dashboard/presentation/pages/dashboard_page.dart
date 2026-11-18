@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
@@ -5,7 +7,6 @@ import '../../../../core/constants/app_strings.dart';
 import '../../../../core/router/app_router.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
-import '../../../../core/utils/formatters.dart';
 import '../../../../core/widgets/bottom_nav_bar.dart';
 import '../../../../core/widgets/gradient_header_card.dart';
 import '../../../../core/widgets/loading_shimmer.dart';
@@ -15,7 +16,9 @@ import '../bloc/dashboard_bloc.dart';
 import '../../data/models/dashboard_stats_model.dart';
 import '../../../notifications/presentation/bloc/notifications_bloc.dart';
 import '../../../../core/di/injection.dart';
+import '../../../../core/services/app_session.dart';
 import '../../../../core/services/app_update_service.dart';
+import '../../../finance/data/company_currency.dart';
 import '../../../companies/data/models/company_model.dart';
 import '../../../companies/data/repositories/company_repository.dart';
 import '../../../companies/presentation/widgets/company_selector_sheet.dart';
@@ -31,64 +34,115 @@ class _DashboardPageState extends State<DashboardPage> {
   int _currentNavIndex = 0;
   String _selectedPeriod = 'month';
   CompanyModel? _currentCompany;
+  bool _companyLoadFailed = false;
 
   final List<_PeriodOption> _periods = const [
-    _PeriodOption(label: 'Сегодня', value: 'today'),
-    _PeriodOption(label: 'Неделя', value: 'week'),
-    _PeriodOption(label: 'Месяц', value: 'month'),
-    _PeriodOption(label: 'Год', value: 'year'),
+    _PeriodOption(label: 'Сегодня', value: 'today', changeLabel: 'за сегодня'),
+    _PeriodOption(label: 'Неделя', value: 'week', changeLabel: 'за неделю'),
+    _PeriodOption(label: 'Месяц', value: 'month', changeLabel: 'с начала месяца'),
+    _PeriodOption(label: 'Год', value: 'year', changeLabel: 'с начала года'),
   ];
 
   @override
   void initState() {
     super.initState();
-    _loadCurrentCompany();
-    context.read<DashboardBloc>().add(LoadDashboardStats(period: _selectedPeriod));
-    context.read<NotificationsBloc>().add(LoadNotificationsEvent());
+    AppSession.instance.addListener(_onSessionChanged);
+    _reloadAll();
+    // The in-app updater installs an APK, which only exists on Android.
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          getIt<AppUpdateService>().showUpdatePrompt(context);
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    AppSession.instance.removeListener(_onSessionChanged);
+    super.dispose();
+  }
+
+  /// Sign-in, sign-out or another organization: everything shown is stale.
+  void _onSessionChanged() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        getIt<AppUpdateService>().showUpdatePrompt(context);
-      }
+      if (!mounted) return;
+      setState(() {
+        _currentCompany = null;
+        _companyLoadFailed = false;
+      });
+      _reloadAll();
     });
   }
 
+  void _reloadAll() {
+    _loadCurrentCompany();
+    context.read<DashboardBloc>().add(LoadDashboardStats(period: _selectedPeriod));
+    context.read<NotificationsBloc>().add(LoadNotificationsEvent());
+  }
+
+  /// Re-reads everything without hiding the content; resolves when the figures have arrived.
+  Future<void> _refresh() async {
+    final done = Completer<void>();
+    context.read<DashboardBloc>().add(RefreshDashboardStats(period: _selectedPeriod, done: done));
+    context.read<NotificationsBloc>().add(LoadNotificationsEvent());
+    await Future.wait([done.future, _loadCurrentCompany()]);
+  }
+
   Future<void> _loadCurrentCompany() async {
+    final session = AppSession.instance.value;
     try {
       final comp = await getIt<CompanyRepository>().getCurrentCompany();
-      if (mounted) {
-        setState(() => _currentCompany = comp);
-      }
-    } catch (_) {}
+      if (!mounted || session != AppSession.instance.value) return;
+      final hasCompany = comp.id.isNotEmpty;
+      if (hasCompany) CompanyCurrency.instance.set(comp.currency);
+      setState(() {
+        _currentCompany = hasCompany ? comp : null;
+        _companyLoadFailed = false;
+      });
+    } catch (_) {
+      if (!mounted || session != AppSession.instance.value) return;
+      setState(() => _companyLoadFailed = true);
+    }
   }
 
   void _onPeriodChanged(String period) {
+    if (period == _selectedPeriod) return;
     setState(() => _selectedPeriod = period);
     context.read<DashboardBloc>().add(LoadDashboardStats(period: period));
   }
 
-  void _onNavTap(int index) {
+  /// Opens a screen and refreshes the dashboard when the user comes back, so
+  /// whatever was added or changed there is reflected immediately.
+  Future<void> _open(String route) async {
+    await context.push(route);
+    if (mounted) _refresh();
+  }
+
+  Future<void> _onNavTap(int index) async {
+    const routes = {1: AppRoutes.inventory, 3: AppRoutes.tasks, 4: AppRoutes.settings};
+    final route = routes[index];
+    if (route == null) return;
     setState(() => _currentNavIndex = index);
-    switch (index) {
-      case 0:
-        break; // Already on dashboard
-      case 1:
-        context.push(AppRoutes.inventory);
-        break;
-      case 3:
-        context.push(AppRoutes.tasks);
-        break;
-      case 4:
-        context.push(AppRoutes.settings);
-        break;
-    }
+    await context.push(route);
+    if (!mounted) return;
+    setState(() => _currentNavIndex = 0);
+    _refresh();
   }
 
   void _onFabTap() {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
-      builder: (ctx) => _QuickActionSheet(),
+      builder: (ctx) => _QuickActionSheet(onOpen: _open),
     );
+  }
+
+  String get _subtitle {
+    if (_currentCompany != null) return 'Организация • Сменить';
+    if (_companyLoadFailed) return 'Организация не загружена • Выбрать';
+    return 'Бизнес-система';
   }
 
   @override
@@ -96,7 +150,7 @@ class _DashboardPageState extends State<DashboardPage> {
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           gradient: AppColors.backgroundGradient,
         ),
         child: SafeArea(
@@ -105,37 +159,30 @@ class _DashboardPageState extends State<DashboardPage> {
             children: [
               _buildAppBar(),
               Expanded(
-                child: BlocBuilder<DashboardBloc, DashboardState>(
-                  builder: (context, state) {
-                    if (state is DashboardLoading) {
-                      return const LoadingShimmer();
+                child: BlocConsumer<DashboardBloc, DashboardState>(
+                  listenWhen: (previous, current) =>
+                      current is DashboardLoaded &&
+                      current.notice != null &&
+                      (previous is! DashboardLoaded || previous.noticeId != current.noticeId),
+                  listener: (context, state) {
+                    if (state is DashboardLoaded && state.notice != null) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text(state.notice!), backgroundColor: AppColors.error),
+                      );
                     }
+                  },
+                  builder: (context, state) {
                     if (state is DashboardError) {
-                      return _buildContent(const DashboardStatsModel(
-                        totalBalance: 1248500000,
-                        balanceChangePercent: 12.4,
-                        income: 420800000,
-                        expenses: 185300000,
-                        sales: 890400000,
-                        stockBalance: 324000000,
-                        activeDeals: 14,
-                        pendingTasks: 5,
-                      ));
+                      return _buildErrorState(state.message);
                     }
                     if (state is DashboardLoaded) {
-                      return _buildContent(state.stats);
+                      // The currency label arrives with the organization.
+                      return ValueListenableBuilder<String>(
+                        valueListenable: CompanyCurrency.instance,
+                        builder: (context, _, __) => _buildContent(state),
+                      );
                     }
-                    // Fallback initial/demo state
-                    return _buildContent(const DashboardStatsModel(
-                      totalBalance: 1248500000,
-                      balanceChangePercent: 12.4,
-                      income: 420800000,
-                      expenses: 185300000,
-                      sales: 890400000,
-                      stockBalance: 324000000,
-                      activeDeals: 14,
-                      pendingTasks: 5,
-                    ));
+                    return const LoadingShimmer();
                   },
                 ),
               ),
@@ -164,9 +211,13 @@ class _DashboardPageState extends State<DashboardPage> {
                   context,
                   currentCompany: _currentCompany,
                   onCompanySelected: (company) {
-                    setState(() => _currentCompany = company);
-                    context.read<DashboardBloc>().add(LoadDashboardStats(period: _selectedPeriod));
-                    context.read<NotificationsBloc>().add(LoadNotificationsEvent());
+                    if (!mounted) return;
+                    CompanyCurrency.instance.set(company.currency);
+                    setState(() {
+                      _currentCompany = company;
+                      _companyLoadFailed = false;
+                    });
+                    _reloadAll();
                   },
                 );
               },
@@ -214,7 +265,7 @@ class _DashboardPageState extends State<DashboardPage> {
                                 ),
                               ),
                               const SizedBox(width: 4),
-                              const Icon(
+                              Icon(
                                 Icons.keyboard_arrow_down_rounded,
                                 size: 18,
                                 color: AppColors.textSecondary,
@@ -222,7 +273,7 @@ class _DashboardPageState extends State<DashboardPage> {
                             ],
                           ),
                           Text(
-                            _currentCompany != null ? 'Организация • Сменить' : 'Бизнес-система',
+                            _subtitle,
                             style: AppTextStyles.captionSmall.copyWith(
                               color: AppColors.primaryBlue,
                               fontWeight: FontWeight.w600,
@@ -246,24 +297,19 @@ class _DashboardPageState extends State<DashboardPage> {
               }
 
               return GestureDetector(
-                onTap: () async {
-                  await context.push(AppRoutes.notifications);
-                  if (context.mounted) {
-                    context.read<NotificationsBloc>().add(LoadNotificationsEvent());
-                  }
-                },
+                onTap: () => _open(AppRoutes.notifications),
                 child: Container(
                   width: 40,
                   height: 40,
                   decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.85),
+                    color: AppColors.cardBackground.withOpacity(0.85),
                     borderRadius: BorderRadius.circular(12),
                     border: Border.all(color: AppColors.cardBorder),
                   ),
                   child: Stack(
                     alignment: Alignment.center,
                     children: [
-                      const Icon(
+                      Icon(
                         Icons.notifications_outlined,
                         color: AppColors.textPrimary,
                         size: 20,
@@ -305,12 +351,13 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  Widget _buildContent(DashboardStatsModel stats) {
+  Widget _buildContent(DashboardLoaded state) {
+    final DashboardStatsModel stats = state.stats;
+    final shownPeriod = _periods.firstWhere((p) => p.value == state.activePeriod, orElse: () => _periods[2]);
+    final hasDebts = stats.customerDebts > 0 || stats.supplierDebts > 0;
+
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<DashboardBloc>().add(RefreshDashboardStats(period: _selectedPeriod));
-        context.read<NotificationsBloc>().add(LoadNotificationsEvent());
-      },
+      onRefresh: _refresh,
       color: AppColors.primaryBlue,
       child: ListView(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
@@ -318,17 +365,22 @@ class _DashboardPageState extends State<DashboardPage> {
         children: [
           // Period selector filter chips
           _buildPeriodSelector(),
-          const SizedBox(height: 16),
+          SizedBox(
+            height: 16,
+            child: state.isUpdating
+                ? const Center(child: LinearProgressIndicator(minHeight: 2, color: AppColors.primaryBlue))
+                : null,
+          ),
 
           // Main Blue-Purple Gradient Header Card
           GradientHeaderCard(
             label: AppStrings.generalResult,
-            value: Formatters.formatUzs(stats.totalBalance),
+            value: money(stats.totalBalance),
             subtitle: AppStrings.totalBalance,
             changePercent: stats.balanceChangePercent,
-            changeLabel: AppStrings.vsLastPeriod,
+            changeLabel: shownPeriod.changeLabel,
             isPositive: stats.balanceChangePercent >= 0,
-            onTap: () => context.push(AppRoutes.finance),
+            onTap: () => _open(AppRoutes.finance),
           ),
           const SizedBox(height: 20),
 
@@ -338,24 +390,24 @@ class _DashboardPageState extends State<DashboardPage> {
               Expanded(
                 child: MetricCard(
                   label: AppStrings.income,
-                  value: Formatters.formatCompact(stats.income) + ' сум',
+                  value: moneyCompact(stats.income),
                   icon: Icons.arrow_downward_rounded,
                   iconColor: AppColors.success,
                   iconBgColor: AppColors.iconBgGreen,
                   valueColor: AppColors.success,
-                  onTap: () => context.push(AppRoutes.finance),
+                  onTap: () => _open(AppRoutes.finance),
                 ),
               ),
               const SizedBox(width: 12),
               Expanded(
                 child: MetricCard(
                   label: AppStrings.expenses,
-                  value: Formatters.formatCompact(stats.expenses) + ' сум',
+                  value: moneyCompact(stats.expenses),
                   icon: Icons.arrow_upward_rounded,
                   iconColor: AppColors.error,
                   iconBgColor: AppColors.iconBgRed,
                   valueColor: AppColors.error,
-                  onTap: () => context.push(AppRoutes.finance),
+                  onTap: () => _open(AppRoutes.finance),
                 ),
               ),
             ],
@@ -366,22 +418,22 @@ class _DashboardPageState extends State<DashboardPage> {
               Expanded(
                 child: MetricCard(
                   label: AppStrings.sales,
-                  value: Formatters.formatCompact(stats.sales) + ' сум',
+                  value: moneyCompact(stats.sales),
                   icon: Icons.shopping_bag_outlined,
                   iconColor: AppColors.primaryBlue,
                   iconBgColor: AppColors.iconBgBlue,
-                  onTap: () => context.push(AppRoutes.sales),
+                  onTap: () => _open(AppRoutes.sales),
                 ),
               ),
               const SizedBox(width: 12),
               Expanded(
                 child: MetricCard(
                   label: AppStrings.stockBalance,
-                  value: Formatters.formatCompact(stats.stockBalance) + ' сум',
+                  value: moneyCompact(stats.stockBalance),
                   icon: Icons.inventory_2_outlined,
                   iconColor: AppColors.secondaryLavender,
                   iconBgColor: AppColors.iconBgPurple,
-                  onTap: () => context.push(AppRoutes.inventory),
+                  onTap: () => _open(AppRoutes.inventory),
                 ),
               ),
             ],
@@ -402,11 +454,29 @@ class _DashboardPageState extends State<DashboardPage> {
           // Nav Menu Items List
           NavMenuItem(
             title: AppStrings.productsAndWarehouse,
-            subtitle: 'Остатки, поступления и списания',
+            subtitle: 'Товаров в каталоге: ${stats.totalProducts}',
             icon: Icons.inventory_2_rounded,
             iconColor: AppColors.primaryBlue,
             iconBgColor: AppColors.iconBgBlue,
-            onTap: () => context.push(AppRoutes.inventory),
+            onTap: () => _open(AppRoutes.inventory),
+          ),
+          const SizedBox(height: 10),
+          NavMenuItem(
+            title: 'Поставки',
+            subtitle: 'Приход товара от поставщиков',
+            icon: Icons.local_shipping_rounded,
+            iconColor: AppColors.secondaryLavender,
+            iconBgColor: AppColors.iconBgPurple,
+            onTap: () => _open(AppRoutes.incomingGoods),
+          ),
+          const SizedBox(height: 10),
+          NavMenuItem(
+            title: 'Продажи',
+            subtitle: 'Чеки, оплаты и возвраты',
+            icon: Icons.shopping_bag_rounded,
+            iconColor: AppColors.primaryBlue,
+            iconBgColor: AppColors.iconBgBlue,
+            onTap: () => _open(AppRoutes.sales),
           ),
           const SizedBox(height: 10),
           NavMenuItem(
@@ -416,25 +486,43 @@ class _DashboardPageState extends State<DashboardPage> {
             iconColor: AppColors.secondaryLavender,
             iconBgColor: AppColors.iconBgPurple,
             badge: stats.activeDeals > 0 ? stats.activeDeals : null,
-            onTap: () => context.push(AppRoutes.deals),
+            onTap: () => _open(AppRoutes.deals),
+          ),
+          const SizedBox(height: 10),
+          NavMenuItem(
+            title: 'Клиенты',
+            subtitle: stats.customerDebts > 0 ? 'Нам должны: ${money(stats.customerDebts)}' : 'База клиентов и их покупки',
+            icon: Icons.groups_rounded,
+            iconColor: AppColors.success,
+            iconBgColor: AppColors.iconBgGreen,
+            onTap: () => _open(AppRoutes.customers),
+          ),
+          const SizedBox(height: 10),
+          NavMenuItem(
+            title: 'Поставщики',
+            subtitle: stats.supplierDebts > 0 ? 'Мы должны: ${money(stats.supplierDebts)}' : 'Контакты и история поставок',
+            icon: Icons.factory_rounded,
+            iconColor: const Color(0xFFF59E0B),
+            iconBgColor: AppColors.iconBgOrange,
+            onTap: () => _open(AppRoutes.suppliers),
           ),
           const SizedBox(height: 10),
           NavMenuItem(
             title: AppStrings.finance,
-            subtitle: 'Касса, счета и транзакции',
+            subtitle: hasDebts ? 'Касса, счета, операции и долги' : 'Касса, счета и транзакции',
             icon: Icons.account_balance_wallet_rounded,
             iconColor: AppColors.success,
             iconBgColor: AppColors.iconBgGreen,
-            onTap: () => context.push(AppRoutes.finance),
+            onTap: () => _open(AppRoutes.finance),
           ),
           const SizedBox(height: 10),
           NavMenuItem(
             title: AppStrings.reportsAndAnalytics,
-            subtitle: 'Финансовые, складские и продажи',
+            subtitle: 'Финансы и продажи за период',
             icon: Icons.bar_chart_rounded,
             iconColor: const Color(0xFFF59E0B),
             iconBgColor: AppColors.iconBgOrange,
-            onTap: () => context.push(AppRoutes.reports),
+            onTap: () => _open(AppRoutes.reports),
           ),
           const SizedBox(height: 10),
           NavMenuItem(
@@ -444,7 +532,25 @@ class _DashboardPageState extends State<DashboardPage> {
             iconColor: const Color(0xFF06B6D4),
             iconBgColor: AppColors.iconBgTeal,
             badge: stats.pendingTasks > 0 ? stats.pendingTasks : null,
-            onTap: () => context.push(AppRoutes.tasks),
+            onTap: () => _open(AppRoutes.tasks),
+          ),
+          const SizedBox(height: 10),
+          NavMenuItem(
+            title: 'Документы',
+            subtitle: 'Договоры, акты и файлы компании',
+            icon: Icons.folder_copy_rounded,
+            iconColor: AppColors.primaryBlue,
+            iconBgColor: AppColors.iconBgBlue,
+            onTap: () => _open(AppRoutes.documents),
+          ),
+          const SizedBox(height: 10),
+          NavMenuItem(
+            title: 'Мессенджер',
+            subtitle: 'Переписка с сотрудниками',
+            icon: Icons.chat_bubble_rounded,
+            iconColor: const Color(0xFF06B6D4),
+            iconBgColor: AppColors.iconBgTeal,
+            onTap: () => _open(AppRoutes.messenger),
           ),
           const SizedBox(height: 30),
         ],
@@ -467,7 +573,7 @@ class _DashboardPageState extends State<DashboardPage> {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               decoration: BoxDecoration(
-                color: isSelected ? AppColors.primaryBlue : Colors.white.withOpacity(0.85),
+                color: isSelected ? AppColors.primaryBlue : AppColors.cardBackground.withOpacity(0.85),
                 borderRadius: BorderRadius.circular(20),
                 border: Border.all(
                   color: isSelected ? AppColors.primaryBlue : AppColors.cardBorder,
@@ -510,8 +616,8 @@ class _DashboardPageState extends State<DashboardPage> {
             Text(message, textAlign: TextAlign.center, style: AppTextStyles.bodyMedium),
             const SizedBox(height: 20),
             ElevatedButton(
-              onPressed: () => context.read<DashboardBloc>().add(LoadDashboardStats(period: _selectedPeriod)),
-              child: const Text(AppStrings.tryAgain),
+              onPressed: _reloadAll,
+              child: const Text('Повторить'),
             ),
           ],
         ),
@@ -523,16 +629,24 @@ class _DashboardPageState extends State<DashboardPage> {
 class _PeriodOption {
   final String label;
   final String value;
-  const _PeriodOption({required this.label, required this.value});
+
+  /// What the balance change percentage is measured against.
+  final String changeLabel;
+  const _PeriodOption({required this.label, required this.value, required this.changeLabel});
 }
 
 class _QuickActionSheet extends StatelessWidget {
+  const _QuickActionSheet({required this.onOpen});
+
+  /// Opens the chosen screen from the dashboard, which refreshes on return.
+  final ValueChanged<String> onOpen;
+
   @override
   Widget build(BuildContext context) {
     return Container(
       padding: const EdgeInsets.all(24),
-      decoration: const BoxDecoration(
-        color: Colors.white,
+      decoration: BoxDecoration(
+        color: AppColors.cardBackground,
         borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
       child: Column(
@@ -561,7 +675,7 @@ class _QuickActionSheet extends StatelessWidget {
                 color: AppColors.primaryBlue,
                 onTap: () {
                   Navigator.pop(context);
-                  context.push(AppRoutes.salesAdd);
+                  onOpen(AppRoutes.salesAdd);
                 },
               ),
               _ActionItem(
@@ -570,7 +684,7 @@ class _QuickActionSheet extends StatelessWidget {
                 color: AppColors.success,
                 onTap: () {
                   Navigator.pop(context);
-                  context.push(AppRoutes.financeIncomeAdd);
+                  onOpen(AppRoutes.financeIncomeAdd);
                 },
               ),
               _ActionItem(
@@ -579,7 +693,7 @@ class _QuickActionSheet extends StatelessWidget {
                 color: AppColors.error,
                 onTap: () {
                   Navigator.pop(context);
-                  context.push(AppRoutes.financeExpenseAdd);
+                  onOpen(AppRoutes.financeExpenseAdd);
                 },
               ),
               _ActionItem(
@@ -588,7 +702,7 @@ class _QuickActionSheet extends StatelessWidget {
                 color: AppColors.secondaryLavender,
                 onTap: () {
                   Navigator.pop(context);
-                  context.push(AppRoutes.tasks);
+                  onOpen(AppRoutes.taskAdd);
                 },
               ),
             ],

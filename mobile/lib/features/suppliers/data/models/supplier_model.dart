@@ -4,8 +4,8 @@ class SupplierPurchaseHistoryModel {
   final String id;
   final String invoiceNumber;
   final double amount;
-  final DateTime date;
-  final String status;
+  final DateTime? date;
+  final String status; // pending | received | cancelled
 
   const SupplierPurchaseHistoryModel({
     required this.id,
@@ -18,10 +18,10 @@ class SupplierPurchaseHistoryModel {
   factory SupplierPurchaseHistoryModel.fromJson(Map<String, dynamic> json) {
     return SupplierPurchaseHistoryModel(
       id: JsonHelpers.toStr(json['id']),
-      invoiceNumber: JsonHelpers.toStr(json['invoiceNumber'] ?? json['shipment_number'], 'б/н'),
-      amount: JsonHelpers.toDouble(json['amount'] ?? json['totalCost'] ?? json['total_amount']),
-      date: JsonHelpers.toDateTime(json['date'] ?? json['created_at']),
-      status: JsonHelpers.toStr(json['status'], 'received'),
+      invoiceNumber: JsonHelpers.toStr(json['shipment_number'] ?? json['invoice_number'] ?? json['invoiceNumber']),
+      amount: JsonHelpers.toDouble(json['amount'] ?? json['total_amount'] ?? json['totalCost']),
+      date: JsonHelpers.toOptionalDateTime(json['created_at'] ?? json['date'])?.toLocal(),
+      status: JsonHelpers.toStr(json['status']).toLowerCase(),
     );
   }
 }
@@ -50,34 +50,20 @@ class SupplierModel {
   });
 
   factory SupplierModel.fromJson(Map<String, dynamic> json) {
-    final pList = JsonHelpers.toList(json['purchases'] ?? json['shipments'])
+    final pList = JsonHelpers.toList(json['shipments'] ?? json['purchases'] ?? json['purchaseHistory'])
         .map((e) => SupplierPurchaseHistoryModel.fromJson(JsonHelpers.toMap(e)))
         .toList();
 
     return SupplierModel(
       id: JsonHelpers.toStr(json['id']),
-      name: JsonHelpers.toStr(json['name'], 'Поставщик'),
-      contactPerson: JsonHelpers.extractString(
-        json['contactPerson'] ?? json['contact'],
-        preferredKeys: ['name', 'fullName'],
-        fallback: '',
-      ),
+      name: JsonHelpers.toStr(json['name']),
+      contactPerson: JsonHelpers.toStr(json['contact_person'] ?? json['contactPerson']),
       phone: JsonHelpers.toStr(json['phone']),
       email: JsonHelpers.toStr(json['email']),
       address: JsonHelpers.toStr(json['address']),
-      totalPurchases: JsonHelpers.toDouble(json['totalPurchases'] ?? json['total_purchases']),
-      payableBalance: JsonHelpers.toDouble(json['payableBalance'] ?? json['debt'] ?? json['balance']),
+      totalPurchases: JsonHelpers.toDouble(json['totalPurchases'] ?? json['total_purchases'] ?? json['totalSales']),
+      payableBalance: JsonHelpers.toDouble(json['balance'] ?? json['payableBalance'] ?? json['debt']),
       purchases: pList,
     );
-  }
-
-  Map<String, dynamic> toJson() {
-    return {
-      'name': name,
-      'contactPerson': contactPerson,
-      'phone': phone,
-      'email': email,
-      'address': address,
-    };
   }
 }

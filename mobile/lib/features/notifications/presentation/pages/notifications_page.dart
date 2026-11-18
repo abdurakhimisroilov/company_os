@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
@@ -20,7 +21,27 @@ class _NotificationsPageState extends State<NotificationsPage> {
   @override
   void initState() {
     super.initState();
-    context.read<NotificationsBloc>().add(LoadNotificationsEvent());
+    context.read<NotificationsBloc>().add(const LoadNotificationsEvent());
+  }
+
+  Future<void> _refresh() {
+    final done = Completer<void>();
+    context.read<NotificationsBloc>().add(LoadNotificationsEvent(done: done));
+    return done.future;
+  }
+
+  void _open(AppNotificationModel n) {
+    if (!n.isRead) {
+      context.read<NotificationsBloc>().add(MarkNotificationReadEvent(n.id));
+    }
+    final route = n.targetRoute;
+    if (route != null) context.push(route);
+  }
+
+  String _when(DateTime date) {
+    final now = DateTime.now();
+    final sameDay = date.year == now.year && date.month == now.month && date.day == now.day;
+    return sameDay ? Formatters.formatTime(date) : Formatters.formatDateTime(date);
   }
 
   @override
@@ -32,42 +53,61 @@ class _NotificationsPageState extends State<NotificationsPage> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+          icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
           onPressed: () => context.pop(),
         ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.done_all, color: AppColors.primaryBlue),
-            tooltip: 'Прочитать все',
-            onPressed: () {
-              context.read<NotificationsBloc>().add(MarkAllNotificationsReadEvent());
+          BlocBuilder<NotificationsBloc, NotificationsState>(
+            builder: (context, state) {
+              final hasUnread = state is NotificationsLoaded && state.unreadCount > 0;
+              if (!hasUnread) return const SizedBox.shrink();
+              return IconButton(
+                icon: const Icon(Icons.done_all, color: AppColors.primaryBlue),
+                tooltip: 'Прочитать все',
+                onPressed: () {
+                  context.read<NotificationsBloc>().add(MarkAllNotificationsReadEvent());
+                },
+              );
             },
           ),
         ],
       ),
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
-        child: BlocBuilder<NotificationsBloc, NotificationsState>(
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
+        child: BlocConsumer<NotificationsBloc, NotificationsState>(
+          listenWhen: (previous, current) => current is NotificationsLoaded && current.actionError != null,
+          listener: (context, state) {
+            if (state is NotificationsLoaded && state.actionError != null) {
+              ScaffoldMessenger.of(context)
+                ..hideCurrentSnackBar()
+                ..showSnackBar(SnackBar(content: Text(state.actionError!), backgroundColor: AppColors.error));
+            }
+          },
           builder: (context, state) {
-            if (state is NotificationsLoading) {
+            if (state is NotificationsLoading || state is NotificationsInitial) {
               return const LoadingShimmer();
             }
             if (state is NotificationsError) {
               return Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      state.message,
-                      style: AppTextStyles.bodyMedium.copyWith(color: AppColors.error),
-                      textAlign: TextAlign.center,
-                    ),
-                    const SizedBox(height: 12),
-                    ElevatedButton(
-                      onPressed: () => context.read<NotificationsBloc>().add(LoadNotificationsEvent()),
-                      child: const Text('Повторить'),
-                    ),
-                  ],
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.error_outline, size: 48, color: AppColors.error),
+                      const SizedBox(height: 12),
+                      Text(
+                        state.message,
+                        style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textPrimary),
+                        textAlign: TextAlign.center,
+                      ),
+                      const SizedBox(height: 12),
+                      ElevatedButton(
+                        onPressed: () => context.read<NotificationsBloc>().add(const LoadNotificationsEvent()),
+                        child: const Text('Повторить'),
+                      ),
+                    ],
+                  ),
                 ),
               );
             }
@@ -83,26 +123,36 @@ class _NotificationsPageState extends State<NotificationsPage> {
 
   Widget _buildList(List<AppNotificationModel> list) {
     if (list.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const Icon(Icons.notifications_off_outlined, size: 48, color: AppColors.textTertiary),
-            const SizedBox(height: 12),
-            Text(
-              'Уведомлений пока нет',
-              style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary),
+      return RefreshIndicator(
+        onRefresh: _refresh,
+        child: LayoutBuilder(
+          builder: (context, constraints) => SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            child: SizedBox(
+              height: constraints.maxHeight,
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.notifications_off_outlined, size: 48, color: AppColors.textTertiary),
+                    const SizedBox(height: 12),
+                    Text(
+                      'Уведомлений пока нет',
+                      style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary),
+                    ),
+                  ],
+                ),
+              ),
             ),
-          ],
+          ),
         ),
       );
     }
 
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<NotificationsBloc>().add(LoadNotificationsEvent());
-      },
+      onRefresh: _refresh,
       child: ListView.builder(
+        physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(16),
         itemCount: list.length,
         itemBuilder: (context, index) {
@@ -122,9 +172,6 @@ class _NotificationsPageState extends State<NotificationsPage> {
             ),
             onDismissed: (_) {
               context.read<NotificationsBloc>().add(DeleteNotificationEvent(n.id));
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Уведомление удалено'), duration: Duration(seconds: 2)),
-              );
             },
             child: _buildNotificationCard(n),
           );
@@ -139,7 +186,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
     Color iconBg;
 
     final typeLower = n.type.toLowerCase();
-    if (typeLower.contains('finance') || typeLower.contains('payment')) {
+    if (typeLower.contains('finance') || typeLower.contains('payment') || typeLower.contains('sale')) {
       icon = Icons.payments_outlined;
       iconColor = AppColors.success;
       iconBg = AppColors.iconBgGreen;
@@ -164,11 +211,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       child: InkWell(
-        onTap: () {
-          if (!n.isRead) {
-            context.read<NotificationsBloc>().add(MarkNotificationReadEvent(n.id));
-          }
-        },
+        onTap: () => _open(n),
         borderRadius: BorderRadius.circular(16),
         child: GlassCard(
           padding: const EdgeInsets.all(14),
@@ -220,7 +263,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
                     ),
                     const SizedBox(height: 6),
                     Text(
-                      Formatters.formatTime(n.createdAt),
+                      _when(n.createdAt),
                       style: AppTextStyles.caption.copyWith(fontSize: 11),
                     ),
                   ],

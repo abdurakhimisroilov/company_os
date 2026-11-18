@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/network/api_error.dart';
 import '../../data/models/customer_model.dart';
 import '../../data/repositories/customers_repository.dart';
 
@@ -10,25 +13,15 @@ abstract class CustomersEvent extends Equatable {
   List<Object?> get props => [];
 }
 
+/// Loads the customer list. When a list is already on screen it stays there
+/// until the new one arrives. [completer] finishes with null on success or
+/// with the error text, so the caller can wait for the request.
 class LoadCustomersEvent extends CustomersEvent {
   final String? search;
-  const LoadCustomersEvent({this.search});
+  final Completer<String?>? completer;
+  const LoadCustomersEvent({this.search, this.completer});
   @override
-  List<Object?> get props => [search];
-}
-
-class LoadCustomerDetailEvent extends CustomersEvent {
-  final String id;
-  const LoadCustomerDetailEvent(this.id);
-  @override
-  List<Object?> get props => [id];
-}
-
-class CreateCustomerEvent extends CustomersEvent {
-  final Map<String, dynamic> data;
-  const CreateCustomerEvent(this.data);
-  @override
-  List<Object?> get props => [data];
+  List<Object?> get props => [search, completer];
 }
 
 // ─── States ─────────────────────────────────────────────────────────────────
@@ -50,20 +43,6 @@ class CustomersLoaded extends CustomersState {
   List<Object?> get props => [customers, search];
 }
 
-class CustomerDetailLoaded extends CustomersState {
-  final CustomerModel customer;
-  const CustomerDetailLoaded(this.customer);
-  @override
-  List<Object?> get props => [customer];
-}
-
-class CustomersActionSuccess extends CustomersState {
-  final String message;
-  const CustomersActionSuccess(this.message);
-  @override
-  List<Object?> get props => [message];
-}
-
 class CustomersError extends CustomersState {
   final String message;
   const CustomersError(this.message);
@@ -72,43 +51,30 @@ class CustomersError extends CustomersState {
 }
 
 // ─── BLoC ───────────────────────────────────────────────────────────────────
+/// Holds the customer list only. Customer cards and forms talk to the
+/// repository themselves and then ask this bloc to reload.
 class CustomersBloc extends Bloc<CustomersEvent, CustomersState> {
   final CustomersRepository customersRepository;
+  String _search = '';
+  int _requestId = 0;
 
   CustomersBloc({required this.customersRepository}) : super(CustomersInitial()) {
     on<LoadCustomersEvent>(_onLoadCustomers);
-    on<LoadCustomerDetailEvent>(_onLoadDetail);
-    on<CreateCustomerEvent>(_onCreateCustomer);
   }
 
   Future<void> _onLoadCustomers(LoadCustomersEvent event, Emitter<CustomersState> emit) async {
-    emit(CustomersLoading());
+    if (event.search != null) _search = event.search!.trim();
+    final search = _search;
+    final requestId = ++_requestId;
+    if (state is! CustomersLoaded) emit(CustomersLoading());
     try {
-      final customers = await customersRepository.getCustomers(search: event.search);
-      emit(CustomersLoaded(customers: customers, search: event.search ?? ''));
+      final customers = await customersRepository.getCustomers(search: search);
+      if (requestId == _requestId) emit(CustomersLoaded(customers: customers, search: search));
+      event.completer?.complete(null);
     } catch (e) {
-      emit(CustomersError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onLoadDetail(LoadCustomerDetailEvent event, Emitter<CustomersState> emit) async {
-    emit(CustomersLoading());
-    try {
-      final customer = await customersRepository.getCustomerById(event.id);
-      emit(CustomerDetailLoaded(customer));
-    } catch (e) {
-      emit(CustomersError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onCreateCustomer(CreateCustomerEvent event, Emitter<CustomersState> emit) async {
-    emit(CustomersLoading());
-    try {
-      await customersRepository.createCustomer(event.data);
-      emit(const CustomersActionSuccess('Клиент успешно добавлен'));
-      add(const LoadCustomersEvent());
-    } catch (e) {
-      emit(CustomersError(e.toString().replaceAll('Exception: ', '')));
+      final message = apiErrorMessage(e, fallback: 'Не удалось загрузить клиентов');
+      if (requestId == _requestId && state is! CustomersLoaded) emit(CustomersError(message));
+      event.completer?.complete(message);
     }
   }
 }

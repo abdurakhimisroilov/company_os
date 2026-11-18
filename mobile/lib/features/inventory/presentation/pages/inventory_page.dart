@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
@@ -18,7 +20,8 @@ class InventoryPage extends StatefulWidget {
 
 class _InventoryPageState extends State<InventoryPage> {
   final _searchController = TextEditingController();
-  String _selectedCategory = 'Все';
+  Timer? _searchDebounce;
+  String? _selectedCategoryId;
 
   @override
   void initState() {
@@ -28,24 +31,50 @@ class _InventoryPageState extends State<InventoryPage> {
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _searchController.dispose();
     super.dispose();
   }
 
-  void _onSearch(String query) {
+  void _load() {
     context.read<InventoryBloc>().add(
-          LoadProductsEvent(search: query, category: _selectedCategory),
+          LoadProductsEvent(search: _searchController.text.trim(), categoryId: _selectedCategoryId),
         );
   }
 
-  void _onCategorySelect(String category) {
-    setState(() => _selectedCategory = category);
-    context.read<InventoryBloc>().add(
-          LoadProductsEvent(
-            search: _searchController.text.trim(),
-            category: category,
-          ),
-        );
+  void _onSearchChanged(String _) {
+    setState(() {});
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 400), () {
+      if (mounted) _load();
+    });
+  }
+
+  void _onSearchSubmitted(String _) {
+    _searchDebounce?.cancel();
+    _load();
+  }
+
+  void _onCategorySelect(String? categoryId) {
+    _searchDebounce?.cancel();
+    _selectedCategoryId = categoryId;
+    _load();
+  }
+
+  Future<void> _refresh() async {
+    final error = await context.read<InventoryBloc>().refresh();
+    if (error != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error), backgroundColor: AppColors.error),
+      );
+    }
+  }
+
+  /// Opens a page that may change products and brings the list up to date afterwards.
+  Future<void> _openAndRefresh(String location) async {
+    await context.push(location);
+    if (!mounted) return;
+    context.read<InventoryBloc>().add(const RefreshProductsEvent());
   }
 
   @override
@@ -53,7 +82,7 @@ class _InventoryPageState extends State<InventoryPage> {
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SafeArea(
           bottom: false,
           child: Column(
@@ -63,26 +92,19 @@ class _InventoryPageState extends State<InventoryPage> {
               Expanded(
                 child: BlocConsumer<InventoryBloc, InventoryState>(
                   listener: (context, state) {
-                    if (state is InventoryActionSuccess) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text(state.message),
-                          backgroundColor: AppColors.success,
-                        ),
-                      );
+                    // The bloc drops a category that no longer exists on the server.
+                    if (state is InventoryLoaded && !state.isLoading) {
+                      _selectedCategoryId = state.selectedCategoryId;
                     }
                   },
                   builder: (context, state) {
-                    if (state is InventoryLoading) {
-                      return const LoadingShimmer();
-                    }
                     if (state is InventoryError) {
                       return _buildErrorState(state.message);
                     }
                     if (state is InventoryLoaded) {
                       return _buildContent(state);
                     }
-                    return const SizedBox.shrink();
+                    return const LoadingShimmer();
                   },
                 ),
               ),
@@ -91,7 +113,7 @@ class _InventoryPageState extends State<InventoryPage> {
         ),
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => context.push('/inventory/product/add'),
+        onPressed: () => _openAndRefresh('/inventory/product/add'),
         backgroundColor: AppColors.primaryBlue,
         icon: const Icon(Icons.add, color: Colors.white),
         label: const Text('Товар', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
@@ -105,10 +127,10 @@ class _InventoryPageState extends State<InventoryPage> {
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+            icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
             onPressed: () => context.pop(),
           ),
-          const Expanded(
+          Expanded(
             child: Text(
               'Склад и товары',
               style: TextStyle(
@@ -121,7 +143,7 @@ class _InventoryPageState extends State<InventoryPage> {
           IconButton(
             icon: const Icon(Icons.tune, color: AppColors.primaryBlue),
             tooltip: 'Корректировка остатков',
-            onPressed: () => context.push('/inventory/adjust'),
+            onPressed: () => _openAndRefresh('/inventory/adjust'),
           ),
         ],
       ),
@@ -133,13 +155,15 @@ class _InventoryPageState extends State<InventoryPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 4.0),
       child: Container(
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.9),
+          color: AppColors.cardBackground.withOpacity(0.9),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: AppColors.cardBorder),
         ),
         child: TextField(
           controller: _searchController,
-          onSubmitted: _onSearch,
+          onChanged: _onSearchChanged,
+          onSubmitted: _onSearchSubmitted,
+          textInputAction: TextInputAction.search,
           decoration: InputDecoration(
             hintText: 'Поиск по названию, артикулу...',
             hintStyle: TextStyle(color: AppColors.textTertiary, fontSize: 14),
@@ -149,7 +173,8 @@ class _InventoryPageState extends State<InventoryPage> {
                     icon: const Icon(Icons.clear, size: 18),
                     onPressed: () {
                       _searchController.clear();
-                      _onSearch('');
+                      setState(() {});
+                      _onSearchSubmitted('');
                     },
                   )
                 : null,
@@ -162,16 +187,11 @@ class _InventoryPageState extends State<InventoryPage> {
   }
 
   Widget _buildContent(InventoryLoaded state) {
+    final isFiltered = state.searchQuery.isNotEmpty || state.selectedCategoryId != null;
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<InventoryBloc>().add(
-              LoadProductsEvent(
-                search: _searchController.text.trim(),
-                category: _selectedCategory,
-              ),
-            );
-      },
+      onRefresh: _refresh,
       child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         children: [
           // Category chips horizontal list
@@ -179,30 +199,60 @@ class _InventoryPageState extends State<InventoryPage> {
             height: 40,
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
-              itemCount: state.categories.length,
+              itemCount: state.categories.length + 1,
               separatorBuilder: (_, __) => const SizedBox(width: 8),
               itemBuilder: (context, index) {
-                final cat = state.categories[index];
-                final isSelected = cat == state.selectedCategory;
+                final category = index == 0 ? null : state.categories[index - 1];
+                final cat = category?.name ?? 'Все';
+                final isSelected = category?.id == state.selectedCategoryId;
                 return ChoiceChip(
                   label: Text(cat),
                   selected: isSelected,
                   selectedColor: AppColors.primaryBlue,
-                  backgroundColor: Colors.white.withOpacity(0.7),
+                  backgroundColor: AppColors.cardBackground.withOpacity(0.7),
                   labelStyle: TextStyle(
                     color: isSelected ? Colors.white : AppColors.textPrimary,
                     fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
                     fontSize: 12,
                   ),
-                  onSelected: (_) => _onCategorySelect(cat),
+                  onSelected: (_) => _onCategorySelect(category?.id),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
                 );
               },
             ),
           ),
-          const SizedBox(height: 16),
+          SizedBox(
+            height: 16,
+            child: state.isLoading
+                ? const Center(child: LinearProgressIndicator(minHeight: 2))
+                : null,
+          ),
 
-          if (state.products.isEmpty)
+          if (state.products.isEmpty && state.isLoading)
+            const SizedBox(height: 120)
+          else if (state.products.isEmpty && isFiltered)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 60),
+              child: Center(
+                child: Column(
+                  children: [
+                    Icon(Icons.search_off, size: 56, color: AppColors.textTertiary),
+                    const SizedBox(height: 12),
+                    Text(
+                      'Ничего не найдено',
+                      style: AppTextStyles.h3.copyWith(color: AppColors.textPrimary),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      'Измените запрос или выберите другую категорию',
+                      style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else if (state.products.isEmpty)
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 60),
               child: Center(
@@ -221,7 +271,7 @@ class _InventoryPageState extends State<InventoryPage> {
                     ),
                     const SizedBox(height: 16),
                     ElevatedButton.icon(
-                      onPressed: () => context.push('/inventory/product/add'),
+                      onPressed: () => _openAndRefresh('/inventory/product/add'),
                       icon: const Icon(Icons.add, size: 18),
                       label: const Text('Добавить товар'),
                       style: ElevatedButton.styleFrom(
@@ -248,7 +298,7 @@ class _InventoryPageState extends State<InventoryPage> {
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       child: GlassCard(
-        onTap: () => context.push('/inventory/product/${product.id}'),
+        onTap: () => _openAndRefresh('/inventory/product/${product.id}'),
         padding: const EdgeInsets.all(14),
         borderRadius: 16,
         child: Row(
@@ -263,19 +313,7 @@ class _InventoryPageState extends State<InventoryPage> {
                 borderRadius: BorderRadius.circular(12),
                 border: Border.all(color: AppColors.cardBorder),
               ),
-              child: product.images.isNotEmpty
-                  ? ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      child: Image.network(
-                        product.images.first,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => const Icon(
-                          Icons.inventory_2,
-                          color: AppColors.primaryBlue,
-                        ),
-                      ),
-                    )
-                  : const Icon(Icons.inventory_2_outlined, color: AppColors.primaryBlue),
+              child: const Icon(Icons.inventory_2_outlined, color: AppColors.primaryBlue),
             ),
             const SizedBox(width: 14),
             Expanded(
@@ -287,7 +325,7 @@ class _InventoryPageState extends State<InventoryPage> {
                       Expanded(
                         child: Text(
                           product.name,
-                          style: const TextStyle(
+                          style: TextStyle(
                             fontWeight: FontWeight.bold,
                             fontSize: 15,
                             color: AppColors.textPrimary,
@@ -332,7 +370,7 @@ class _InventoryPageState extends State<InventoryPage> {
                         ),
                       ),
                       Text(
-                        'Остаток: ${product.currentStock.toStringAsFixed(0)} ${product.unit}',
+                        'Остаток: ${formatQty(product.currentStock)} ${product.unit}',
                         style: TextStyle(
                           fontWeight: FontWeight.w600,
                           fontSize: 13,
@@ -357,10 +395,13 @@ class _InventoryPageState extends State<InventoryPage> {
         children: [
           const Icon(Icons.error_outline, size: 48, color: AppColors.error),
           const SizedBox(height: 12),
-          Text(message, style: AppTextStyles.bodyMedium),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Text(message, style: AppTextStyles.bodyMedium, textAlign: TextAlign.center),
+          ),
           const SizedBox(height: 16),
           ElevatedButton(
-            onPressed: () => context.read<InventoryBloc>().add(const LoadProductsEvent()),
+            onPressed: _load,
             child: const Text('Повторить'),
           ),
         ],

@@ -18,54 +18,44 @@ class ShipmentItemModel {
   });
 
   factory ShipmentItemModel.fromJson(Map<String, dynamic> json) {
-    final qty = JsonHelpers.toDouble(json['quantity']);
-    final price = JsonHelpers.toDouble(json['unitPrice'] ?? json['purchase_price'] ?? json['price']);
-    final total = JsonHelpers.toDouble(json['totalPrice'] ?? json['total_amount'] ?? (qty * price));
-
     return ShipmentItemModel(
       id: JsonHelpers.toStr(json['id']),
-      productId: JsonHelpers.toStr(json['productId'] ?? json['product_id']),
-      productName: JsonHelpers.extractString(
-        json['product'],
-        preferredKeys: ['name', 'title'],
-        fallback: JsonHelpers.toStr(json['productName'], 'Товар'),
-      ),
-      quantity: qty,
-      unitPrice: price,
-      totalPrice: total,
+      productId: JsonHelpers.toStr(json['product_id'] ?? json['productId']),
+      productName: JsonHelpers.toStr(json['product_name'] ?? json['productName'], 'Товар удалён'),
+      quantity: JsonHelpers.toDouble(json['quantity']),
+      unitPrice: JsonHelpers.toDouble(json['purchase_price'] ?? json['unitPrice']),
+      totalPrice: JsonHelpers.toDouble(json['total_amount'] ?? json['totalPrice']),
     );
-  }
-
-  Map<String, dynamic> toJson() {
-    return {
-      'productId': productId,
-      'productName': productName,
-      'quantity': quantity,
-      'unitPrice': unitPrice,
-      'totalPrice': totalPrice,
-    };
   }
 }
 
 class ShipmentModel {
   final String id;
-  final String supplierId;
-  final String supplierName;
+  final String? supplierId;
+
+  /// Null when the shipment was saved without a supplier.
+  final String? supplierName;
   final String invoiceNumber;
-  final DateTime expectedDate;
+  final DateTime? expectedDate;
   final DateTime? receivedDate;
-  final String status; // 'pending' (Ожидается) | 'received' (Получено) | 'partial' (Частично)
+
+  /// 'pending' (ожидается), 'received' (принята на склад) or 'cancelled'.
+  final String status;
+
+  /// Sum of the items, without additional costs.
   final double totalCost;
   final double additionalCosts;
   final String? responsibleEmployee;
+
+  /// Filled only by the detail request.
   final List<ShipmentItemModel> items;
 
   const ShipmentModel({
     required this.id,
-    required this.supplierId,
-    required this.supplierName,
+    this.supplierId,
+    this.supplierName,
     required this.invoiceNumber,
-    required this.expectedDate,
+    this.expectedDate,
     this.receivedDate,
     this.status = 'pending',
     required this.totalCost,
@@ -74,7 +64,10 @@ class ShipmentModel {
     this.items = const [],
   });
 
-  int get itemCount => items.fold(0, (sum, it) => sum + it.quantity.toInt());
+  bool get isReceived => status == 'received';
+  bool get isPending => status == 'pending';
+  double get grandTotal => totalCost + additionalCosts;
+  String get supplierLabel => supplierName ?? 'Без поставщика';
 
   factory ShipmentModel.fromJson(Map<String, dynamic> json) {
     final itemsList = JsonHelpers.toList(json['items'])
@@ -83,39 +76,16 @@ class ShipmentModel {
 
     return ShipmentModel(
       id: JsonHelpers.toStr(json['id']),
-      supplierId: JsonHelpers.toStr(json['supplierId'] ?? json['supplier_id']),
-      supplierName: JsonHelpers.extractString(
-        json['supplier'],
-        preferredKeys: ['name', 'fullName'],
-        fallback: JsonHelpers.toStr(json['supplierName'], 'Поставщик'),
-      ),
-      invoiceNumber: JsonHelpers.toStr(json['invoiceNumber'] ?? json['shipment_number'], 'б/н'),
-      expectedDate: JsonHelpers.toDateTime(json['expectedDate'] ?? json['expected_date']),
-      receivedDate: JsonHelpers.toOptionalDateTime(json['receivedDate'] ?? json['received_date']),
+      supplierId: JsonHelpers.extractOptionalString(json['supplier_id'] ?? json['supplierId']),
+      supplierName: JsonHelpers.extractOptionalString(json['supplier_name'] ?? json['supplierName']),
+      invoiceNumber: JsonHelpers.toStr(json['shipment_number'] ?? json['invoiceNumber']),
+      expectedDate: JsonHelpers.toOptionalDateTime(json['expected_date'] ?? json['expectedDate']),
+      receivedDate: JsonHelpers.toOptionalDateTime(json['received_date'] ?? json['receivedDate']),
       status: JsonHelpers.toStr(json['status'], 'pending').toLowerCase(),
-      totalCost: JsonHelpers.toDouble(json['totalCost'] ?? json['total_amount']),
-      additionalCosts: JsonHelpers.toDouble(json['additionalCosts'] ?? json['additional_costs']),
-      responsibleEmployee: JsonHelpers.extractOptionalString(
-            json['employee'] ?? json['user'],
-            preferredKeys: ['fullName', 'name'],
-          ) ??
-          JsonHelpers.extractOptionalString(json['responsibleEmployee']),
+      totalCost: JsonHelpers.toDouble(json['total_amount'] ?? json['totalCost']),
+      additionalCosts: JsonHelpers.toDouble(json['additional_costs'] ?? json['additionalCosts']),
+      responsibleEmployee: JsonHelpers.extractOptionalString(json['created_by_name'] ?? json['responsibleEmployee']),
       items: itemsList,
     );
-  }
-
-  Map<String, dynamic> toJson() {
-    return {
-      'id': id,
-      'supplierId': supplierId,
-      'supplierName': supplierName,
-      'invoiceNumber': invoiceNumber,
-      'expectedDate': expectedDate.toIso8601String(),
-      'status': status,
-      'totalCost': totalCost,
-      'additionalCosts': additionalCosts,
-      'responsibleEmployee': responsibleEmployee,
-      'items': items.map((e) => e.toJson()).toList(),
-    };
   }
 }

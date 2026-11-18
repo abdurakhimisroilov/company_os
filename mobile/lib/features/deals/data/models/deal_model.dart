@@ -4,7 +4,7 @@ class DealCommentModel {
   final String id;
   final String authorName;
   final String text;
-  final DateTime createdAt;
+  final DateTime? createdAt;
 
   const DealCommentModel({
     required this.id,
@@ -16,13 +16,9 @@ class DealCommentModel {
   factory DealCommentModel.fromJson(Map<String, dynamic> json) {
     return DealCommentModel(
       id: JsonHelpers.toStr(json['id']),
-      authorName: JsonHelpers.extractString(
-        json['author'],
-        preferredKeys: ['fullName', 'name'],
-        fallback: JsonHelpers.toStr(json['authorName'], 'Сотрудник'),
-      ),
-      text: JsonHelpers.toStr(json['text'] ?? json['content']),
-      createdAt: JsonHelpers.toDateTime(json['createdAt']),
+      authorName: JsonHelpers.toStr(json['authorName'] ?? json['author_name']),
+      text: JsonHelpers.toStr(json['text'] ?? json['comment'] ?? json['content']),
+      createdAt: JsonHelpers.toOptionalDateTime(json['created_at'] ?? json['createdAt'])?.toLocal(),
     );
   }
 }
@@ -37,6 +33,7 @@ class DealModel {
   final DateTime? expectedCloseDate;
   final String? description;
   final String? assignedEmployeeName;
+  final DateTime? createdAt;
   final List<DealCommentModel> comments;
 
   const DealModel({
@@ -49,6 +46,7 @@ class DealModel {
     this.expectedCloseDate,
     this.description,
     this.assignedEmployeeName,
+    this.createdAt,
     this.comments = const [],
   });
 
@@ -79,37 +77,42 @@ class DealModel {
         .map((e) => DealCommentModel.fromJson(JsonHelpers.toMap(e)))
         .toList();
 
+    // `customer` may arrive as a plain name or as an object; the server's own
+    // field is `customer_name`.
+    final customerName = JsonHelpers.extractOptionalString(json['customer'], preferredKeys: ['name', 'fullName']) ??
+        JsonHelpers.toStr(json['customer_name'] ?? json['customerName']);
+    final status = JsonHelpers.toStr(json['status'], 'lead').toLowerCase();
+
     return DealModel(
       id: JsonHelpers.toStr(json['id']),
-      title: JsonHelpers.toStr(json['title'] ?? json['name'], 'Сделка'),
-      customerId: JsonHelpers.toStr(json['customerId'] ?? json['customer_id']),
-      customerName: JsonHelpers.extractString(
-        json['customer'],
-        preferredKeys: ['name', 'fullName'],
-        fallback: JsonHelpers.toStr(json['customerName'], 'Клиент'),
-      ),
-      amount: JsonHelpers.toDouble(json['amount'] ?? json['value']),
-      status: JsonHelpers.toStr(json['status'], 'lead').toLowerCase(),
-      expectedCloseDate: JsonHelpers.toOptionalDateTime(json['expectedCloseDate'] ?? json['close_date']),
+      title: JsonHelpers.toStr(json['title']),
+      customerId: JsonHelpers.toStr(json['customer_id'] ?? json['customerId']),
+      customerName: customerName,
+      amount: JsonHelpers.toDouble(json['amount']),
+      status: statusKeys.contains(status) ? status : 'lead',
+      expectedCloseDate: JsonHelpers.toOptionalDateTime(json['expected_close_date'] ?? json['expectedCloseDate'])?.toLocal(),
       description: JsonHelpers.extractOptionalString(json['description']),
       assignedEmployeeName: JsonHelpers.extractOptionalString(
-            json['assignedTo'] ?? json['employee'],
-            preferredKeys: ['fullName', 'name'],
-          ) ??
-          JsonHelpers.extractOptionalString(json['assignedEmployeeName']),
+        json['assigned_employee_name'] ?? json['assignedEmployeeName'] ?? json['assigned_to_name'],
+      ),
+      createdAt: JsonHelpers.toOptionalDateTime(json['created_at'] ?? json['createdAt'])?.toLocal(),
       comments: commentsList,
     );
   }
 
-  Map<String, dynamic> toJson() {
-    return {
-      'title': title,
-      'customerId': customerId,
-      'customerName': customerName,
-      'amount': amount,
-      'status': status,
-      'expectedCloseDate': expectedCloseDate?.toIso8601String(),
-      'description': description,
-    };
+  DealModel copyWith({String? status, List<DealCommentModel>? comments}) {
+    return DealModel(
+      id: id,
+      title: title,
+      customerId: customerId,
+      customerName: customerName,
+      amount: amount,
+      status: status ?? this.status,
+      expectedCloseDate: expectedCloseDate,
+      description: description,
+      assignedEmployeeName: assignedEmployeeName,
+      createdAt: createdAt,
+      comments: comments ?? this.comments,
+    );
   }
 }

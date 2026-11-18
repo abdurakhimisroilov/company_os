@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/network/api_error.dart';
 import '../../data/models/employee_model.dart';
 import '../../data/repositories/employees_repository.dart';
 
@@ -10,42 +12,24 @@ abstract class EmployeesEvent extends Equatable {
   List<Object?> get props => [];
 }
 
+/// Loads the list of the current organization. The bloc holds only the list;
+/// an employee's profile and the add form talk to the repository themselves
+/// and ask for a reload when something changed.
 class LoadEmployeesEvent extends EmployeesEvent {
-  final String? department;
+  /// Department id from the server, or null for every department.
+  final String? departmentId;
+
+  /// Role id (`MANAGER`, `ACCOUNTANT`…), or null for every role.
+  final String? role;
   final String? search;
-  const LoadEmployeesEvent({this.department, this.search});
-  @override
-  List<Object?> get props => [department, search];
-}
 
-class LoadEmployeeDetailEvent extends EmployeesEvent {
-  final String id;
-  const LoadEmployeeDetailEvent(this.id);
-  @override
-  List<Object?> get props => [id];
-}
+  /// Completed when the request has finished, successfully or not.
+  final Completer<void>? done;
 
-class CreateEmployeeEvent extends EmployeesEvent {
-  final Map<String, dynamic> data;
-  const CreateEmployeeEvent(this.data);
-  @override
-  List<Object?> get props => [data];
-}
+  const LoadEmployeesEvent({this.departmentId, this.role, this.search, this.done});
 
-class UpdateEmployeeRoleEvent extends EmployeesEvent {
-  final String employeeId;
-  final String role;
-  const UpdateEmployeeRoleEvent({required this.employeeId, required this.role});
   @override
-  List<Object?> get props => [employeeId, role];
-}
-
-class UpdateEmployeeEvent extends EmployeesEvent {
-  final String employeeId;
-  final Map<String, dynamic> data;
-  const UpdateEmployeeEvent({required this.employeeId, required this.data});
-  @override
-  List<Object?> get props => [employeeId, data];
+  List<Object?> get props => [departmentId, role, search];
 }
 
 // ─── States ─────────────────────────────────────────────────────────────────
@@ -61,33 +45,32 @@ class EmployeesLoading extends EmployeesState {}
 
 class EmployeesLoaded extends EmployeesState {
   final List<EmployeeModel> employees;
-  final List<String> departments;
-  final String selectedDepartment;
+  final List<DepartmentModel> departments;
+  final String? selectedDepartmentId;
+  final String? selectedRole;
   final String searchQuery;
+
+  /// A newer list is being fetched; the current one stays on screen.
+  final bool isRefreshing;
+
+  /// The last refresh failed; the list shown is the previous one.
+  final String? refreshError;
+  final int _errorSeq;
 
   const EmployeesLoaded({
     required this.employees,
     required this.departments,
-    this.selectedDepartment = 'Все',
+    this.selectedDepartmentId,
+    this.selectedRole,
     this.searchQuery = '',
-  });
+    this.isRefreshing = false,
+    this.refreshError,
+    int errorSeq = 0,
+  }) : _errorSeq = errorSeq;
 
   @override
-  List<Object?> get props => [employees, departments, selectedDepartment, searchQuery];
-}
-
-class EmployeeDetailLoaded extends EmployeesState {
-  final EmployeeModel employee;
-  const EmployeeDetailLoaded(this.employee);
-  @override
-  List<Object?> get props => [employee];
-}
-
-class EmployeesActionSuccess extends EmployeesState {
-  final String message;
-  const EmployeesActionSuccess(this.message);
-  @override
-  List<Object?> get props => [message];
+  List<Object?> get props =>
+      [employees, departments, selectedDepartmentId, selectedRole, searchQuery, isRefreshing, refreshError, _errorSeq];
 }
 
 class EmployeesError extends EmployeesState {
@@ -100,80 +83,65 @@ class EmployeesError extends EmployeesState {
 // ─── BLoC ───────────────────────────────────────────────────────────────────
 class EmployeesBloc extends Bloc<EmployeesEvent, EmployeesState> {
   final EmployeesRepository employeesRepository;
-  List<String> _cachedDepts = ['Все'];
+  int _requestSeq = 0;
+  int _errorSeq = 0;
 
   EmployeesBloc({required this.employeesRepository}) : super(EmployeesInitial()) {
     on<LoadEmployeesEvent>(_onLoadEmployees);
-    on<LoadEmployeeDetailEvent>(_onLoadDetail);
-    on<CreateEmployeeEvent>(_onCreateEmployee);
-    on<UpdateEmployeeRoleEvent>(_onUpdateRole);
-    on<UpdateEmployeeEvent>(_onUpdateEmployee);
   }
 
   Future<void> _onLoadEmployees(LoadEmployeesEvent event, Emitter<EmployeesState> emit) async {
-    emit(EmployeesLoading());
-    try {
-      if (_cachedDepts.length <= 1) {
-        final depts = await employeesRepository.getDepartments();
-        _cachedDepts = ['Все', ...depts.where((d) => d != 'Все')];
-      }
+    final request = ++_requestSeq;
+    final shown = state;
+    final search = event.search?.trim() ?? '';
 
-      final employees = await employeesRepository.getEmployees(
-        departmentId: event.department == 'Все' ? null : event.department,
-        search: event.search,
-      );
-
+    if (shown is EmployeesLoaded) {
       emit(EmployeesLoaded(
-        employees: employees,
-        departments: _cachedDepts,
-        selectedDepartment: event.department ?? 'Все',
-        searchQuery: event.search ?? '',
+        employees: shown.employees,
+        departments: shown.departments,
+        selectedDepartmentId: event.departmentId,
+        selectedRole: event.role,
+        searchQuery: search,
+        isRefreshing: true,
+      ));
+    } else {
+      emit(EmployeesLoading());
+    }
+
+    try {
+      final results = await Future.wait([
+        employeesRepository.getDepartmentList(),
+        employeesRepository.getEmployees(departmentId: event.departmentId, role: event.role, search: search),
+      ]);
+      // A newer request (another filter, another search) owns the screen now.
+      if (request != _requestSeq) return;
+      emit(EmployeesLoaded(
+        employees: results[1] as List<EmployeeModel>,
+        departments: results[0] as List<DepartmentModel>,
+        selectedDepartmentId: event.departmentId,
+        selectedRole: event.role,
+        searchQuery: search,
       ));
     } catch (e) {
-      emit(EmployeesError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onLoadDetail(LoadEmployeeDetailEvent event, Emitter<EmployeesState> emit) async {
-    emit(EmployeesLoading());
-    try {
-      final employee = await employeesRepository.getEmployeeById(event.id);
-      emit(EmployeeDetailLoaded(employee));
-    } catch (e) {
-      emit(EmployeesError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onCreateEmployee(CreateEmployeeEvent event, Emitter<EmployeesState> emit) async {
-    emit(EmployeesLoading());
-    try {
-      await employeesRepository.createEmployee(event.data);
-      emit(const EmployeesActionSuccess('Сотрудник успешно добавлен'));
-      add(const LoadEmployeesEvent());
-    } catch (e) {
-      emit(EmployeesError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onUpdateRole(UpdateEmployeeRoleEvent event, Emitter<EmployeesState> emit) async {
-    emit(EmployeesLoading());
-    try {
-      final updated = await employeesRepository.updateEmployeeRole(event.employeeId, event.role);
-      emit(EmployeeDetailLoaded(updated));
-      emit(const EmployeesActionSuccess('Роль успешно назначена'));
-    } catch (e) {
-      emit(EmployeesError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onUpdateEmployee(UpdateEmployeeEvent event, Emitter<EmployeesState> emit) async {
-    emit(EmployeesLoading());
-    try {
-      final updated = await employeesRepository.updateEmployee(event.employeeId, event.data);
-      emit(EmployeeDetailLoaded(updated));
-      emit(const EmployeesActionSuccess('Данные сотрудника обновлены'));
-    } catch (e) {
-      emit(EmployeesError(e.toString().replaceAll('Exception: ', '')));
+      if (request != _requestSeq) return;
+      final message = apiErrorMessage(e, fallback: 'Не удалось загрузить сотрудников');
+      if (shown is EmployeesLoaded) {
+        // Keep what was on screen, with the filters it was loaded for.
+        emit(EmployeesLoaded(
+          employees: shown.employees,
+          departments: shown.departments,
+          selectedDepartmentId: shown.selectedDepartmentId,
+          selectedRole: shown.selectedRole,
+          searchQuery: shown.searchQuery,
+          refreshError: message,
+          errorSeq: ++_errorSeq,
+        ));
+      } else {
+        emit(EmployeesError(message));
+      }
+    } finally {
+      final done = event.done;
+      if (done != null && !done.isCompleted) done.complete();
     }
   }
 }

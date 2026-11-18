@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:equatable/equatable.dart';
+import '../../../../core/network/api_error.dart';
 import '../../data/models/supplier_model.dart';
 import '../../data/repositories/suppliers_repository.dart';
 
@@ -10,25 +13,15 @@ abstract class SuppliersEvent extends Equatable {
   List<Object?> get props => [];
 }
 
+/// Loads the supplier list. When a list is already on screen it stays there
+/// until the new one arrives. [completer] finishes with null on success or
+/// with the error text, so the caller can wait for the request.
 class LoadSuppliersEvent extends SuppliersEvent {
   final String? search;
-  const LoadSuppliersEvent({this.search});
+  final Completer<String?>? completer;
+  const LoadSuppliersEvent({this.search, this.completer});
   @override
-  List<Object?> get props => [search];
-}
-
-class LoadSupplierDetailEvent extends SuppliersEvent {
-  final String id;
-  const LoadSupplierDetailEvent(this.id);
-  @override
-  List<Object?> get props => [id];
-}
-
-class CreateSupplierEvent extends SuppliersEvent {
-  final Map<String, dynamic> data;
-  const CreateSupplierEvent(this.data);
-  @override
-  List<Object?> get props => [data];
+  List<Object?> get props => [search, completer];
 }
 
 // ─── States ─────────────────────────────────────────────────────────────────
@@ -50,20 +43,6 @@ class SuppliersLoaded extends SuppliersState {
   List<Object?> get props => [suppliers, search];
 }
 
-class SupplierDetailLoaded extends SuppliersState {
-  final SupplierModel supplier;
-  const SupplierDetailLoaded(this.supplier);
-  @override
-  List<Object?> get props => [supplier];
-}
-
-class SuppliersActionSuccess extends SuppliersState {
-  final String message;
-  const SuppliersActionSuccess(this.message);
-  @override
-  List<Object?> get props => [message];
-}
-
 class SuppliersError extends SuppliersState {
   final String message;
   const SuppliersError(this.message);
@@ -72,43 +51,30 @@ class SuppliersError extends SuppliersState {
 }
 
 // ─── BLoC ───────────────────────────────────────────────────────────────────
+/// Holds the supplier list only. Supplier cards and forms talk to the
+/// repository themselves and then ask this bloc to reload.
 class SuppliersBloc extends Bloc<SuppliersEvent, SuppliersState> {
   final SuppliersRepository suppliersRepository;
+  String _search = '';
+  int _requestId = 0;
 
   SuppliersBloc({required this.suppliersRepository}) : super(SuppliersInitial()) {
     on<LoadSuppliersEvent>(_onLoadSuppliers);
-    on<LoadSupplierDetailEvent>(_onLoadDetail);
-    on<CreateSupplierEvent>(_onCreateSupplier);
   }
 
   Future<void> _onLoadSuppliers(LoadSuppliersEvent event, Emitter<SuppliersState> emit) async {
-    emit(SuppliersLoading());
+    if (event.search != null) _search = event.search!.trim();
+    final search = _search;
+    final requestId = ++_requestId;
+    if (state is! SuppliersLoaded) emit(SuppliersLoading());
     try {
-      final suppliers = await suppliersRepository.getSuppliers(search: event.search);
-      emit(SuppliersLoaded(suppliers: suppliers, search: event.search ?? ''));
+      final suppliers = await suppliersRepository.getSuppliers(search: search);
+      if (requestId == _requestId) emit(SuppliersLoaded(suppliers: suppliers, search: search));
+      event.completer?.complete(null);
     } catch (e) {
-      emit(SuppliersError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onLoadDetail(LoadSupplierDetailEvent event, Emitter<SuppliersState> emit) async {
-    emit(SuppliersLoading());
-    try {
-      final supplier = await suppliersRepository.getSupplierById(event.id);
-      emit(SupplierDetailLoaded(supplier));
-    } catch (e) {
-      emit(SuppliersError(e.toString().replaceAll('Exception: ', '')));
-    }
-  }
-
-  Future<void> _onCreateSupplier(CreateSupplierEvent event, Emitter<SuppliersState> emit) async {
-    emit(SuppliersLoading());
-    try {
-      await suppliersRepository.createSupplier(event.data);
-      emit(const SuppliersActionSuccess('Поставщик успешно добавлен'));
-      add(const LoadSuppliersEvent());
-    } catch (e) {
-      emit(SuppliersError(e.toString().replaceAll('Exception: ', '')));
+      final message = apiErrorMessage(e, fallback: 'Не удалось загрузить поставщиков');
+      if (requestId == _requestId && state is! SuppliersLoaded) emit(SuppliersError(message));
+      event.completer?.complete(message);
     }
   }
 }

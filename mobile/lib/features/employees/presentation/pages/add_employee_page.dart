@@ -1,12 +1,15 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
+import '../../../../core/di/injection.dart';
+import '../../../../core/network/api_error.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
+import '../../../../core/utils/validators.dart';
 import '../../../../core/widgets/app_button.dart';
 import '../../../../core/widgets/glass_card.dart';
 import '../../data/models/employee_model.dart';
-import '../bloc/employees_bloc.dart';
+import '../../data/repositories/employees_repository.dart';
+import '../widgets/temporary_password_dialog.dart';
 
 class AddEmployeePage extends StatefulWidget {
   const AddEmployeePage({super.key});
@@ -16,17 +19,31 @@ class AddEmployeePage extends StatefulWidget {
 }
 
 class _AddEmployeePageState extends State<AddEmployeePage> {
+  // Dropdown values that are not department ids.
+  static const String _noDepartment = '';
+  static const String _newDepartment = '__new__';
+
+  final _repository = getIt<EmployeesRepository>();
   final _formKey = GlobalKey<FormState>();
   final _fullNameController = TextEditingController();
   final _emailController = TextEditingController();
   final _phoneController = TextEditingController();
   final _positionController = TextEditingController();
   final _passwordController = TextEditingController();
+  final _newDepartmentController = TextEditingController();
 
-  String _selectedDepartment = 'Продажи';
+  List<DepartmentModel> _departments = [];
+  bool _departmentsLoading = true;
+  String? _departmentsError;
+  String _selectedDepartment = _noDepartment;
   String _selectedRole = 'EMPLOYEE';
+  bool _isSaving = false;
 
-  final List<String> _departments = ['IT', 'Продажи', 'Финансы', 'Склад', 'HR', 'Руководство'];
+  @override
+  void initState() {
+    super.initState();
+    _loadDepartments();
+  }
 
   @override
   void dispose() {
@@ -35,24 +52,90 @@ class _AddEmployeePageState extends State<AddEmployeePage> {
     _phoneController.dispose();
     _positionController.dispose();
     _passwordController.dispose();
+    _newDepartmentController.dispose();
     super.dispose();
   }
 
-  void _saveEmployee() {
-    if (!_formKey.currentState!.validate()) return;
+  Future<void> _loadDepartments() async {
+    setState(() {
+      _departmentsLoading = true;
+      _departmentsError = null;
+    });
+    try {
+      final list = await _repository.getDepartmentList();
+      if (!mounted) return;
+      setState(() {
+        _departments = list;
+        _departmentsLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _departmentsLoading = false;
+        _departmentsError = apiErrorMessage(e, fallback: 'Не удалось загрузить отделы');
+      });
+    }
+  }
 
-    final data = {
+  Future<void> _saveEmployee() async {
+    if (_isSaving) return;
+    if (!_formKey.currentState!.validate()) return;
+    FocusScope.of(context).unfocus();
+
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+    final data = <String, dynamic>{
       'fullName': _fullNameController.text.trim(),
-      'email': _emailController.text.trim(),
+      'email': email,
       'phone': _phoneController.text.trim(),
       'position': _positionController.text.trim(),
-      'departmentName': _selectedDepartment,
       'role': _selectedRole,
-      'password': _passwordController.text.trim(),
+      if (_selectedDepartment == _newDepartment)
+        'departmentName': _newDepartmentController.text.trim()
+      else if (_selectedDepartment != _noDepartment)
+        'departmentId': _selectedDepartment,
+      if (password.isNotEmpty) 'password': password,
     };
 
-    context.read<EmployeesBloc>().add(CreateEmployeeEvent(data));
-    context.pop();
+    setState(() => _isSaving = true);
+    try {
+      final created = await _repository.createEmployee(data);
+      if (!mounted) return;
+
+      final generated = created.temporaryPassword;
+      if (generated != null) {
+        await showTemporaryPasswordDialog(
+          context,
+          title: 'Сотрудник добавлен',
+          login: created.employee.email.isNotEmpty ? created.employee.email : email,
+          password: generated,
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            backgroundColor: AppColors.success,
+            duration: const Duration(seconds: 6),
+            content: Text(
+              password.isNotEmpty
+                  ? 'Сотрудник добавлен. Если этот адрес уже был зарегистрирован в Company OS, сотрудник входит со своим прежним паролем'
+                  : 'Сотрудник добавлен. Этот адрес уже зарегистрирован в Company OS — сотрудник входит со своим паролем',
+            ),
+          ),
+        );
+      }
+      if (mounted) context.pop(true);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _isSaving = false);
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(
+          SnackBar(
+            content: Text(apiErrorMessage(e, fallback: 'Не удалось добавить сотрудника')),
+            backgroundColor: AppColors.error,
+          ),
+        );
+    }
   }
 
   @override
@@ -64,12 +147,12 @@ class _AddEmployeePageState extends State<AddEmployeePage> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
-          onPressed: () => context.pop(),
+          icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+          onPressed: _isSaving ? null : () => context.pop(),
         ),
       ),
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(16),
           child: Form(
@@ -87,8 +170,9 @@ class _AddEmployeePageState extends State<AddEmployeePage> {
                       const SizedBox(height: 8),
                       TextFormField(
                         controller: _fullNameController,
+                        textCapitalization: TextCapitalization.words,
                         decoration: _inputDeco('Алиев Тимур Бахтиярович'),
-                        validator: (v) => (v == null || v.isEmpty) ? 'Введите ФИО' : null,
+                        validator: (v) => (v == null || v.trim().isEmpty) ? 'Введите ФИО' : null,
                       ),
                       const SizedBox(height: 16),
 
@@ -97,48 +181,33 @@ class _AddEmployeePageState extends State<AddEmployeePage> {
                       TextFormField(
                         controller: _emailController,
                         keyboardType: TextInputType.emailAddress,
+                        autocorrect: false,
                         decoration: _inputDeco('employee@company.uz'),
-                        validator: (v) => (v == null || v.isEmpty) ? 'Введите email' : null,
+                        validator: Validators.email,
                       ),
                       const SizedBox(height: 16),
 
-                      Text('Номер телефона *', style: AppTextStyles.labelMedium),
+                      Text('Номер телефона', style: AppTextStyles.labelMedium),
                       const SizedBox(height: 8),
                       TextFormField(
                         controller: _phoneController,
                         keyboardType: TextInputType.phone,
                         decoration: _inputDeco('+998 90 123 45 67'),
-                        validator: (v) => (v == null || v.isEmpty) ? 'Введите телефон' : null,
                       ),
                       const SizedBox(height: 16),
 
-                      Text('Должность *', style: AppTextStyles.labelMedium),
+                      Text('Должность', style: AppTextStyles.labelMedium),
                       const SizedBox(height: 8),
                       TextFormField(
                         controller: _positionController,
+                        textCapitalization: TextCapitalization.sentences,
                         decoration: _inputDeco('Менеджер по продажам'),
-                        validator: (v) => (v == null || v.isEmpty) ? 'Укажите должность' : null,
                       ),
                       const SizedBox(height: 16),
 
                       Text('Отдел', style: AppTextStyles.labelMedium),
                       const SizedBox(height: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 14),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: AppColors.cardBorder),
-                        ),
-                        child: DropdownButtonHideUnderline(
-                          child: DropdownButton<String>(
-                            value: _selectedDepartment,
-                            isExpanded: true,
-                            items: _departments.map((d) => DropdownMenuItem(value: d, child: Text(d))).toList(),
-                            onChanged: (v) => setState(() => _selectedDepartment = v!),
-                          ),
-                        ),
-                      ),
+                      _buildDepartmentPicker(),
                       const SizedBox(height: 16),
 
                       Text('Роль в системе', style: AppTextStyles.labelMedium),
@@ -146,7 +215,7 @@ class _AddEmployeePageState extends State<AddEmployeePage> {
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 14),
                         decoration: BoxDecoration(
-                          color: Colors.white,
+                          color: AppColors.cardBackground,
                           borderRadius: BorderRadius.circular(12),
                           border: Border.all(color: AppColors.cardBorder),
                         ),
@@ -161,24 +230,37 @@ class _AddEmployeePageState extends State<AddEmployeePage> {
                                   children: [
                                     Icon(r.icon, size: 16, color: r.color),
                                     const SizedBox(width: 8),
-                                    Text(r.title, style: const TextStyle(fontSize: 13)),
+                                    Expanded(
+                                      child: Text(
+                                        r.title,
+                                        style: const TextStyle(fontSize: 13),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
                                   ],
                                 ),
                               );
                             }).toList(),
-                            onChanged: (v) => setState(() => _selectedRole = v!),
+                            onChanged: _isSaving ? null : (v) => setState(() => _selectedRole = v!),
                           ),
                         ),
                       ),
                       const SizedBox(height: 16),
 
-                      Text('Временный пароль *', style: AppTextStyles.labelMedium),
+                      Text('Пароль (необязательно)', style: AppTextStyles.labelMedium),
                       const SizedBox(height: 8),
                       TextFormField(
                         controller: _passwordController,
                         obscureText: true,
-                        decoration: _inputDeco('••••••••'),
-                        validator: (v) => (v == null || v.length < 6) ? 'Минимум 6 символов' : null,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        decoration: _inputDeco('Не менее 6 символов'),
+                        validator: (v) => (v != null && v.isNotEmpty && v.length < 6) ? 'Минимум 6 символов' : null,
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        'Оставьте поле пустым — система создаст временный пароль и покажет его после сохранения.',
+                        style: AppTextStyles.caption.copyWith(color: AppColors.textSecondary),
                       ),
                     ],
                   ),
@@ -186,7 +268,8 @@ class _AddEmployeePageState extends State<AddEmployeePage> {
                 const SizedBox(height: 24),
                 AppButton(
                   label: 'Зарегистрировать сотрудника',
-                  onPressed: _saveEmployee,
+                  isLoading: _isSaving,
+                  onPressed: _isSaving ? null : _saveEmployee,
                 ),
                 const SizedBox(height: 30),
               ],
@@ -197,11 +280,66 @@ class _AddEmployeePageState extends State<AddEmployeePage> {
     );
   }
 
+  Widget _buildDepartmentPicker() {
+    if (_departmentsLoading) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 10),
+        child: LinearProgressIndicator(minHeight: 2, color: AppColors.primaryBlue),
+      );
+    }
+    if (_departmentsError != null) {
+      return Row(
+        children: [
+          Expanded(
+            child: Text(_departmentsError!, style: const TextStyle(color: AppColors.error, fontSize: 13)),
+          ),
+          TextButton(onPressed: _loadDepartments, child: const Text('Повторить')),
+        ],
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          decoration: BoxDecoration(
+            color: AppColors.cardBackground,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: AppColors.cardBorder),
+          ),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: _selectedDepartment,
+              isExpanded: true,
+              items: [
+                const DropdownMenuItem(value: _noDepartment, child: Text('Без отдела')),
+                ..._departments.map((d) => DropdownMenuItem(value: d.id, child: Text(d.name))),
+                const DropdownMenuItem(value: _newDepartment, child: Text('Новый отдел…')),
+              ],
+              onChanged: _isSaving ? null : (v) => setState(() => _selectedDepartment = v ?? _noDepartment),
+            ),
+          ),
+        ),
+        if (_selectedDepartment == _newDepartment) ...[
+          const SizedBox(height: 8),
+          TextFormField(
+            controller: _newDepartmentController,
+            textCapitalization: TextCapitalization.sentences,
+            decoration: _inputDeco('Название нового отдела'),
+            validator: (v) => (_selectedDepartment == _newDepartment && (v == null || v.trim().isEmpty))
+                ? 'Введите название отдела'
+                : null,
+          ),
+        ],
+      ],
+    );
+  }
+
   InputDecoration _inputDeco(String hint) {
     return InputDecoration(
       hintText: hint,
       filled: true,
-      fillColor: Colors.white,
+      fillColor: AppColors.cardBackground,
       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: AppColors.cardBorder)),
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
     );

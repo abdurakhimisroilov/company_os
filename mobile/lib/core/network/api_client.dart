@@ -6,102 +6,102 @@ import 'api_endpoints.dart';
 
 class ApiClient {
   late final Dio dio;
+  late final Dio _refreshDio;
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
-  bool _isRefreshing = false;
-  final List<Completer<String?>> _refreshCompleters = [];
+  Future<String?>? _refreshInFlight;
+  String? _cachedAccessToken;
+  bool _tokenLoaded = false;
+
+  /// Called once when the server rejects the session and it cannot be refreshed.
+  void Function()? onSessionExpired;
 
   ApiClient({String? baseUrl}) {
-    dio = Dio(
-      BaseOptions(
-        baseUrl: baseUrl ?? AppConstants.apiBaseUrl,
-        connectTimeout: AppConstants.connectTimeout,
-        receiveTimeout: AppConstants.receiveTimeout,
-        sendTimeout: AppConstants.sendTimeout,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-      ),
+    final options = BaseOptions(
+      baseUrl: baseUrl ?? AppConstants.apiBaseUrl,
+      connectTimeout: AppConstants.connectTimeout,
+      receiveTimeout: AppConstants.receiveTimeout,
+      sendTimeout: AppConstants.sendTimeout,
+      headers: {'Accept': 'application/json'},
     );
-
-    dio.interceptors.addAll([
-      _AuthInterceptor(this),
-      _LoggingInterceptor(),
-      _ErrorInterceptor(),
-    ]);
+    dio = Dio(options);
+    // Refresh runs on its own client so a failing refresh can never wait on the
+    // interceptor that is waiting for it.
+    _refreshDio = Dio(options.copyWith());
+    dio.interceptors.add(_AuthInterceptor(this));
   }
 
   String get baseUrl => dio.options.baseUrl;
 
   void setBaseUrl(String url) {
     dio.options.baseUrl = url;
+    _refreshDio.options.baseUrl = url;
+  }
+
+  /// Absolute URL for a server file reference such as `/uploads/abc.pdf`.
+  String resolveFileUrl(String url) {
+    if (url.startsWith('http://') || url.startsWith('https://')) return url;
+    return '${AppConstants.serverOrigin}${url.startsWith('/') ? '' : '/'}$url';
   }
 
   Future<String?> getAccessToken() async {
-    return await _storage.read(key: AppConstants.accessTokenKey);
+    if (!_tokenLoaded) {
+      _cachedAccessToken = await _storage.read(key: AppConstants.accessTokenKey);
+      _tokenLoaded = true;
+    }
+    return _cachedAccessToken;
   }
+
+  /// Token state without touching storage; valid after the first [getAccessToken].
+  bool get hasSessionCached => _tokenLoaded && (_cachedAccessToken?.isNotEmpty ?? false);
+  bool get sessionKnown => _tokenLoaded;
 
   Future<String?> getRefreshToken() async {
     return await _storage.read(key: AppConstants.refreshTokenKey);
   }
 
   Future<void> saveTokens({required String accessToken, required String refreshToken}) async {
+    _cachedAccessToken = accessToken;
+    _tokenLoaded = true;
     await _storage.write(key: AppConstants.accessTokenKey, value: accessToken);
     await _storage.write(key: AppConstants.refreshTokenKey, value: refreshToken);
   }
 
   Future<void> clearTokens() async {
+    _cachedAccessToken = null;
+    _tokenLoaded = true;
     await _storage.delete(key: AppConstants.accessTokenKey);
     await _storage.delete(key: AppConstants.refreshTokenKey);
     await _storage.delete(key: AppConstants.userDataKey);
   }
 
-  Future<String?> refreshAuthToken() async {
-    if (_isRefreshing) {
-      final completer = Completer<String?>();
-      _refreshCompleters.add(completer);
-      return completer.future;
-    }
+  /// Returns a fresh access token, or null when the session is definitely over.
+  /// Throws on network trouble so a flaky connection does not sign the user out.
+  Future<String?> refreshAuthToken() {
+    return _refreshInFlight ??= _doRefresh().whenComplete(() => _refreshInFlight = null);
+  }
 
-    _isRefreshing = true;
+  Future<String?> _doRefresh() async {
+    final refreshToken = await getRefreshToken();
+    if (refreshToken == null || refreshToken.isEmpty) return null;
     try {
-      final refreshToken = await getRefreshToken();
-      if (refreshToken == null) {
-        _completeRefresh(null);
-        return null;
-      }
-
-      final response = await dio.post(
-        ApiEndpoints.refresh,
-        data: {'refreshToken': refreshToken},
-        options: Options(headers: {'Requires-Token': 'false'}),
-      );
-
-      if (response.statusCode == 200 || response.statusCode == 201) {
-        final newAccessToken = response.data['accessToken'] as String?;
-        final newRefreshToken = response.data['refreshToken'] as String?;
-        if (newAccessToken != null && newRefreshToken != null) {
-          await saveTokens(accessToken: newAccessToken, refreshToken: newRefreshToken);
-          _completeRefresh(newAccessToken);
-          return newAccessToken;
-        }
-      }
-      _completeRefresh(null);
-      return null;
-    } catch (_) {
-      _completeRefresh(null);
-      await clearTokens();
-      return null;
-    } finally {
-      _isRefreshing = false;
+      final response = await _refreshDio.post(ApiEndpoints.refresh, data: {'refreshToken': refreshToken});
+      final data = response.data;
+      final newAccess = data is Map ? data['accessToken'] as String? : null;
+      final newRefresh = data is Map ? data['refreshToken'] as String? : null;
+      if (newAccess == null || newAccess.isEmpty) return null;
+      await saveTokens(accessToken: newAccess, refreshToken: newRefresh ?? refreshToken);
+      return newAccess;
+    } on DioException catch (e) {
+      final status = e.response?.statusCode;
+      if (status == 400 || status == 401 || status == 403) return null;
+      rethrow;
     }
   }
 
-  void _completeRefresh(String? token) {
-    for (final completer in _refreshCompleters) {
-      completer.complete(token);
-    }
-    _refreshCompleters.clear();
+  Future<void> _expireSession() async {
+    final hadSession = _cachedAccessToken != null;
+    await clearTokens();
+    if (hadSession) onSessionExpired?.call();
   }
 
   // HTTP Helpers
@@ -120,8 +120,10 @@ class ApiClient {
     Map<String, dynamic>? queryParameters,
     Options? options,
     CancelToken? cancelToken,
+    ProgressCallback? onSendProgress,
   }) {
-    return dio.post<T>(path, data: data, queryParameters: queryParameters, options: options, cancelToken: cancelToken);
+    return dio.post<T>(path,
+        data: data, queryParameters: queryParameters, options: options, cancelToken: cancelToken, onSendProgress: onSendProgress);
   }
 
   Future<Response<T>> put<T>(
@@ -154,97 +156,88 @@ class ApiClient {
     return dio.delete<T>(path, data: data, queryParameters: queryParameters, options: options, cancelToken: cancelToken);
   }
 
-  Future<Map<String, dynamic>> uploadFile(String filePath, {String? customFileName}) async {
+  /// Uploads one file as multipart field `file`. [onProgress] receives 0.0–1.0
+  /// as bytes actually leave the device.
+  Future<Map<String, dynamic>> uploadFile(
+    String filePath, {
+    String? customFileName,
+    String path = ApiEndpoints.fileUpload,
+    Map<String, dynamic>? fields,
+    void Function(double progress)? onProgress,
+    CancelToken? cancelToken,
+  }) async {
     final fileName = customFileName ?? filePath.split(RegExp(r'[\\/]')).last;
     final formData = FormData.fromMap({
+      ...?fields,
       'file': await MultipartFile.fromFile(filePath, filename: fileName),
     });
     final response = await dio.post(
-      ApiEndpoints.fileUpload,
+      path,
       data: formData,
+      cancelToken: cancelToken,
+      options: Options(sendTimeout: const Duration(minutes: 5), receiveTimeout: const Duration(minutes: 2)),
+      onSendProgress: (sent, total) {
+        if (onProgress != null && total > 0) onProgress(sent / total);
+      },
     );
-    if (response.statusCode == 200 || response.statusCode == 201) {
-      if (response.data is Map<String, dynamic>) {
-        return response.data as Map<String, dynamic>;
-      }
-    }
+    if (response.data is Map) return Map<String, dynamic>.from(response.data as Map);
     throw Exception('Не удалось загрузить файл на сервер');
+  }
+
+  /// Downloads a server file to [savePath]. [onProgress] receives 0.0–1.0.
+  Future<void> downloadFile(String url, String savePath, {void Function(double progress)? onProgress, CancelToken? cancelToken}) async {
+    await dio.download(
+      resolveFileUrl(url),
+      savePath,
+      cancelToken: cancelToken,
+      options: Options(receiveTimeout: const Duration(minutes: 5)),
+      onReceiveProgress: (received, total) {
+        if (onProgress != null && total > 0) onProgress(received / total);
+      },
+    );
   }
 }
 
-class _AuthInterceptor extends QueuedInterceptor {
+class _AuthInterceptor extends Interceptor {
   final ApiClient _client;
   _AuthInterceptor(this._client);
 
   @override
   Future<void> onRequest(RequestOptions options, RequestInterceptorHandler handler) async {
-    if (options.headers['Requires-Token'] == 'false') {
-      options.headers.remove('Requires-Token');
-      return handler.next(options);
-    }
-
     final token = await _client.getAccessToken();
-    if (token != null) {
+    if (token != null && token.isNotEmpty) {
       options.headers['Authorization'] = 'Bearer $token';
     }
-    return handler.next(options);
-  }
-
-  @override
-  Future<void> onError(DioException err, ErrorInterceptorHandler handler) async {
-    if (err.response?.statusCode == 401 && err.requestOptions.headers['Requires-Token'] != 'false') {
-      final newToken = await _client.refreshAuthToken();
-      if (newToken != null) {
-        final options = err.requestOptions;
-        options.headers['Authorization'] = 'Bearer $newToken';
-        try {
-          final response = await _client.dio.fetch(options);
-          return handler.resolve(response);
-        } on DioException catch (retryError) {
-          return handler.next(retryError);
-        }
-      }
-    }
-    return handler.next(err);
-  }
-}
-
-class _LoggingInterceptor extends Interceptor {
-  @override
-  void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
-    // Debug logging can be hooked here
     handler.next(options);
   }
 
   @override
-  void onResponse(Response response, ResponseInterceptorHandler handler) {
-    handler.next(response);
-  }
-
-  @override
-  void onError(DioException err, ErrorInterceptorHandler handler) {
-    handler.next(err);
-  }
-}
-
-class _ErrorInterceptor extends Interceptor {
-  @override
-  void onError(DioException err, ErrorInterceptorHandler handler) {
-    String message = 'Произошла ошибка';
-    if (err.type == DioExceptionType.connectionTimeout ||
-        err.type == DioExceptionType.receiveTimeout) {
-      message = 'Превышено время ожидания ответа';
-    } else if (err.type == DioExceptionType.connectionError) {
-      message = 'Нет подключения к серверу';
-    } else if (err.response?.data is Map && (err.response?.data as Map)['message'] != null) {
-      message = (err.response?.data as Map)['message'].toString();
+  Future<void> onError(DioException err, ErrorInterceptorHandler handler) async {
+    final request = err.requestOptions;
+    final isAuthCall = request.path.contains('/auth/login') || request.path.contains('/auth/register');
+    if (err.response?.statusCode != 401 || isAuthCall || request.extra['retried'] == true) {
+      return handler.next(err);
     }
-    final customErr = DioException(
-      requestOptions: err.requestOptions,
-      response: err.response,
-      type: err.type,
-      error: message,
-    );
-    handler.next(customErr);
+
+    String? newToken;
+    try {
+      newToken = await _client.refreshAuthToken();
+    } catch (_) {
+      return handler.next(err);
+    }
+    if (newToken == null) {
+      await _client._expireSession();
+      return handler.next(err);
+    }
+
+    try {
+      request.headers['Authorization'] = 'Bearer $newToken';
+      request.extra['retried'] = true;
+      // A consumed multipart body cannot be replayed; the caller retries those.
+      if (request.data is FormData) return handler.next(err);
+      handler.resolve(await _client.dio.fetch(request));
+    } on DioException catch (retryError) {
+      handler.next(retryError);
+    }
   }
 }

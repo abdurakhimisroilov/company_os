@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:go_router/go_router.dart';
@@ -33,12 +35,30 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
     super.dispose();
   }
 
+  /// Reloads the deals and finishes when the server has answered.
+  Future<void> _reload() async {
+    final completer = Completer<String?>();
+    context.read<DealsBloc>().add(LoadDealsEvent(completer: completer));
+    final error = await completer.future;
+    if (!mounted || error == null) return;
+    if (context.read<DealsBloc>().state is DealsLoaded) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error), backgroundColor: AppColors.error),
+      );
+    }
+  }
+
+  Future<void> _openDeal(DealModel deal) async {
+    await context.push('/deals/${deal.id}');
+    if (mounted) await _reload();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.background,
       body: Container(
-        decoration: const BoxDecoration(gradient: AppColors.backgroundGradient),
+        decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
         child: SafeArea(
           bottom: false,
           child: Column(
@@ -46,21 +66,8 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
               _buildHeader(),
               _buildViewSwitch(),
               Expanded(
-                child: BlocConsumer<DealsBloc, DealsState>(
-                  listener: (context, state) {
-                    if (state is DealsActionSuccess) {
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text(state.message), backgroundColor: AppColors.success),
-                      );
-                    }
-                  },
+                child: BlocBuilder<DealsBloc, DealsState>(
                   builder: (context, state) {
-                    if (state is DealsLoading) {
-                      return const LoadingShimmer();
-                    }
-                    if (state is DealsError) {
-                      return _buildErrorState(state.message);
-                    }
                     if (state is DealsLoaded) {
                       return TabBarView(
                         controller: _viewTabController,
@@ -70,7 +77,10 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
                         ],
                       );
                     }
-                    return const SizedBox.shrink();
+                    if (state is DealsError) {
+                      return _buildErrorState(state.message);
+                    }
+                    return const LoadingShimmer();
                   },
                 ),
               ),
@@ -93,10 +103,10 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
       child: Row(
         children: [
           IconButton(
-            icon: const Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
+            icon: Icon(Icons.arrow_back_ios_new, color: AppColors.textPrimary, size: 20),
             onPressed: () => context.pop(),
           ),
-          const Expanded(
+          Expanded(
             child: Text(
               'Сделки и CRM',
               style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: AppColors.textPrimary),
@@ -112,7 +122,7 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
       height: 38,
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.6),
+        color: AppColors.cardBackground.withOpacity(0.6),
         borderRadius: BorderRadius.circular(10),
       ),
       child: TabBar(
@@ -132,10 +142,9 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
   Widget _buildListView(List<DealModel> deals) {
     if (deals.isEmpty) {
       return RefreshIndicator(
-        onRefresh: () async {
-          context.read<DealsBloc>().add(const LoadDealsEvent());
-        },
+        onRefresh: _reload,
         child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.symmetric(vertical: 60),
           children: [
             Center(
@@ -167,18 +176,17 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
     }
 
     return RefreshIndicator(
-      onRefresh: () async {
-        context.read<DealsBloc>().add(const LoadDealsEvent());
-      },
+      onRefresh: _reload,
       child: ListView.builder(
-        padding: const EdgeInsets.all(16),
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
         itemCount: deals.length,
         itemBuilder: (context, index) {
           final deal = deals[index];
           return Container(
             margin: const EdgeInsets.only(bottom: 12),
             child: GlassCard(
-              onTap: () => context.push('/deals/${deal.id}'),
+              onTap: () => _openDeal(deal),
               padding: const EdgeInsets.all(16),
               borderRadius: 16,
               child: Column(
@@ -189,14 +197,17 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
                       Expanded(
                         child: Text(
                           deal.title,
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: AppColors.textPrimary),
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: AppColors.textPrimary),
                         ),
                       ),
                       _statusChip(deal.status),
                     ],
                   ),
                   const SizedBox(height: 6),
-                  Text('Клиент: ${deal.customerName}', style: AppTextStyles.bodyMedium),
+                  Text(
+                    deal.customerName.isNotEmpty ? 'Клиент: ${deal.customerName}' : 'Клиент не указан',
+                    style: AppTextStyles.bodyMedium,
+                  ),
                   const Divider(height: 20),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -208,7 +219,7 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
                       if (deal.assignedEmployeeName != null)
                         Row(
                           children: [
-                            const Icon(Icons.person, size: 14, color: AppColors.textSecondary),
+                            Icon(Icons.person, size: 14, color: AppColors.textSecondary),
                             const SizedBox(width: 4),
                             Text(deal.assignedEmployeeName!, style: AppTextStyles.caption),
                           ],
@@ -236,7 +247,7 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
           width: 260,
           margin: const EdgeInsets.only(right: 12),
           decoration: BoxDecoration(
-            color: Colors.white.withOpacity(0.5),
+            color: AppColors.cardBackground.withOpacity(0.5),
             borderRadius: BorderRadius.circular(16),
             border: Border.all(color: AppColors.cardBorder),
           ),
@@ -247,7 +258,7 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                 decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.8),
+                  color: AppColors.cardBackground.withOpacity(0.8),
                   borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
                 ),
                 child: Column(
@@ -258,7 +269,7 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
                       children: [
                         Text(
                           DealModel.statusNames[statusKey] ?? statusKey,
-                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppColors.textPrimary),
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppColors.textPrimary),
                         ),
                         Container(
                           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -280,7 +291,9 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
               ),
               // Deals cards list in this column
               Expanded(
-                child: ListView.builder(
+                child: columnDeals.isEmpty
+                    ? Center(child: Text('Нет сделок', style: AppTextStyles.caption))
+                    : ListView.builder(
                   padding: const EdgeInsets.all(8),
                   itemCount: columnDeals.length,
                   itemBuilder: (context, idx) {
@@ -288,15 +301,17 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
                     return Container(
                       margin: const EdgeInsets.only(bottom: 8),
                       child: GlassCard(
-                        onTap: () => context.push('/deals/${d.id}'),
+                        onTap: () => _openDeal(d),
                         padding: const EdgeInsets.all(12),
                         borderRadius: 12,
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(d.title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                            const SizedBox(height: 4),
-                            Text(d.customerName, style: AppTextStyles.caption),
+                            Text(d.title, style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: AppColors.textPrimary)),
+                            if (d.customerName.isNotEmpty) ...[
+                              const SizedBox(height: 4),
+                              Text(d.customerName, style: AppTextStyles.caption),
+                            ],
                             const SizedBox(height: 8),
                             Text(
                               Formatters.formatUzs(d.amount),
@@ -340,18 +355,21 @@ class _DealsPageState extends State<DealsPage> with SingleTickerProviderStateMix
 
   Widget _buildErrorState(String message) {
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.error_outline, size: 48, color: AppColors.error),
-          const SizedBox(height: 12),
-          Text(message, style: AppTextStyles.bodyMedium),
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: () => context.read<DealsBloc>().add(const LoadDealsEvent()),
-            child: const Text('Повторить'),
-          ),
-        ],
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.error_outline, size: 48, color: AppColors.error),
+            const SizedBox(height: 12),
+            Text(message, style: AppTextStyles.bodyMedium, textAlign: TextAlign.center),
+            const SizedBox(height: 16),
+            ElevatedButton(
+              onPressed: _reload,
+              child: const Text('Повторить'),
+            ),
+          ],
+        ),
       ),
     );
   }
