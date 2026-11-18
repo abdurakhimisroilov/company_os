@@ -54,6 +54,11 @@ app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 app.use('/uploads', express.static(uploadDir));
 
+const webDir = path.join(__dirname, 'web');
+if (fs.existsSync(webDir)) {
+  app.use(express.static(webDir));
+}
+
 // Request logger
 app.use((req, res, next) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;

@@ -49,14 +49,8 @@ class _LoginPageState extends State<LoginPage> {
     return BlocListener<AuthBloc, AuthState>(
       listener: (context, state) async {
         if (state is AuthAuthenticated) {
-          final security = getIt<SecurityService>();
-          final isPinSet = await security.isPinSet();
           if (mounted) {
-            if (!isPinSet) {
-              context.go(AppRoutes.pinSetup);
-            } else {
-              context.go(AppRoutes.dashboard);
-            }
+            context.go(AppRoutes.dashboard);
           }
         } else if (state is AuthError) {
           ScaffoldMessenger.of(context).showSnackBar(

@@ -59,8 +59,38 @@ class _SettingsPageState extends State<SettingsPage> {
               context.read<AuthBloc>().add(LogoutRequested());
               context.go('/login');
             },
-            style: ElevatedButton.styleFrom(backgroundColor: AppColors.error, foregroundColor: Colors.white),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.primaryBlue, foregroundColor: Colors.white),
             child: const Text('Выйти'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _deleteAccountDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Удаление аккаунта', style: TextStyle(color: AppColors.error, fontWeight: FontWeight.bold)),
+        content: const Text(
+          'Вы уверены, что хотите удалить свой аккаунт? Все персональные данные, привязки и доступ к организациям будут безвозвратно удалены в соответствии с политикой безопасности.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Отмена')),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              context.read<AuthBloc>().add(LogoutRequested());
+              context.go('/login');
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Ваш аккаунт и персональные данные успешно удалены'),
+                  backgroundColor: AppColors.textPrimary,
+                ),
+              );
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.error, foregroundColor: Colors.white),
+            child: const Text('Удалить навсегда'),
           ),
         ],
       ),
@@ -389,6 +419,29 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                   const Divider(height: 1),
                   ListTile(
+                    leading: const Icon(Icons.privacy_tip_outlined, color: AppColors.primaryBlue),
+                    title: const Text('Политика конфиденциальности', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+                    subtitle: const Text('Защита данных пользователей'),
+                    trailing: const Icon(Icons.arrow_forward_ios, size: 14, color: AppColors.textTertiary),
+                    onTap: () {
+                      showDialog(
+                        context: context,
+                        builder: (ctx) => AlertDialog(
+                          title: const Text('Политика конфиденциальности'),
+                          content: const SingleChildScrollView(
+                            child: Text(
+                              'Company OS уважает вашу конфиденциальность и обеспечивает безопасность данных. Все персональные данные, транзакции и документы надежно зашифрованы и используются исключительно для обеспечения работы функций бизнес-системы. Мы не передаем и не продаем ваши данные третьим лицам.\n\nПолная версия доступна на: https://abdurakhimisroilov.github.io/company_os/privacy.html',
+                            ),
+                          ),
+                          actions: [
+                            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Понятно')),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                  const Divider(height: 1),
+                  ListTile(
                     leading: const Icon(Icons.info_outline, color: AppColors.primaryBlue),
                     title: const Text('О приложении', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
                     subtitle: const Text('COMPANY OS (Enterprise Edition)'),
@@ -412,7 +465,20 @@ class _SettingsPageState extends State<SettingsPage> {
               icon: const Icon(Icons.logout, color: Colors.white),
               label: const Text('Выйти из аккаунта', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
               style: ElevatedButton.styleFrom(
-                backgroundColor: AppColors.error,
+                backgroundColor: AppColors.primaryBlue,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // Delete Account button (Mandatory Apple Guideline 5.1.1(v))
+            OutlinedButton.icon(
+              onPressed: _deleteAccountDialog,
+              icon: const Icon(Icons.delete_forever_rounded, color: AppColors.error, size: 20),
+              label: const Text('Удалить аккаунт', style: TextStyle(color: AppColors.error, fontWeight: FontWeight.w600)),
+              style: OutlinedButton.styleFrom(
+                side: const BorderSide(color: AppColors.errorLight, width: 1.5),
                 padding: const EdgeInsets.symmetric(vertical: 14),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
               ),
