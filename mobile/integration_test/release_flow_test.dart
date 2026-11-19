@@ -45,7 +45,14 @@ void main() {
     await typeInto(tester, nthField(4), 'Secret123');
     await typeInto(tester, nthField(5), 'Secret123');
     await tester.testTextInput.receiveAction(TextInputAction.done);
-    await tapOn(tester, find.widgetWithText(InkWell, 'Зарегистрироваться').last);
+    await settle(tester, 10);
+    // On Android "done" on the last field already submits the form, so the
+    // button may be gone (or going) by now.
+    final registerButton = find.widgetWithText(InkWell, 'Зарегистрироваться');
+    if (registerButton.evaluate().isNotEmpty) {
+      await tester.tap(registerButton.first, warnIfMissed: false);
+      await settle(tester, 4);
+    }
 
     // ── PIN setup ───────────────────────────────────────────────────────────
     step = 'PIN setup';

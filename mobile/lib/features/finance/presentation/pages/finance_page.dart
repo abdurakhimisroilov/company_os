@@ -290,6 +290,7 @@ class _FinancePageState extends State<FinancePage> with SingleTickerProviderStat
               controller: _tabController,
               isScrollable: true,
               tabAlignment: TabAlignment.start,
+              labelPadding: const EdgeInsets.symmetric(horizontal: 14),
               indicator: BoxDecoration(
                 borderRadius: BorderRadius.circular(10),
                 color: AppColors.primaryBlue,
