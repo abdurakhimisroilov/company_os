@@ -189,7 +189,7 @@ class _SessionScopeState extends State<_SessionScope> with WidgetsBindingObserve
           // Only the active theme is built: the AppColors tokens resolve
           // against AppColors.isDark, so the other one would be wrong.
           return MaterialApp.router(
-            title: 'COMPANY OS',
+            title: 'Opero',
             debugShowCheckedModeBanner: false,
             theme: isDark ? AppTheme.dark : AppTheme.light,
             themeMode: mode,

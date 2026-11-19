@@ -2,7 +2,7 @@ class AppStrings {
   AppStrings._();
 
   // ─── App ───────────────────────────────────────────────────────────────────
-  static const String appName = 'COMPANY OS';
+  static const String appName = 'OPERO';
   static const String loading = 'Загрузка...';
   static const String error = 'Ошибка';
   static const String success = 'Успешно';

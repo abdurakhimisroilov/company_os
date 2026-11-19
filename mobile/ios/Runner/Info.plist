@@ -7,7 +7,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Company OS</string>
+	<string>Opero</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -15,7 +15,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>company_os</string>
+	<string>Opero</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -35,7 +35,7 @@
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Необходимо для сохранения экспортированных отчетов и счетов в галерею.</string>
 	<key>NSFaceIDUsageDescription</key>
-	<string>Используйте Face ID / Touch ID для быстрого и безопасного входа в Company OS.</string>
+	<string>Используйте Face ID / Touch ID для быстрого и безопасного входа в Opero.</string>
 
 	<!-- App Transport Security for HTTP VPS Server -->
 	<key>NSAppTransportSecurity</key>

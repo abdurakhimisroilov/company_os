@@ -1,0 +1,11 @@
+# Regenerate with: dart run flutter_launcher_icons
+flutter_launcher_icons:
+  image_path: "branding/opero_icon_1024.png"
+  ios: true
+  remove_alpha_ios: true
+  android: "ic_launcher"
+  min_sdk_android: 21
+  # Adaptive icon: the full artwork is the background layer; the emblem sits
+  # inside Android's safe zone, so no separate foreground is needed.
+  adaptive_icon_background: "branding/opero_icon_1024.png"
+  adaptive_icon_foreground: "branding/adaptive_foreground_empty.png"

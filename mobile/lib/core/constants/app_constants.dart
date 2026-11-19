@@ -62,7 +62,7 @@ class AppConstants {
 
   // ─── Misc ──────────────────────────────────────────────────────────────────
   static const int debounceMs = 400;
-  static const String appName = 'COMPANY OS';
-  static const String companyName = 'Company OS';
+  static const String appName = 'OPERO';
+  static const String companyName = 'Opero';
   static const String packageName = 'com.companyos.app';
 }

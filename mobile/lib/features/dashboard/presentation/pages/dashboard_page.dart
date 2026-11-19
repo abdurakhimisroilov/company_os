@@ -203,7 +203,7 @@ class _DashboardPageState extends State<DashboardPage> {
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
       child: Row(
         children: [
-          // Company OS Brand Mark & Interactive Company Switcher
+          // Opero brand mark & Interactive Company Switcher
           Expanded(
             child: InkWell(
               onTap: () {

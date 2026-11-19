@@ -2,7 +2,7 @@ class AppStringsUz {
   AppStringsUz._();
 
   // ─── App ───────────────────────────────────────────────────────────────────
-  static const String appName = 'COMPANY OS';
+  static const String appName = 'OPERO';
   static const String loading = 'Yuklanmoqda...';
   static const String error = 'Xatolik';
   static const String success = 'Muvaffaqiyatli';

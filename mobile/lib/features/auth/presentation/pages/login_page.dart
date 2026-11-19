@@ -106,7 +106,7 @@ class _LoginPageState extends State<LoginPage> {
             ),
             const SizedBox(height: 10),
             Text(
-              'Восстановление по электронной почте не предусмотрено. Если вы единственный владелец организации и не можете войти, обратитесь в службу поддержки Company OS.',
+              'Восстановление по электронной почте не предусмотрено. Если вы единственный владелец организации и не можете войти, обратитесь в службу поддержки Opero.',
               style: AppTextStyles.caption.copyWith(color: AppColors.textSecondary, height: 1.4),
             ),
             const SizedBox(height: 20),

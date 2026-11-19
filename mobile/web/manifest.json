@@ -1,6 +1,6 @@
 {
-    "name": "company_os",
-    "short_name": "company_os",
+    "name": "Opero",
+    "short_name": "Opero",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

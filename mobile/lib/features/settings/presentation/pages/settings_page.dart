@@ -156,7 +156,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    'Company OS использует ваши персональные данные, операции и документы только для работы функций бизнес-системы. Мы не передаём и не продаём ваши данные третьим лицам.\n\nУдалить учётную запись вместе с данными можно в любой момент: «Настройки» → «Удалить аккаунт».\n\nПолная версия политики:',
+                    'Opero использует ваши персональные данные, операции и документы только для работы функций бизнес-системы. Мы не передаём и не продаём ваши данные третьим лицам.\n\nУдалить учётную запись вместе с данными можно в любой момент: «Настройки» → «Удалить аккаунт».\n\nПолная версия политики:',
                   ),
                   const SizedBox(height: 8),
                   const SelectableText(
@@ -407,14 +407,14 @@ class _SettingsPageState extends State<SettingsPage> {
                     title: const Text('О приложении', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
                     subtitle: Text(
                       _packageInfo == null
-                          ? 'COMPANY OS (Enterprise Edition)'
-                          : 'COMPANY OS (Enterprise Edition) • v${_packageInfo!.version}',
+                          ? 'Opero (Enterprise Edition)'
+                          : 'Opero (Enterprise Edition) • v${_packageInfo!.version}',
                     ),
                     onTap: () {
                       final info = _packageInfo;
                       showAboutDialog(
                         context: context,
-                        applicationName: 'COMPANY OS',
+                        applicationName: 'Opero',
                         applicationVersion: info == null ? null : '${info.version} (${info.buildNumber})',
                         applicationLegalese: '© 2026 Все права защищены',
                       );

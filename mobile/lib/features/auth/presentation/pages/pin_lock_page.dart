@@ -105,7 +105,7 @@ class _PinLockPageState extends State<PinLockPage> {
     _isCheckingBiometrics = true;
 
     final success = await _securityService.authenticateWithBiometrics(
-      reason: 'Войдите в COMPANY OS с помощью биометрии',
+      reason: 'Войдите в Opero с помощью биометрии',
     );
 
     _isCheckingBiometrics = false;
