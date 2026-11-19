@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
@@ -16,6 +18,17 @@ if (pubspecFile.exists()) {
         if (parts.size > 1) parsedVersionCode = parts[1].trim().toIntOrNull() ?: 3
     }
 }
+
+// Release signing: android/key.properties (git-ignored) points at the upload key.
+// Without it, release builds fall back to the debug key (CI, local testing).
+val keystoreProperties = Properties().apply {
+    val file = rootProject.file("key.properties")
+    if (file.exists()) file.inputStream().use { load(it) }
+}
+val hasReleaseKey = keystoreProperties.getProperty("storeFile") != null
+
+// PLAY_STORE=true builds the Google Play variant: no self-updater permission.
+val isPlayStoreBuild = System.getenv("PLAY_STORE") == "true"
 
 android {
     namespace = "com.companyos.company_os"
@@ -40,10 +53,25 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (hasReleaseKey) "release" else "debug")
         }
+    }
+
+    if (isPlayStoreBuild) {
+        sourceSets.getByName("release").manifest.srcFile("src/playstore/AndroidManifest.xml")
     }
 
     packaging {

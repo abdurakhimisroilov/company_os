@@ -68,7 +68,11 @@ class AppUpdateService {
 
   /// Installing an APK from our own server exists only on Android. On iOS
   /// (and everywhere else) updates come from the store, so nothing here runs.
-  static bool get isSupported => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+  /// Builds for Google Play are made with --dart-define=PLAY_STORE=true: the
+  /// store forbids apps that download and install their own updates.
+  static const bool _playStoreBuild = bool.fromEnvironment('PLAY_STORE');
+
+  static bool get isSupported => !kIsWeb && !_playStoreBuild && defaultTargetPlatform == TargetPlatform.android;
 
   /// Version of the installed build, as the platform reports it.
   Future<Map<String, dynamic>> getCurrentVersion() async {
