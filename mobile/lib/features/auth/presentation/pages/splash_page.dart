@@ -7,6 +7,7 @@ import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/di/injection.dart';
 import '../../../../core/services/security_service.dart';
+import '../../../../core/widgets/app_logo.dart';
 import '../bloc/auth_bloc.dart';
 
 class SplashPage extends StatefulWidget {
@@ -90,26 +91,7 @@ class _SplashPageState extends State<SplashPage> with SingleTickerProviderStateM
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         // App Logo
-                        Container(
-                          width: 88,
-                          height: 88,
-                          decoration: BoxDecoration(
-                            gradient: AppColors.primaryGradient,
-                            borderRadius: BorderRadius.circular(26),
-                            boxShadow: [
-                              BoxShadow(
-                                color: AppColors.primaryBlue.withOpacity(0.4),
-                                blurRadius: 28,
-                                offset: const Offset(0, 10),
-                              ),
-                            ],
-                          ),
-                          child: const Icon(
-                            Icons.business_center_rounded,
-                            size: 46,
-                            color: Colors.white,
-                          ),
-                        ),
+                        const AppLogo(size: 88, borderRadius: 26, shadowOpacity: 0.4, shadowBlur: 28, shadowOffsetY: 10),
                         const SizedBox(height: 24),
                         Text(
                           AppStrings.appName,

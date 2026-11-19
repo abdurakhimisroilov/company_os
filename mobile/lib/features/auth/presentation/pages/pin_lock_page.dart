@@ -9,6 +9,7 @@ import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/di/injection.dart';
 import '../../../../core/services/security_service.dart';
+import '../../../../core/widgets/app_logo.dart';
 import '../bloc/auth_bloc.dart';
 import 'biometric_kind.dart';
 
@@ -219,28 +220,7 @@ class _PinLockPageState extends State<PinLockPage> {
             children: [
               const Spacer(flex: 1),
               // Logo
-              Container(
-                width: 72,
-                height: 72,
-                decoration: BoxDecoration(
-                  gradient: AppColors.primaryGradient,
-                  borderRadius: BorderRadius.circular(22),
-                  boxShadow: [
-                    BoxShadow(
-                      color: AppColors.primaryBlue.withOpacity(0.35),
-                      blurRadius: 20,
-                      offset: const Offset(0, 8),
-                    ),
-                  ],
-                ),
-                child: const Center(
-                  child: Icon(
-                    Icons.business_center_rounded,
-                    size: 38,
-                    color: Colors.white,
-                  ),
-                ),
-              ),
+              const AppLogo(size: 72, borderRadius: 22, shadowOpacity: 0.35, shadowBlur: 20, shadowOffsetY: 8),
               const SizedBox(height: 20),
               Text(
                 AppStrings.appName,

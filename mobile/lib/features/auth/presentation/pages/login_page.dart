@@ -9,6 +9,7 @@ import '../../../../core/utils/validators.dart';
 import '../../../../core/widgets/app_button.dart';
 import '../../../../core/widgets/app_text_field.dart';
 import '../../../../core/widgets/glass_card.dart';
+import '../../../../core/widgets/app_logo.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../bloc/auth_bloc.dart';
 
@@ -151,28 +152,7 @@ class _LoginPageState extends State<LoginPage> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     // Logo & App Name
-                    Container(
-                      width: 72,
-                      height: 72,
-                      decoration: BoxDecoration(
-                        gradient: AppColors.primaryGradient,
-                        borderRadius: BorderRadius.circular(22),
-                        boxShadow: [
-                          BoxShadow(
-                            color: AppColors.primaryBlue.withOpacity(0.35),
-                            blurRadius: 20,
-                            offset: const Offset(0, 8),
-                          ),
-                        ],
-                      ),
-                      child: const Center(
-                        child: Icon(
-                          Icons.business_center_rounded,
-                          size: 38,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ),
+                    const AppLogo(size: 72, borderRadius: 22, shadowOpacity: 0.35, shadowBlur: 20, shadowOffsetY: 8),
                     const SizedBox(height: 20),
                     Text(
                       AppStrings.appName,

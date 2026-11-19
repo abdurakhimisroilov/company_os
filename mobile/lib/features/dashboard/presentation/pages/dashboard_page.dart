@@ -18,6 +18,7 @@ import '../../../notifications/presentation/bloc/notifications_bloc.dart';
 import '../../../../core/di/injection.dart';
 import '../../../../core/services/app_session.dart';
 import '../../../../core/services/app_update_service.dart';
+import '../../../../core/widgets/app_logo.dart';
 import '../../../finance/data/company_currency.dart';
 import '../../../companies/data/models/company_model.dart';
 import '../../../companies/data/repositories/company_repository.dart';
@@ -226,26 +227,7 @@ class _DashboardPageState extends State<DashboardPage> {
                 padding: const EdgeInsets.symmetric(vertical: 4),
                 child: Row(
                   children: [
-                    Container(
-                      width: 38,
-                      height: 38,
-                      decoration: BoxDecoration(
-                        gradient: AppColors.primaryGradient,
-                        borderRadius: BorderRadius.circular(10),
-                        boxShadow: [
-                          BoxShadow(
-                            color: AppColors.primaryBlue.withOpacity(0.2),
-                            blurRadius: 8,
-                            offset: const Offset(0, 3),
-                          ),
-                        ],
-                      ),
-                      child: const Icon(
-                        Icons.business_center_rounded,
-                        color: Colors.white,
-                        size: 20,
-                      ),
-                    ),
+                    const AppLogo(size: 38, borderRadius: 10, shadowOpacity: 0.2, shadowBlur: 8, shadowOffsetY: 3),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Column(
