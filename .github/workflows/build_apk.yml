@@ -29,13 +29,47 @@ jobs:
           cd mobile
           flutter pub get
 
-      - name: Build Android APK
+      # Signing key comes from repository secrets (Settings → Secrets and
+      # variables → Actions). Without them the build is signed with a debug key.
+      - name: Restore upload key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        if: env.KEYSTORE_BASE64 != ''
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/upload-keystore.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/upload-keystore.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyPassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+          } > mobile/android/key.properties
+
+      - name: Build Android APK (direct install, with in-app updater)
         run: |
           cd mobile
-          flutter build apk --release --android-skip-build-dependency-validation --verbose
+          flutter build apk --release --android-skip-build-dependency-validation
+
+      - name: Build Google Play bundle (no self-updater)
+        env:
+          PLAY_STORE: 'true'
+        run: |
+          cd mobile
+          flutter build appbundle --release --android-skip-build-dependency-validation --dart-define=PLAY_STORE=true
+
+      - name: Remove signing files
+        if: always()
+        run: rm -f mobile/android/key.properties "$RUNNER_TEMP/upload-keystore.jks"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: CompanyOS-Android
           path: mobile/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload Play bundle Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CompanyOS-GooglePlay
+          path: mobile/build/app/outputs/bundle/release/app-release.aab
