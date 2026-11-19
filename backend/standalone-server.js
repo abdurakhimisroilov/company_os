@@ -82,6 +82,12 @@ function num(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+// "1 200 000" with thin grouping spaces, as amounts are written in the app.
+function money(v) {
+  const n = Math.round(num(v) * 100) / 100;
+  return n.toLocaleString('ru-RU', { maximumFractionDigits: 2 }).replace(/\u00a0/g, ' ');
+}
+
 function requirePositive(v, label) {
   const n = num(v, NaN);
   if (!Number.isFinite(n) || n <= 0) throw new HttpError(400, `${label} должна быть больше 0`);
@@ -917,7 +923,7 @@ api.post('/finance/transactions/income', h(async (req, res) => {
       documentUrl: relativeUploadPath(b.documentUrl), documentName: strOrNull(b.documentName),
     });
   });
-  await notify(req.user.id, 'Поступление средств', `Зафиксирован доход: ${amount} сум (${row.category})`, 'FINANCE', row.id);
+  await notify(req.user.id, 'Поступление средств', `Зафиксирован доход: ${money(amount)} сум${row.counterparty_name ? ` — ${row.counterparty_name}` : ''}`, 'FINANCE', row.id);
   res.status(201).json({ data: txOut(row) });
 }));
 
@@ -941,7 +947,7 @@ api.post('/finance/transactions/expense', h(async (req, res) => {
       documentUrl: relativeUploadPath(b.documentUrl), documentName: strOrNull(b.documentName),
     });
   });
-  await notify(req.user.id, 'Расход средств', `Зафиксирован расход: ${amount} сум (${row.category})`, 'FINANCE', row.id);
+  await notify(req.user.id, 'Расход средств', `Зафиксирован расход: ${money(amount)} сум (${row.category})`, 'FINANCE', row.id);
   res.status(201).json({ data: txOut(row) });
 }));
 
@@ -1002,7 +1008,7 @@ api.post('/finance/debts/pay', h(async (req, res) => {
       documentUrl: relativeUploadPath(b.documentUrl), documentName: strOrNull(b.documentName),
     });
   });
-  await notify(req.user.id, payable ? 'Оплата кредиторской задолженности' : 'Погашение дебиторской задолженности', `Оплата задолженности: ${amount} сум`, 'FINANCE', row.id);
+  await notify(req.user.id, payable ? 'Оплата кредиторской задолженности' : 'Погашение дебиторской задолженности', `Оплата задолженности: ${money(amount)} сум`, 'FINANCE', row.id);
   res.status(201).json({ data: txOut(row) });
 }));
 
@@ -1415,7 +1421,7 @@ api.post('/shipments', h(async (req, res) => {
     const full = await client.query(`${SHIPMENT_SELECT} WHERE s.id = $1`, [inserted.rows[0].id]);
     return shipmentOut(full.rows[0], await shipmentItems(client, inserted.rows[0].id));
   });
-  await notify(req.user.id, 'Новая поставка', `Поставка №${shipment.shipment_number} на сумму ${shipment.totalCost} сум`, 'SHIPMENT', shipment.id);
+  await notify(req.user.id, 'Новая поставка', `Поставка №${shipment.shipment_number} на сумму ${money(shipment.totalCost)} сум`, 'SHIPMENT', shipment.id);
   res.status(201).json({ data: shipment });
 }));
 
@@ -1549,7 +1555,7 @@ api.post('/sales', h(async (req, res) => {
     const full = await client.query(`${SALE_SELECT} WHERE s.id = $1`, [saleRow.id]);
     return saleDetails(client, full.rows[0]);
   });
-  await notify(req.user.id, 'Новая продажа', `Продажа №${sale.sale_number} на сумму ${sale.totalAmount} сум`, 'SALE', sale.id);
+  await notify(req.user.id, 'Новая продажа', `Продажа №${sale.sale_number} на сумму ${money(sale.totalAmount)} сум`, 'SALE', sale.id);
   res.status(201).json({ data: sale });
 }));
 
@@ -1656,7 +1662,7 @@ api.post('/deals', h(async (req, res) => {
     );
     return (await client.query(`${DEAL_SELECT} WHERE d.id = $1`, [inserted.rows[0].id])).rows[0];
   });
-  await notify(req.user.id, 'Новая сделка', `Создана сделка: ${deal.title} на сумму ${num(deal.amount)} сум`, 'DEAL', deal.id);
+  await notify(req.user.id, 'Новая сделка', `Создана сделка: ${deal.title} на сумму ${money(deal.amount)} сум`, 'DEAL', deal.id);
   res.status(201).json({ data: dealOut(deal, []) });
 }));
 

@@ -38,10 +38,10 @@ let cachedAt = 0;
 function providerToken() {
   const now = Math.floor(Date.now() / 1000);
   if (!cachedToken || now - cachedAt > 50 * 60) {
-    cachedToken = jwt.sign({ iss: config.teamId, iat: now }, config.key, {
+    // jsonwebtoken adds "iat" itself; Apple requires it.
+    cachedToken = jwt.sign({ iss: config.teamId }, config.key, {
       algorithm: 'ES256',
       header: { alg: 'ES256', kid: config.keyId },
-      noTimestamp: true,
     });
     cachedAt = now;
   }

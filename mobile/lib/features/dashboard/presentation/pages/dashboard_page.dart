@@ -88,8 +88,9 @@ class _DashboardPageState extends State<DashboardPage> {
     }
   }
 
+  /// A push arrived while the app is open: the figures it reports changed too.
   void _onPushReceived() {
-    if (mounted) context.read<NotificationsBloc>().add(LoadNotificationsEvent());
+    if (mounted) _refresh();
   }
 
   void _onPushOpened() {
