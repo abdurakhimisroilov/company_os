@@ -19,7 +19,7 @@ if (pubspecFile.exists()) {
 
 android {
     namespace = "com.companyos.company_os"
-    compileSdk = 37
+    compileSdk = flutter.compileSdkVersion
 
 
     compileOptions {
@@ -36,7 +36,7 @@ android {
         versionName = parsedVersionName
         multiDexEnabled = true
         ndk {
-            abiFilters.addAll(listOf("arm64-v8a"))
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
         }
     }
 
