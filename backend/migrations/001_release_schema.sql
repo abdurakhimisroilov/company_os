@@ -182,3 +182,14 @@ SELECT v.name FROM (VALUES ('Аренда'), ('Зарплата'), ('Закуп�
 WHERE NOT EXISTS (SELECT 1 FROM expense_categories);
 
 COMMIT;
+
+-- ─── Push notifications (added after the first release migration) ──────────
+CREATE TABLE IF NOT EXISTS device_tokens (
+    token VARCHAR(255) PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    platform VARCHAR(20) NOT NULL,          -- ios | android
+    environment VARCHAR(20) NOT NULL DEFAULT 'production', -- production | sandbox (APNs)
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);

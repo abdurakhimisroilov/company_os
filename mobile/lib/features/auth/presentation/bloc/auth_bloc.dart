@@ -5,6 +5,8 @@ import '../../../../core/di/injection.dart';
 import '../../../../core/network/api_error.dart';
 import '../../../../core/services/app_session.dart';
 import '../../../../core/services/security_service.dart';
+import '../../../../core/services/push_service.dart';
+import '../../../../core/network/api_client.dart';
 import '../../data/models/user_model.dart';
 import '../../data/repositories/auth_repository.dart';
 
@@ -160,6 +162,10 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
 
   // PIN and biometric unlock belong to the account that set them up.
   Future<void> _endSession() async {
+    // While the session is still valid: stop sending this user's notifications to this phone.
+    try {
+      await PushService.instance.unregister(getIt<ApiClient>());
+    } catch (_) {}
     await authRepository.logout();
     try {
       await getIt<SecurityService>().clearAllSecurity();

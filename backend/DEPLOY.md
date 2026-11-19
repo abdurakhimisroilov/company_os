@@ -32,6 +32,14 @@ psql -U company_os_user -d company_os -v ON_ERROR_STOP=1 -f migrations/001_relea
 ```
 Then register the first account in the app; it becomes the owner of its own organization.
 
+## Push notifications (no Firebase)
+
+- **iPhone:** the server sends directly to Apple (`apns.js`). Run
+  `migrations/002_device_tokens.sql` once, set the `APNS_*` variables below and
+  restart. Without them the server runs normally and simply sends no pushes.
+- **Android:** no server setup. The app checks `GET /api/v1/notifications/since`
+  in the background about every 15 minutes and shows new notifications itself.
+
 ## Environment
 
 | Variable | Required | Notes |
@@ -41,6 +49,10 @@ Then register the first account in the app; it becomes the owner of its own orga
 | `PORT` | no | Default 3000. |
 | `PUBLIC_URL` | no | e.g. `https://api.example.com`. When set, file links are returned as absolute URLs. |
 | `JWT_EXPIRES_IN`, `JWT_REFRESH_EXPIRES_IN` | no | Defaults `7d` / `30d`. |
+| `APNS_KEY_FILE` | for iPhone push | Path to the `AuthKey_XXXXXXXXXX.p8` file from Apple (keep it outside the repo, readable only by the server). |
+| `APNS_KEY_ID` | for iPhone push | The 10-character Key ID shown next to that key in the Apple Developer portal. |
+| `APNS_TEAM_ID` | for iPhone push | `62AN53R699` |
+| `APNS_BUNDLE_ID` | no | Default `com.companyos.companyOs`. |
 
 ## Before the App Store build
 

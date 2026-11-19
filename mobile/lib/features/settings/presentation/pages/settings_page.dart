@@ -19,6 +19,9 @@ import '../../../auth/presentation/bloc/auth_bloc.dart';
 import '../../../auth/presentation/pages/biometric_kind.dart';
 import '../../../employees/data/models/employee_model.dart';
 import '../../../companies/presentation/widgets/company_selector_sheet.dart';
+import '../../../../core/services/push_service.dart';
+import '../../../../core/network/api_client.dart';
+import 'package:flutter/foundation.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
@@ -36,11 +39,16 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _isBiometricBusy = false;
   IconData _biometricIcon = Icons.fingerprint_rounded;
   PackageInfo? _packageInfo;
+  bool _pushEnabled = true;
+  bool _pushBusy = false;
 
   @override
   void initState() {
     super.initState();
     _loadSecuritySettings();
+    PushService.instance.isEnabledLocally().then((v) {
+      if (mounted) setState(() => _pushEnabled = v);
+    });
     PackageInfo.fromPlatform().then((info) {
       if (mounted) setState(() => _packageInfo = info);
     }).catchError((_) {});
@@ -56,6 +64,34 @@ class _SettingsPageState extends State<SettingsPage> {
         _isBiometricEnabled = enabled;
         _biometricIcon = icon;
       });
+    }
+  }
+
+  Future<void> _setPushEnabled(bool value) async {
+    setState(() {
+      _pushBusy = true;
+      _pushEnabled = value;
+    });
+    final api = getIt<ApiClient>();
+    try {
+      if (value) {
+        final ok = await PushService.instance.enable(api);
+        if (!ok) {
+          await PushService.instance.disable(api);
+          if (mounted) {
+            setState(() => _pushEnabled = false);
+            _showSnack('Уведомления запрещены в настройках телефона. Разрешите их для Opero и включите снова', isError: true);
+          }
+        }
+      } else {
+        await PushService.instance.disable(api);
+      }
+      // The server also stops sending pushes to every phone of this account when switched off.
+      await getIt<AuthRepository>().updateProfile({'pushEnabled': _pushEnabled});
+    } catch (e) {
+      if (mounted) _showSnack(apiErrorMessage(e, fallback: 'Не удалось изменить настройку уведомлений'), isError: true);
+    } finally {
+      if (mounted) setState(() => _pushBusy = false);
     }
   }
 
@@ -341,6 +377,20 @@ class _SettingsPageState extends State<SettingsPage> {
                     value: ThemeController.instance.isDark,
                     activeColor: AppColors.primaryBlue,
                     onChanged: (v) => ThemeController.instance.setDark(v),
+                  ),
+                  const Divider(height: 1, thickness: 0.5),
+                  SwitchListTile(
+                    title: const Text('Уведомления на телефоне', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+                    subtitle: Text(
+                      defaultTargetPlatform == TargetPlatform.android
+                          ? 'Проверка новых примерно каждые 15 минут'
+                          : 'Новые операции, задачи и сделки',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                    secondary: const Icon(Icons.notifications_active_outlined, color: AppColors.primaryBlue),
+                    value: _pushEnabled,
+                    activeColor: AppColors.primaryBlue,
+                    onChanged: _pushBusy ? null : _setPushEnabled,
                   ),
                 ],
               ),

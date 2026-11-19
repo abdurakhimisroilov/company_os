@@ -23,6 +23,8 @@ import '../../../finance/data/company_currency.dart';
 import '../../../companies/data/models/company_model.dart';
 import '../../../companies/data/repositories/company_repository.dart';
 import '../../../companies/presentation/widgets/company_selector_sheet.dart';
+import '../../../../core/services/push_service.dart';
+import '../../../../core/network/api_client.dart';
 
 class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key});
@@ -48,7 +50,13 @@ class _DashboardPageState extends State<DashboardPage> {
   void initState() {
     super.initState();
     AppSession.instance.addListener(_onSessionChanged);
+    PushService.instance.received.addListener(_onPushReceived);
+    PushService.instance.opened.addListener(_onPushOpened);
+    _notificationsSub = context.read<NotificationsBloc>().stream.listen((state) {
+      if (state is NotificationsLoaded) PushService.instance.setBadge(state.unreadCount);
+    });
     _reloadAll();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _enablePush());
     // The in-app updater installs an APK, which only exists on Android.
     if (defaultTargetPlatform == TargetPlatform.android) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -62,7 +70,32 @@ class _DashboardPageState extends State<DashboardPage> {
   @override
   void dispose() {
     AppSession.instance.removeListener(_onSessionChanged);
+    PushService.instance.received.removeListener(_onPushReceived);
+    PushService.instance.opened.removeListener(_onPushOpened);
+    _notificationsSub?.cancel();
     super.dispose();
+  }
+
+  StreamSubscription<NotificationsState>? _notificationsSub;
+
+  /// Registers this phone for notifications unless the user switched them off.
+  Future<void> _enablePush() async {
+    if (!mounted || !await PushService.instance.isEnabledLocally()) return;
+    try {
+      await PushService.instance.enable(getIt<ApiClient>());
+    } catch (e) {
+      debugPrint('[Dashboard] push registration failed: $e');
+    }
+  }
+
+  void _onPushReceived() {
+    if (mounted) context.read<NotificationsBloc>().add(LoadNotificationsEvent());
+  }
+
+  void _onPushOpened() {
+    if (!mounted) return;
+    context.read<NotificationsBloc>().add(LoadNotificationsEvent());
+    context.push(AppRoutes.notifications);
   }
 
   /// Sign-in, sign-out or another organization: everything shown is stale.

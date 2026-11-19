@@ -13,6 +13,7 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const apns = require('./apns');
 
 const app = express();
 const server = http.createServer(app);
@@ -435,7 +436,34 @@ api.get('/auth/me', h(async (req, res) => {
   res.json(await userProfile(req.user.id));
 }));
 
-api.post('/auth/logout', (req, res) => res.json({ success: true }));
+api.post('/auth/logout', h(async (req, res) => {
+  const token = str(req.body && req.body.deviceToken);
+  if (token) await pool.query('DELETE FROM device_tokens WHERE token = $1 AND user_id = $2', [token, req.user.id]);
+  res.json({ success: true });
+}));
+
+// Phones register here to receive push notifications for the signed-in user.
+api.post('/devices', h(async (req, res) => {
+  const b = req.body || {};
+  const token = str(b.token);
+  const platform = str(b.platform).toLowerCase();
+  if (!/^[0-9a-f]{32,200}$/i.test(token) || !['ios', 'android'].includes(platform)) throw new HttpError(400, 'Некорректные данные устройства');
+  const environment = str(b.environment) === 'sandbox' ? 'sandbox' : 'production';
+  // A phone belongs to whoever signed in on it last.
+  await pool.query(
+    `INSERT INTO device_tokens (token, user_id, platform, environment) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, platform = EXCLUDED.platform,
+       environment = EXCLUDED.environment, updated_at = CURRENT_TIMESTAMP`,
+    [token, req.user.id, platform, environment]
+  );
+  res.json({ success: true, pushAvailable: platform !== 'ios' || apns.enabled });
+}));
+
+api.delete('/devices', h(async (req, res) => {
+  const token = str((req.body && req.body.token) || req.query.token);
+  if (token) await pool.query('DELETE FROM device_tokens WHERE token = $1 AND user_id = $2', [token, req.user.id]);
+  res.json({ success: true });
+}));
 
 api.patch('/auth/profile', h(async (req, res) => {
   const b = req.body || {};
@@ -2381,18 +2409,51 @@ api.delete('/documents/:id', handleDeleteDocument);
 // ============================================================================
 async function notify(userId, title, body, type = 'SYSTEM', referenceId = null) {
   if (!isUuid(userId)) return;
+  let inserted;
   try {
-    await pool.query(
-      'INSERT INTO notifications (user_id, title, body, type, reference_id) VALUES ($1, $2, $3, $4, $5)',
+    inserted = await pool.query(
+      'INSERT INTO notifications (user_id, title, body, type, reference_id) VALUES ($1, $2, $3, $4, $5) RETURNING id',
       [userId, title, body, type, uuidOrNull(referenceId)]
     );
   } catch (err) {
     console.error('Notification insertion error:', err.message);
+    return;
+  }
+  // Push to the user's iPhones in the background; the request does not wait for Apple.
+  pushToUser(userId, { title, body, type, referenceId, notificationId: inserted.rows[0].id }).catch((err) => {
+    console.error('Push error:', err.message);
+  });
+}
+
+async function pushToUser(userId, { title, body, type, referenceId, notificationId }) {
+  if (!apns.enabled) return;
+  const user = await pool.query('SELECT push_enabled FROM users WHERE id = $1', [userId]);
+  if (!user.rows[0] || !user.rows[0].push_enabled) return;
+  const devices = await pool.query(`SELECT token, environment FROM device_tokens WHERE user_id = $1 AND platform = 'ios'`, [userId]);
+  if (devices.rows.length === 0) return;
+  const unread = await pool.query('SELECT count(*)::int AS n FROM notifications WHERE user_id = $1 AND NOT is_read', [userId]);
+  for (const d of devices.rows) {
+    const result = await apns.send(d.token, {
+      title, body, badge: unread.rows[0].n, environment: d.environment,
+      data: { type, referenceId: referenceId || null, notificationId },
+    });
+    if (result.unregistered) await pool.query('DELETE FROM device_tokens WHERE token = $1', [d.token]);
+    else if (!result.ok && !result.skipped) console.error(`APNs ${result.status || ''} ${result.reason || ''}`.trim());
   }
 }
 
 api.get('/notifications', h(async (req, res) => {
   const result = await pool.query('SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100', [req.user.id]);
+  res.json({ data: out(result.rows) });
+}));
+
+api.get('/notifications/since', h(async (req, res) => {
+  const since = new Date(String(req.query.after || ''));
+  if (Number.isNaN(since.getTime())) throw new HttpError(400, 'Укажите время');
+  const result = await pool.query(
+    `SELECT * FROM notifications WHERE user_id = $1 AND NOT is_read AND created_at > $2 ORDER BY created_at ASC LIMIT 20`,
+    [req.user.id, since.toISOString()]
+  );
   res.json({ data: out(result.rows) });
 }));
 
