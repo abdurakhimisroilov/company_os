@@ -34,6 +34,8 @@
 	<string>Доступ к фотогалерее необходим для прикрепления финансовых отчетов и изображений товаров.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Необходимо для сохранения экспортированных отчетов и счетов в галерею.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Opero не отслеживает ваше местоположение. Разрешение может понадобиться только встроенной камере при съёмке фото документов.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Используйте Face ID / Touch ID для быстрого и безопасного входа в Opero.</string>
 

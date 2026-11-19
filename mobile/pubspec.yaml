@@ -1,7 +1,7 @@
 name: company_os
 description: Company OS - Enterprise Business Management App
 publish_to: 'none'
-version: 1.1.0+5
+version: 1.1.0+6
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -60,8 +60,6 @@ dependencies:
   intl: ^0.20.3
 
   # Permissions
-  permission_handler: ^11.1.0
-
   # DI
   get_it: ^7.6.4
 
