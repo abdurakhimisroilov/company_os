@@ -10,7 +10,8 @@ class AppTheme {
   /// System bars for the light theme (same values the app always used).
   static const SystemUiOverlayStyle lightOverlayStyle = SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
-    statusBarIconBrightness: Brightness.dark,
+    statusBarIconBrightness: Brightness.dark, // Android
+    statusBarBrightness: Brightness.light, // iOS: dark icons, whatever the phone's own appearance
     systemNavigationBarColor: Colors.white,
     systemNavigationBarIconBrightness: Brightness.dark,
   );
@@ -88,7 +89,7 @@ class AppTheme {
           titleTextStyle: AppTextStyles.titleLarge,
           iconTheme: IconThemeData(color: AppColors.textPrimary),
           surfaceTintColor: Colors.transparent,
-          systemOverlayStyle: dark ? darkOverlayStyle : null,
+          systemOverlayStyle: dark ? darkOverlayStyle : lightOverlayStyle,
         ),
         cardTheme: CardThemeData(
           color: AppColors.cardBackgroundTranslucent,
