@@ -48,6 +48,8 @@ class PushService {
   Future<bool> enable(ApiClient api) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(prefsEnabled, true);
+    // Screen-recording runs (integration tests) skip the system permission prompt.
+    if (const bool.fromEnvironment('SKIP_PUSH_PROMPT')) return false;
     if (_isIOS) return _enableIOS(api, prefs);
     if (_isAndroid) return _enableAndroid(prefs);
     return false;
