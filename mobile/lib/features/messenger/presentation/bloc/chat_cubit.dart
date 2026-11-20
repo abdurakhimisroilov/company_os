@@ -74,7 +74,23 @@ class ChatCubit extends Cubit<ChatState> {
     } catch (_) {}
   }
 
-  /// Throws when the server rejects the message; the caller keeps the draft.
+  /// Reports [message] and removes it from the screen. Throws on failure.
+  Future<void> report(MessageModel message, String reason) async {
+    await repository.reportMessage(message.id, reason);
+    _sendVersion++;
+    final current = state.messages;
+    if (current != null) _emit(ChatState(messages: current.where((m) => m.id != message.id).toList()));
+  }
+
+  /// Blocks the sender of [message] and removes their messages. Throws on failure.
+  Future<void> blockSender(MessageModel message) async {
+    await repository.blockUser(message.senderId);
+    _sendVersion++;
+    final current = state.messages;
+    if (current != null) _emit(ChatState(messages: current.where((m) => m.senderId != message.senderId).toList()));
+  }
+
+    /// Throws when the server rejects the message; the caller keeps the draft.
   Future<void> send(String text, {String? replyTo, String? attachmentUrl, String? attachmentType}) async {
     final sent = await repository.sendMessage(
       roomId,

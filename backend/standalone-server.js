@@ -1920,6 +1920,12 @@ async function ensureDefaultRoom(companyId, userId) {
   await pool.query(`INSERT INTO chat_rooms (name, is_group, created_by, company_id) VALUES ('Общий чат', TRUE, $1, $2)`, [userId, companyId]);
 }
 
+// Messages the viewer must not see: from users they blocked, or ones they reported.
+// `viewer` is the SQL placeholder holding the viewer's user id; the outer query aliases messages as m.
+const HIDDEN_FOR = (viewer) =>
+  `NOT EXISTS (SELECT 1 FROM user_blocks ub WHERE ub.blocker_id = ${viewer} AND ub.blocked_id = m.sender_id)
+   AND NOT EXISTS (SELECT 1 FROM message_reports mr WHERE mr.reporter_id = ${viewer} AND mr.message_id = m.id)`;
+
 async function roomOfCompany(roomId, companyId) {
   const r = await pool.query(`SELECT id FROM chat_rooms WHERE id = $1 AND company_id = $2`, [uuidOrNull(roomId), companyId]);
   if (!r.rows[0]) throw new HttpError(404, 'Чат не найден');
@@ -1931,10 +1937,10 @@ api.get('/chat/rooms', h(async (req, res) => {
   const result = await pool.query(
     `SELECT r.*, r.name AS title,
             lm.content AS last_message, COALESCE(lm.created_at, r.created_at) AS last_message_time,
-            (SELECT count(*)::int FROM messages m WHERE m.room_id = r.id AND m.sender_id <> $2
+            (SELECT count(*)::int FROM messages m WHERE m.room_id = r.id AND m.sender_id <> $2 AND ${HIDDEN_FOR('$2')}
                AND m.created_at > COALESCE((SELECT last_read_at FROM chat_members cm WHERE cm.room_id = r.id AND cm.user_id = $2), 'epoch')) AS unread_count
      FROM chat_rooms r
-     LEFT JOIN LATERAL (SELECT content, created_at FROM messages WHERE room_id = r.id ORDER BY created_at DESC LIMIT 1) lm ON TRUE
+     LEFT JOIN LATERAL (SELECT content, created_at FROM messages m WHERE m.room_id = r.id AND ${HIDDEN_FOR('$2')} ORDER BY created_at DESC LIMIT 1) lm ON TRUE
      WHERE r.company_id = $1
      ORDER BY last_message_time DESC`,
     [req.companyId, req.user.id]
@@ -1956,7 +1962,7 @@ api.get('/chat/rooms/:roomId/messages', h(async (req, res) => {
   const roomId = await roomOfCompany(req.params.roomId, req.companyId);
   const result = await pool.query(
     `SELECT m.*, u.full_name AS sender_name, u.avatar_url AS sender_avatar, (m.sender_id = $2) AS is_mine
-     FROM (SELECT * FROM messages WHERE room_id = $1 ORDER BY created_at DESC LIMIT 300) m
+     FROM (SELECT * FROM messages m WHERE m.room_id = $1 AND ${HIDDEN_FOR('$2')} ORDER BY created_at DESC LIMIT 300) m
      LEFT JOIN users u ON m.sender_id = u.id ORDER BY m.created_at ASC`,
     [roomId, req.user.id]
   );
@@ -1988,6 +1994,61 @@ api.post('/chat/rooms/:roomId/read', h(async (req, res) => {
      ON CONFLICT (room_id, user_id) DO UPDATE SET last_read_at = CURRENT_TIMESTAMP`,
     [roomId, req.user.id]
   );
+  res.json({ success: true });
+}));
+
+// Report a message. It disappears for the reporter at once; the organization's
+// owners and admins are notified, and the report is stored for the Opero team to review.
+api.post('/chat/messages/:messageId/report', h(async (req, res) => {
+  const found = await pool.query(
+    `SELECT m.id, m.content, m.sender_id, u.full_name AS sender_name
+     FROM messages m JOIN chat_rooms r ON r.id = m.room_id LEFT JOIN users u ON u.id = m.sender_id
+     WHERE m.id = $1 AND r.company_id = $2`,
+    [uuidOrNull(req.params.messageId), req.companyId]
+  );
+  const msg = found.rows[0];
+  if (!msg) throw new HttpError(404, 'Сообщение не найдено');
+  if (msg.sender_id === req.user.id) throw new HttpError(400, 'Нельзя пожаловаться на своё сообщение');
+  const reason = str(req.body && req.body.reason) || 'Неприемлемое содержание';
+  const inserted = await pool.query(
+    `INSERT INTO message_reports (message_id, company_id, reporter_id, sender_id, message_content, reason)
+     VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (message_id, reporter_id) DO NOTHING RETURNING id`,
+    [msg.id, req.companyId, req.user.id, msg.sender_id, msg.content, reason]
+  );
+  if (inserted.rows[0]) {
+    console.log(`Message report ${inserted.rows[0].id}: message ${msg.id} by user ${msg.sender_id}, reason: ${reason}`);
+    const admins = await pool.query(
+      `SELECT user_id FROM user_companies WHERE company_id = $1 AND role IN ('OWNER', 'ADMIN') AND user_id NOT IN ($2, $3)`,
+      [req.companyId, req.user.id, msg.sender_id]
+    );
+    for (const a of admins.rows) {
+      await notify(a.user_id, 'Жалоба на сообщение', `Пожаловались на сообщение ${msg.sender_name || 'сотрудника'}: ${reason}`, 'SYSTEM', msg.id);
+    }
+  }
+  res.status(201).json({ success: true, message: 'Жалоба отправлена' });
+}));
+
+api.get('/chat/blocks', h(async (req, res) => {
+  const result = await pool.query(
+    `SELECT u.id, u.full_name, b.created_at FROM user_blocks b JOIN users u ON u.id = b.blocked_id
+     WHERE b.blocker_id = $1 ORDER BY b.created_at DESC`,
+    [req.user.id]
+  );
+  res.json({ data: out(result.rows) });
+}));
+
+api.post('/chat/blocks', h(async (req, res) => {
+  const userId = uuidOrNull(req.body && req.body.userId);
+  if (!userId) throw new HttpError(400, 'Не указан пользователь');
+  if (userId === req.user.id) throw new HttpError(400, 'Нельзя заблокировать себя');
+  const exists = await pool.query(`SELECT 1 FROM users WHERE id = $1`, [userId]);
+  if (!exists.rows[0]) throw new HttpError(404, 'Пользователь не найден');
+  await pool.query(`INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`, [req.user.id, userId]);
+  res.status(201).json({ success: true });
+}));
+
+api.delete('/chat/blocks/:userId', h(async (req, res) => {
+  await pool.query(`DELETE FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2`, [req.user.id, uuidOrNull(req.params.userId)]);
   res.json({ success: true });
 }));
 

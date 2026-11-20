@@ -65,6 +65,9 @@ class ApiEndpoints {
   static String chatRoom(String id) => '/chat/rooms/$id';
   static String chatMessages(String roomId) => '/chat/rooms/$roomId/messages';
   static String chatMarkRead(String roomId) => '/chat/rooms/$roomId/read';
+  static String chatReportMessage(String messageId) => '/chat/messages/$messageId/report';
+  static const String chatBlocks = '/chat/blocks';
+  static String chatBlock(String userId) => '/chat/blocks/$userId';
 
   // Employees
   static const String employees = '/employees';

@@ -59,4 +59,27 @@ class MessengerRepository {
   Future<void> markAsRead(String roomId) async {
     await apiClient.post(ApiEndpoints.chatMarkRead(roomId));
   }
+
+  /// Reports a message; it is hidden for the reporter from then on.
+  Future<void> reportMessage(String messageId, String reason) async {
+    await apiClient.post(ApiEndpoints.chatReportMessage(messageId), data: {'reason': reason});
+  }
+
+  /// Hides all messages of [userId] for the current user.
+  Future<void> blockUser(String userId) async {
+    await apiClient.post(ApiEndpoints.chatBlocks, data: {'userId': userId});
+  }
+
+  Future<void> unblockUser(String userId) async {
+    await apiClient.delete(ApiEndpoints.chatBlock(userId));
+  }
+
+  /// Users blocked by the current user: (id, name) pairs.
+  Future<List<({String id, String name})>> getBlockedUsers() async {
+    final response = await apiClient.get(ApiEndpoints.chatBlocks);
+    return JsonHelpers.toList(response.data).map((e) {
+      final m = JsonHelpers.toMap(e);
+      return (id: JsonHelpers.toStr(m['id']), name: JsonHelpers.toStr(m['fullName'] ?? m['full_name']));
+    }).toList();
+  }
 }

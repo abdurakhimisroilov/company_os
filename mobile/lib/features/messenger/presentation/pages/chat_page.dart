@@ -229,6 +229,148 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     }
   }
 
+  static const _reportReasons = ['Оскорбление или угрозы', 'Спам или мошенничество', 'Неприемлемый контент', 'Другое'];
+
+  void _showSnack(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  Widget _sheet(BuildContext ctx, List<Widget> children) {
+    return Material(
+      color: AppColors.cardBackground,
+      borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        child: SafeArea(child: Column(mainAxisSize: MainAxisSize.min, children: children)),
+      ),
+    );
+  }
+
+  Widget _sheetTile(IconData icon, String label, Color color, VoidCallback onTap) {
+    return ListTile(
+      leading: Icon(icon, color: color),
+      title: Text(label, style: TextStyle(fontWeight: FontWeight.w600, color: color == AppColors.error ? AppColors.error : AppColors.textPrimary)),
+      onTap: onTap,
+    );
+  }
+
+  /// Long press on a message: reply, and for other people's messages report or block.
+  void _showMessageActions(MessageModel msg) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => _sheet(ctx, [
+        _sheetTile(Icons.reply, 'Ответить', AppColors.primaryBlue, () {
+          Navigator.pop(ctx);
+          setState(() => _replyToText = msg.hasAttachment ? msg.attachmentName : msg.content);
+        }),
+        if (!msg.isMine && msg.senderId.isNotEmpty) ...[
+          _sheetTile(Icons.flag_outlined, 'Пожаловаться', AppColors.error, () {
+            Navigator.pop(ctx);
+            _reportMessage(msg);
+          }),
+          _sheetTile(Icons.block, 'Заблокировать ${msg.senderName.isNotEmpty ? msg.senderName : 'пользователя'}', AppColors.error, () {
+            Navigator.pop(ctx);
+            _blockSender(msg);
+          }),
+        ],
+      ]),
+    );
+  }
+
+  Future<void> _reportMessage(MessageModel msg) async {
+    final reason = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => _sheet(ctx, [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+          child: Text('Причина жалобы', style: AppTextStyles.bodyMedium.copyWith(fontWeight: FontWeight.bold)),
+        ),
+        for (final r in _reportReasons)
+          ListTile(title: Text(r, style: TextStyle(color: AppColors.textPrimary)), onTap: () => Navigator.pop(ctx, r)),
+      ]),
+    );
+    if (reason == null) return;
+    try {
+      await _cubit.report(msg, reason);
+      _showSnack('Жалоба отправлена. Сообщение скрыто, мы рассмотрим его в течение 24 часов');
+    } catch (e) {
+      _showError(apiErrorMessage(e, fallback: 'Не удалось отправить жалобу'));
+    }
+  }
+
+  Future<void> _blockSender(MessageModel msg) async {
+    final name = msg.senderName.isNotEmpty ? msg.senderName : 'этого пользователя';
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Заблокировать?'),
+        content: Text('Вы больше не будете видеть сообщения от $name. Разблокировать можно в списке «Заблокированные».'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Отмена')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Заблокировать', style: TextStyle(color: AppColors.error)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await _cubit.blockSender(msg);
+      _showSnack('Пользователь заблокирован');
+    } catch (e) {
+      _showError(apiErrorMessage(e, fallback: 'Не удалось заблокировать пользователя'));
+    }
+  }
+
+  Future<void> _showBlockedUsers() async {
+    List<({String id, String name})> users;
+    try {
+      users = await _repository.getBlockedUsers();
+    } catch (e) {
+      _showError(apiErrorMessage(e, fallback: 'Не удалось загрузить список'));
+      return;
+    }
+    if (!mounted) return;
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) => _sheet(ctx, [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+            child: Text('Заблокированные', style: AppTextStyles.bodyMedium.copyWith(fontWeight: FontWeight.bold)),
+          ),
+          if (users.isEmpty)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text('Вы никого не заблокировали', style: AppTextStyles.bodyMedium.copyWith(color: AppColors.textSecondary)),
+            ),
+          for (final u in users)
+            ListTile(
+              leading: Icon(Icons.person_off_outlined, color: AppColors.textSecondary),
+              title: Text(u.name, style: TextStyle(color: AppColors.textPrimary)),
+              trailing: TextButton(
+                child: const Text('Разблокировать'),
+                onPressed: () async {
+                  try {
+                    await _repository.unblockUser(u.id);
+                    setSheet(() => users = users.where((x) => x.id != u.id).toList());
+                    _cubit.poll();
+                  } catch (e) {
+                    _showError(apiErrorMessage(e, fallback: 'Не удалось разблокировать'));
+                  }
+                },
+              ),
+            ),
+        ]),
+      ),
+    );
+  }
+
   Widget _attachOption(IconData icon, String label, Color color, VoidCallback onTap) {
     return InkWell(
       onTap: onTap,
@@ -278,6 +420,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
             ),
           ],
         ),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.block, color: AppColors.textSecondary, size: 22),
+            tooltip: 'Заблокированные',
+            onPressed: _showBlockedUsers,
+          ),
+        ],
       ),
       body: Container(
         decoration: BoxDecoration(gradient: AppColors.backgroundGradient),
@@ -344,7 +493,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       child: GestureDetector(
         onLongPress: () {
           HapticFeedback.selectionClick();
-          setState(() => _replyToText = msg.hasAttachment ? msg.attachmentName : msg.content);
+          _showMessageActions(msg);
         },
         child: Container(
           margin: const EdgeInsets.symmetric(vertical: 4),

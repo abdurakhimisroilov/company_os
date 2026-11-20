@@ -107,7 +107,7 @@ function minimalPdf(lines) {
   await call('POST', '/deals', { title: 'Детский сад №15', customerName: 'Детский сад №15', amount: 5200000, status: 'won' });
 
   // A second user so roles and task assignment are visible
-  const manager = await call('POST', '/employees', { fullName: 'Дилноза Юсупова', email: MANAGER_EMAIL, role: 'MANAGER', position: 'Менеджер по продажам', departmentName: 'Продажи', phone: '+998 93 555-12-12' });
+  const manager = await call('POST', '/employees', { fullName: 'Дилноза Юсупова', email: MANAGER_EMAIL, password: PASSWORD, role: 'MANAGER', position: 'Менеджер по продажам', departmentName: 'Продажи', phone: '+998 93 555-12-12' });
 
   // Tasks
   const t1 = await call('POST', '/tasks', { title: 'Подготовить коммерческое предложение для гостиницы', description: 'Расчёт на 40 номеров, два варианта ткани', priority: 'high', assignedToId: manager.id, deadline: new Date(Date.now() + 3 * 86400000).toISOString() });
@@ -122,6 +122,22 @@ function minimalPdf(lines) {
   form.append('folderId', folder.id);
   form.append('file', new Blob([minimalPdf(['Opero demo document', 'Supply contract No. 24', 'Sample file for review'])], { type: 'application/pdf' }), 'Договор поставки №24.pdf');
   await call('POST', '/documents/upload', undefined, form);
+
+  // Team chat: a few messages from both users, so the reviewer can try Reply / Report / Block.
+  const ownerToken = token;
+  const room = (await call('GET', '/chat/rooms'))[0];
+  const login = await fetch(BASE + '/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: MANAGER_EMAIL, password: PASSWORD }) });
+  const managerToken = (await login.json()).accessToken;
+  for (const [who, text] of [
+    [ownerToken, 'Доброе утро! Сегодня встреча с гостиницей «Сити» в 15:00'],
+    [managerToken, 'Здравствуйте! Коммерческое предложение почти готово, отправлю до обеда'],
+    [managerToken, 'Образцы тканей уже на складе, могу взять с собой'],
+    [ownerToken, 'Отлично, спасибо!'],
+  ]) {
+    token = who;
+    await call('POST', `/chat/rooms/${room.id}/messages`, { content: text });
+  }
+  token = ownerToken;
 
   const stats = await call('GET', '/dashboard/stats?period=month');
   console.log('done. Dashboard this month:', JSON.stringify({ balance: stats.totalBalance, income: stats.income, expenses: stats.expenses, sales: stats.sales, products: stats.totalProducts }));

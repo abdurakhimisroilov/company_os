@@ -24,6 +24,17 @@ Do these in order. Steps 1–3 are safe to repeat.
 6. **Verify:** `BASE_URL=http://localhost:3000 node test/api-e2e.js` (creates and
    deletes its own throwaway accounts; expects every check to pass).
 
+## Messenger moderation (report / block) — required for App Store review
+
+Run once, then restart the server with the new `standalone-server.js`:
+`psql -U company_os_user -d company_os -v ON_ERROR_STOP=1 -f migrations/003_chat_moderation.sql`
+
+Reports are stored in `message_reports` (status `open`) and the organization's owners/admins
+get a notification. Apple expects reports to be handled within 24 hours. To see open ones:
+`SELECT created_at, reason, message_content, sender_id FROM message_reports WHERE status = 'open' ORDER BY created_at;`
+To remove the offending message: `DELETE FROM messages WHERE id = '<message_id>';` then
+`UPDATE message_reports SET status = 'resolved' WHERE id = '<report_id>';`
+
 ## Creating a new database from scratch
 
 ```
